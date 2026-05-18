@@ -1,5 +1,13 @@
 import type { BrainEngine } from '../core/engine.ts';
-import { loadConfig } from '../core/config.ts';
+import { loadConfig, loadConfigWithEngine } from '../core/config.ts';
+import {
+  getEmbeddingColumnRegistry,
+  validateColumnKey,
+  validateColumnConfig,
+  quoteIdentifier,
+  EmbeddingColumnNotRegisteredError,
+  EmbeddingColumnConfigError,
+} from '../core/search/embedding-column.ts';
 
 function redactUrl(url: string): string {
   // Redact password in postgresql:// URLs
@@ -84,6 +92,112 @@ export async function runConfig(engine: BrainEngine, args: string[]) {
       process.exit(1);
     }
   } else if (action === 'set' && key && value) {
+    // v0.36 (D12 + D14): validate embedding-column keys at set time so a
+    // bad config gets rejected loud + early. The `--coverage-override`
+    // flag lets the user proceed past the < 90% gate when they know
+    // they're mid-backfill.
+    const coverageOverride =
+      args.includes('--coverage-override') || args.includes('--yes');
+
+    if (key === 'embedding_columns') {
+      try {
+        const parsed = JSON.parse(value);
+        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+          throw new Error('embedding_columns must be a JSON object');
+        }
+        // D12: validate every key + entry shape before persisting.
+        for (const [k, entry] of Object.entries(parsed)) {
+          validateColumnKey(k);
+          validateColumnConfig(k, entry);
+        }
+      } catch (err) {
+        if (err instanceof EmbeddingColumnConfigError) {
+          console.error(`[config] ${err.message}`);
+        } else {
+          console.error(
+            `[config] embedding_columns rejected: ${(err as Error).message}`,
+          );
+          console.error(
+            `[config] Expected JSON shape: {"<column_name>": {"provider": "...", "dimensions": N, "type": "vector" | "halfvec"}, ...}`,
+          );
+        }
+        process.exit(1);
+      }
+    }
+
+    if (key === 'search_embedding_column') {
+      // Validate against the merged registry (file + DB plane + builtins).
+      // We re-read merged config so a prior `gbrain config set
+      // embedding_columns ...` is visible.
+      const fileCfg = loadConfig();
+      const mergedCfg = fileCfg
+        ? await loadConfigWithEngine(engine, fileCfg).catch(() => fileCfg)
+        : null;
+      if (mergedCfg) {
+        let registry: ReturnType<typeof getEmbeddingColumnRegistry>;
+        try {
+          registry = getEmbeddingColumnRegistry(mergedCfg);
+        } catch (err) {
+          console.error(
+            `[config] Existing embedding_columns is invalid; refusing to set search_embedding_column. ` +
+              `Fix the registry first. (${(err as Error).message})`,
+          );
+          process.exit(1);
+        }
+        // Object.hasOwn so inherited keys ('constructor', 'toString', etc.)
+        // cannot pass the registry-lookup gate.
+        if (!Object.hasOwn(registry, value)) {
+          const known = Object.keys(registry).sort().join(', ') || '(none)';
+          console.error(
+            `[config] Unknown embedding column "${value}". ` +
+              `Declared columns: ${known}. ` +
+              `Add it via: gbrain config set embedding_columns '<JSON>'`,
+          );
+          process.exit(1);
+        }
+
+        // D14 coverage gate. Probe the column's NULL-rate; refuse when
+        // coverage < 90% unless `--coverage-override` or `--yes` is
+        // present.
+        try {
+          const covRows = await engine.executeRaw<{ pct: number; total: number }>(
+            `SELECT (
+               COUNT(*) FILTER (WHERE ${quoteIdentifier(value)} IS NOT NULL)::float
+               / NULLIF(COUNT(*), 0) * 100
+             )::float AS pct,
+             COUNT(*)::int AS total
+             FROM content_chunks`,
+          );
+          const pct = covRows[0]?.pct ?? 0;
+          const total = covRows[0]?.total ?? 0;
+          if (total > 0 && pct < 90 && !coverageOverride) {
+            console.error(
+              `[config] Column "${value}" is ${pct.toFixed(1)}% populated (${total} total chunks).`,
+            );
+            console.error(
+              `[config] Switching the default to a low-coverage column silently degrades search.`,
+            );
+            console.error(
+              `[config] Re-run with --coverage-override (or --yes) to proceed anyway:`,
+            );
+            console.error(
+              `[config]   gbrain config set search_embedding_column ${value} --coverage-override`,
+            );
+            process.exit(1);
+          }
+        } catch (err) {
+          // Coverage probe failure shouldn't block when the column shape
+          // is otherwise valid (e.g. the column was JUST added, no chunks
+          // yet, NULLIF guard returns NULL → pct=0 BUT total=0 short-
+          // circuits above). If the SQL itself errors (column ALTER race,
+          // permission), warn but proceed.
+          console.error(
+            `[config] WARN: coverage probe failed (${(err as Error).message}); proceeding.`,
+          );
+        }
+      }
+    }
+
     await engine.setConfig(key, value);
     console.log(`Set ${key} = ${value}`);
   } else {

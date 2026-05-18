@@ -363,7 +363,28 @@ export function attributeKnob<K extends keyof ModeBundle>(
 // `cache.ttl_seconds` (default 3600s). The CHANGELOG note covers this.
 export const KNOBS_HASH_VERSION = 3;
 
-export function knobsHash(knobs: ResolvedSearchKnobs): string {
+/**
+ * v0.36 (D8 / CDX-2) — second-arg context for the cache key. The
+ * embedding column + provider live OUTSIDE ResolvedSearchKnobs because
+ * they're orthogonal to search mode (mode bundles don't pick columns).
+ * Passing them as a second argument keeps ModeBundle pure and lets the
+ * hash invalidate correctly across column/provider switches.
+ *
+ * When undefined, the hash falls back to the legacy 'embedding' /
+ * 'default' values so unrelated callers (eval-replay, telemetry) that
+ * don't know the column produce a stable hash for the default case.
+ */
+export interface KnobsHashContext {
+  /** Resolved column name, e.g. 'embedding', 'embedding_voyage'. */
+  embeddingColumn?: string;
+  /** Resolved provider:model, e.g. 'voyage:voyage-3-large'. */
+  embeddingModel?: string;
+}
+
+export function knobsHash(
+  knobs: ResolvedSearchKnobs,
+  ctx?: KnobsHashContext,
+): string {
   // Fixed-order key list. Adding a knob here REQUIRES bumping
   // KNOBS_HASH_VERSION and is a breaking change for any persisted cache.
   const parts = [
@@ -382,10 +403,20 @@ export function knobsHash(knobs: ResolvedSearchKnobs): string {
     `rri=${knobs.reranker_top_n_in}`,
     `rro=${knobs.reranker_top_n_out ?? 'none'}`,
     `rrt=${knobs.reranker_timeout_ms}`,
-    // v=3 additions (append-only). Use 4-decimal precision so 0.85 and
-    // 0.851 differ in the hash; undefined uses literal 'none' so a
-    // floor-off write and a floor-on write key into different rows.
+    // v=3 additions (append-only). Both contributions landed under v=3:
+    //
+    //   floor_ratio (v0.35.6.0 / codex T1): a floor-on write must not be
+    //     served to a floor-off lookup. 4-decimal precision so 0.85 and
+    //     0.851 produce different hashes; undefined uses literal 'none'.
+    //
+    //   col + prov (v0.36 / D8 / CDX-2): cross-column + cross-provider
+    //     cache contamination. A query against `embedding_voyage` must
+    //     NEVER be served from a cache row that ran against `embedding`
+    //     — they sit in different vector spaces. ctx is optional so
+    //     unrelated callers fall back to the default-column hash.
     `fr=${knobs.floor_ratio === undefined ? 'none' : knobs.floor_ratio.toFixed(4)}`,
+    `col=${ctx?.embeddingColumn ?? 'embedding'}`,
+    `prov=${ctx?.embeddingModel ?? 'default'}`,
   ];
   const h = createHash('sha256');
   h.update(parts.join('|'));

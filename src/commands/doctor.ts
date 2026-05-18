@@ -1662,6 +1662,164 @@ export async function runDoctor(engine: BrainEngine | null, args: string[], dbSo
     }
   } catch { /* listRecipes / gateway not available — silent */ }
 
+  // 8c. Embedding column registry (v0.36 — D5 + D13 + D14).
+  //     Validates every column in the merged registry against the real DB
+  //     shape: (a) column exists, (b) declared type+dims match actual
+  //     format_type(atttypid, atttypmod), (c) HNSW index present on
+  //     Postgres, (d) the ACTIVE default column has >= 90% coverage.
+  //
+  //     Batch probes (D5) so the registry can grow without N+1 round-trips:
+  //     one format_type query, one pg_indexes query, one coverage-per-active
+  //     column query.
+  progress.heartbeat('embedding_column_registry');
+  try {
+    const { getEmbeddingColumnRegistry, resolveEmbeddingColumn, quoteIdentifier } =
+      await import('../core/search/embedding-column.ts');
+    const { loadConfig: _loadConfig } = await import('../core/config.ts');
+    const fileCfg = _loadConfig();
+    const mergedCfg = fileCfg ? await (await import('../core/config.ts')).loadConfigWithEngine(engine, fileCfg).catch(() => fileCfg) : null;
+    if (!mergedCfg) {
+      checks.push({
+        name: 'embedding_column_registry',
+        status: 'ok',
+        message: 'No brain config loaded — skipped',
+      });
+    } else {
+      const registry = getEmbeddingColumnRegistry(mergedCfg);
+      const declaredColumns = Object.keys(registry);
+      const activeCol = resolveEmbeddingColumn(undefined, mergedCfg).name;
+
+      // D13 — batch format_type probe via pg_attribute. udt_name only
+      // returns 'vector' vs 'halfvec'; format_type(atttypid, atttypmod)
+      // returns 'vector(1024)' / 'halfvec(2560)' so dim drift surfaces.
+      const formatRows = await engine.executeRaw<{ attname: string; formatted: string }>(
+        `SELECT a.attname, format_type(a.atttypid, a.atttypmod) AS formatted
+           FROM pg_attribute a
+           JOIN pg_class c ON c.oid = a.attrelid
+           JOIN pg_namespace n ON n.oid = c.relnamespace
+          WHERE n.nspname = 'public'
+            AND c.relname = 'content_chunks'
+            AND a.attname = ANY($1::text[])
+            AND NOT a.attisdropped`,
+        [declaredColumns],
+      );
+      const actualByName = new Map<string, string>();
+      for (const r of formatRows) actualByName.set(r.attname, r.formatted);
+
+      // D5 — batch index probe (Postgres only; PGLite indexing is implicit
+      // and the partial-index pattern doesn't surface in pg_indexes the
+      // same way). Reports informational, not blocking — search still
+      // works without an HNSW index, just slow.
+      const haveIndex = new Map<string, boolean>();
+      if (engine.kind === 'postgres') {
+        const indexRows = await engine.executeRaw<{ indexdef: string }>(
+          `SELECT indexdef FROM pg_indexes
+            WHERE tablename = 'content_chunks'
+              AND schemaname = 'public'`,
+        );
+        for (const col of declaredColumns) {
+          const found = indexRows.some(r => /USING\s+hnsw/i.test(r.indexdef) && r.indexdef.includes(`(${col} `));
+          haveIndex.set(col, found);
+        }
+      }
+
+      // Per-column health rollup.
+      const issues: string[] = [];
+      const okColumns: string[] = [];
+      for (const colName of declaredColumns) {
+        const entry = registry[colName];
+        const actual = actualByName.get(colName);
+        if (!actual) {
+          issues.push(`${colName}: declared but column does NOT exist in content_chunks`);
+          continue;
+        }
+        // Expected format: `vector(N)` or `halfvec(N)`.
+        const m = actual.match(/^(vector|halfvec)\((\d+)\)/i);
+        const actualType = m ? m[1].toLowerCase() : actual;
+        const actualDims = m ? parseInt(m[2], 10) : null;
+        if (actualType !== entry.type) {
+          issues.push(
+            `${colName}: declared type=${entry.type} but actual is ${actual}. ` +
+              `Fix: gbrain config set embedding_columns '<JSON>' OR ` +
+              `ALTER TABLE content_chunks ALTER COLUMN ${colName} TYPE ${entry.type}(${entry.dimensions});`,
+          );
+          continue;
+        }
+        if (actualDims !== null && actualDims !== entry.dimensions) {
+          issues.push(
+            `${colName}: declared dims=${entry.dimensions} but actual is ${actual}. ` +
+              `Fix one side: update config OR ` +
+              `ALTER TABLE content_chunks ALTER COLUMN ${colName} TYPE ${entry.type}(${entry.dimensions});`,
+          );
+          continue;
+        }
+        if (engine.kind === 'postgres' && haveIndex.get(colName) === false) {
+          issues.push(
+            `${colName}: no HNSW index. Search works but uses sequential scan. ` +
+              `Fix: CREATE INDEX IF NOT EXISTS idx_chunks_${colName} ON content_chunks USING hnsw (${quoteIdentifier(colName)} ${entry.type}_cosine_ops);`,
+          );
+          continue;
+        }
+        okColumns.push(colName);
+      }
+
+      // D14 — coverage gate on the ACTIVE default column. Catches the
+      // "user switched to a 5%-populated column" silent-degradation case.
+      let coverageWarn: string | null = null;
+      if (activeCol && actualByName.has(activeCol)) {
+        // Codex /ship #5: pull `total` alongside `pct` so a fresh brain
+        // (0 chunks → NULLIF makes pct NULL → coalesces to 0) doesn't
+        // false-warn "Active column 'embedding' is 0.0% populated".
+        const covRows = await engine.executeRaw<{ pct: number; total: number }>(
+          `SELECT (
+             COUNT(*) FILTER (WHERE ${quoteIdentifier(activeCol)} IS NOT NULL)::float
+             / NULLIF(COUNT(*), 0) * 100
+           )::float AS pct,
+           COUNT(*)::int AS total
+           FROM content_chunks`,
+        );
+        const pct = covRows[0]?.pct ?? 0;
+        const total = covRows[0]?.total ?? 0;
+        // Only warn when there's a real coverage gap. Empty brain (0 chunks)
+        // is a normal state for new installs — skip the gate entirely.
+        if (total > 0 && pct < 90) {
+          coverageWarn =
+            `Active column '${activeCol}' is ${pct.toFixed(1)}% populated. ` +
+            `Search quality silently degraded on un-embedded chunks. ` +
+            `Fix: gbrain embed --column ${activeCol} --stale (write-side support v2) ` +
+            `OR gbrain config set search_embedding_column embedding`;
+        }
+      }
+
+      if (issues.length === 0 && !coverageWarn) {
+        const indexNote = engine.kind === 'postgres' ? ' (all indexed)' : '';
+        checks.push({
+          name: 'embedding_column_registry',
+          status: 'ok',
+          message: `Registry healthy: ${okColumns.length} columns (${okColumns.join(', ')})${indexNote}; active='${activeCol}'`,
+        });
+      } else {
+        const allMessages = [
+          ...issues,
+          ...(coverageWarn ? [coverageWarn] : []),
+        ];
+        checks.push({
+          name: 'embedding_column_registry',
+          status: 'warn',
+          message: allMessages.join(' | '),
+        });
+      }
+    }
+  } catch (err) {
+    // Pre-config brains, registry-validation throws, etc. Surfaces the
+    // error message but doesn't fail the doctor run.
+    checks.push({
+      name: 'embedding_column_registry',
+      status: 'warn',
+      message: `Could not check embedding column registry: ${(err as Error).message}`,
+    });
+  }
+
   // 9. Graph health (link + timeline coverage on entity pages).
   // dead_links removed in v0.10.1: ON DELETE CASCADE on link FKs makes it always 0.
   //
