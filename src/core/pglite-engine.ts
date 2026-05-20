@@ -3269,23 +3269,28 @@ export class PGLiteEngine implements BrainEngine {
     if (opts.until !== undefined) { params.push(opts.until); clauses.push(`AND since_date <= $${params.length}`); }
     if (allowList !== undefined) { params.push(allowList); clauses.push(`AND holder = ANY($${params.length}::text[])`); }
     const where = clauses.join(' ');
+    // v0.36.1.1 T1c: `resolved` deliberately filters to the 3-state subset
+    // (correct|incorrect|partial) — NOT `resolved_quality IS NOT NULL` — so
+    // historical comparisons against pre-v74 scorecards stay valid.
+    // `unresolvable_count` is a sibling field counting the new 4th state.
     const res = await this.db.query(
       `SELECT
-         COUNT(*) FILTER (WHERE kind = 'bet')::int                            AS total_bets,
-         COUNT(*) FILTER (WHERE resolved_quality IS NOT NULL)::int            AS resolved,
-         COUNT(*) FILTER (WHERE resolved_quality = 'correct')::int            AS correct,
-         COUNT(*) FILTER (WHERE resolved_quality = 'incorrect')::int          AS incorrect,
-         COUNT(*) FILTER (WHERE resolved_quality = 'partial')::int            AS partial,
+         COUNT(*) FILTER (WHERE kind = 'bet')::int                                              AS total_bets,
+         COUNT(*) FILTER (WHERE resolved_quality IN ('correct','incorrect','partial'))::int     AS resolved,
+         COUNT(*) FILTER (WHERE resolved_quality = 'correct')::int                              AS correct,
+         COUNT(*) FILTER (WHERE resolved_quality = 'incorrect')::int                            AS incorrect,
+         COUNT(*) FILTER (WHERE resolved_quality = 'partial')::int                              AS partial,
+         COUNT(*) FILTER (WHERE resolved_quality = 'unresolvable')::int                         AS unresolvable_count,
          AVG(
            CASE WHEN resolved_quality IN ('correct','incorrect')
                 THEN POWER(weight - (CASE resolved_quality WHEN 'correct' THEN 1 ELSE 0 END), 2)
            END
-         )::float                                                              AS brier
+         )::float                                                                               AS brier
        FROM takes
        WHERE 1=1 ${where}`,
       params,
     );
-    const r = res.rows[0] as { total_bets: number; resolved: number; correct: number; incorrect: number; partial: number; brier: number | null };
+    const r = res.rows[0] as { total_bets: number; resolved: number; correct: number; incorrect: number; partial: number; unresolvable_count: number; brier: number | null };
     return finalizeScorecard(r);
   }
 

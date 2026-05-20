@@ -295,6 +295,22 @@ at `~/.claude/plans/system-instruction-you-are-working-rippling-knuth.md`.
 Convention skill at `skills/conventions/calibration.md` has the agent-
 facing rules.
 
+**v0.36.1.1 hotfix (2026-05-19, migration v74)** — `takes_resolution_consistency`
+CHECK widened to accept `quality='unresolvable' AND outcome=NULL` as the 4th
+valid resolution state. Column-level CHECK on `resolved_quality` renamed to
+`takes_resolved_quality_values` and widened to enumerate all 4 states. Unblocks
+production grading scripts that write the judge's 4th verdict type. `Take.resolved_quality`,
+`TakeResolution.quality`, and `takes-fence.ts:TakeQuality` all widen to 4-state.
+`TakesScorecard` gains sibling fields `unresolvable_count` + `unresolvable_rate`;
+`resolved` stays 3-state (correct+incorrect+partial) so historical comparisons
+hold. `finalizeScorecard` formula: `unresolvable_rate = unresolvable_count / (resolved
++ unresolvable_count)`, NULL when both 0. Spec doc preserved at
+`docs/architecture/calibration-quality-gate-spec.md` (from closed PR #1191) since
+v0.36.2.0 (forthcoming) ships the falsifiability + per-category calibration on top.
+Pinned by R1-R5 in `test/takes-resolution.test.ts` and `test/migrate.test.ts`'s
+v74 structural + PGLite round-trip suite (CHECK admits unresolvable+NULL, still
+rejects partial+true and unresolvable+true|false, pre-v74 NULL/NULL rows survive).
+
 - `src/core/cycle/base-phase.ts` — abstract `BaseCyclePhase` class.
   Enforces `sourceScopeOpts(ctx)` threading at the type level; closes
   the v0.34.1 source-isolation leak class structurally for every new

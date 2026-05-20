@@ -3513,6 +3513,55 @@ export const MIGRATIONS: Migration[] = [
         ON think_ab_results (source_id, ran_at DESC);
     `,
   },
+  {
+    version: 74,
+    name: 'takes_unresolvable_quality_v0_36_1_1',
+    // v0.36.1.1 hotfix — accepts quality='unresolvable' as a 4th valid
+    // resolution state. Unblocks production grading scripts that write the
+    // 4th verdict type (the judge in grade-takes returns
+    // correct|incorrect|partial|unresolvable, but v37's CHECKs only allowed
+    // the first three).
+    //
+    // Two CHECKs to widen:
+    //   (a) Table-level `takes_resolution_consistency` enumerates valid
+    //       (quality, outcome) pairs. We add ('unresolvable', NULL).
+    //   (b) Column-level CHECK on resolved_quality enumerates valid string
+    //       values. Postgres auto-names this `takes_resolved_quality_check`
+    //       when it's attached via ADD COLUMN ... CHECK. We drop it and
+    //       re-add with the wider value list (named explicitly this time
+    //       so future widening targets a known name).
+    //
+    // Existing rows with (NULL, NULL), ('correct', true), ('incorrect',
+    // false), ('partial', NULL) all satisfy both new CHECKs unchanged.
+    //
+    // ALTER TABLE ADD CONSTRAINT acquires AccessExclusiveLock while it
+    // validates existing rows. On a 36K-row takes table this is sub-second;
+    // larger tables would want NOT VALID + VALIDATE CONSTRAINT, deferred.
+    idempotent: true,
+    sql: `
+      -- (b) Drop both possible names for the column-level CHECK:
+      -- v37's auto-generated takes_resolved_quality_check (Postgres default
+      -- for inline ADD COLUMN CHECK) and the explicit
+      -- takes_resolved_quality_values name we re-add below (idempotent on
+      -- re-run).
+      ALTER TABLE takes DROP CONSTRAINT IF EXISTS takes_resolved_quality_check;
+      ALTER TABLE takes DROP CONSTRAINT IF EXISTS takes_resolved_quality_values;
+      ALTER TABLE takes ADD CONSTRAINT takes_resolved_quality_values CHECK (
+        resolved_quality IS NULL
+        OR resolved_quality IN ('correct', 'incorrect', 'partial', 'unresolvable')
+      );
+
+      -- (a) Widen the (quality, outcome) consistency CHECK.
+      ALTER TABLE takes DROP CONSTRAINT IF EXISTS takes_resolution_consistency;
+      ALTER TABLE takes ADD CONSTRAINT takes_resolution_consistency CHECK (
+        (resolved_quality IS NULL             AND resolved_outcome IS NULL)
+        OR (resolved_quality = 'correct'      AND resolved_outcome = true)
+        OR (resolved_quality = 'incorrect'    AND resolved_outcome = false)
+        OR (resolved_quality = 'partial'      AND resolved_outcome IS NULL)
+        OR (resolved_quality = 'unresolvable' AND resolved_outcome IS NULL)
+      );
+    `,
+  },
 ];
 
 export const LATEST_VERSION = MIGRATIONS.length > 0

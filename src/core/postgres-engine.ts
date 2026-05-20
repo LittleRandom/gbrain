@@ -3211,22 +3211,27 @@ export class PostgresEngine implements BrainEngine {
       : sql``;
     const sinceClause = opts.since ? sql`AND since_date >= ${opts.since}` : sql``;
     const untilClause = opts.until ? sql`AND since_date <= ${opts.until}` : sql``;
+    // v0.36.1.1 T1c: `resolved` deliberately filters to the 3-state subset
+    // (correct|incorrect|partial) — NOT `resolved_quality IS NOT NULL` — so
+    // historical comparisons against pre-v74 scorecards stay valid.
+    // `unresolvable_count` is a sibling field counting the new 4th state.
     const rows = await sql`
       SELECT
-        COUNT(*) FILTER (WHERE kind = 'bet')::int                              AS total_bets,
-        COUNT(*) FILTER (WHERE resolved_quality IS NOT NULL)::int              AS resolved,
-        COUNT(*) FILTER (WHERE resolved_quality = 'correct')::int              AS correct,
-        COUNT(*) FILTER (WHERE resolved_quality = 'incorrect')::int            AS incorrect,
-        COUNT(*) FILTER (WHERE resolved_quality = 'partial')::int              AS partial,
+        COUNT(*) FILTER (WHERE kind = 'bet')::int                                              AS total_bets,
+        COUNT(*) FILTER (WHERE resolved_quality IN ('correct','incorrect','partial'))::int     AS resolved,
+        COUNT(*) FILTER (WHERE resolved_quality = 'correct')::int                              AS correct,
+        COUNT(*) FILTER (WHERE resolved_quality = 'incorrect')::int                            AS incorrect,
+        COUNT(*) FILTER (WHERE resolved_quality = 'partial')::int                              AS partial,
+        COUNT(*) FILTER (WHERE resolved_quality = 'unresolvable')::int                         AS unresolvable_count,
         AVG(
           CASE WHEN resolved_quality IN ('correct','incorrect')
                THEN POWER(weight - (CASE resolved_quality WHEN 'correct' THEN 1 ELSE 0 END), 2)
           END
-        )::float                                                               AS brier
+        )::float                                                                               AS brier
       FROM takes
       WHERE 1=1 ${holderClause} ${domainClause} ${sinceClause} ${untilClause} ${allowed}
     `;
-    const r = rows[0] as { total_bets: number; resolved: number; correct: number; incorrect: number; partial: number; brier: number | null };
+    const r = rows[0] as { total_bets: number; resolved: number; correct: number; incorrect: number; partial: number; unresolvable_count: number; brier: number | null };
     return finalizeScorecard(r);
   }
 

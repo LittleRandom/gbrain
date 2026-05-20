@@ -1610,3 +1610,187 @@ describe('resolveSessionTimeouts — env var overrides', () => {
     expect(Object.keys(t)).toHaveLength(0);
   });
 });
+
+// ─── v0.36.1.1 — v74 takes_unresolvable_quality_v0_36_1_1 ──────────────────
+//
+// Hotfix that unblocks the production grading script. Widens BOTH:
+//   (a) the table-level takes_resolution_consistency CHECK to accept
+//       quality='unresolvable' AND outcome=NULL
+//   (b) the column-level CHECK on resolved_quality to allow 'unresolvable'
+// Structural assertions only — round-trip behavior is covered by E2E.
+
+describe('migrate v74 — takes_unresolvable_quality_v0_36_1_1', () => {
+  const v74 = MIGRATIONS.find(m => m.version === 74);
+
+  test('v74 entry exists with the documented name', () => {
+    expect(v74).toBeDefined();
+    expect(v74!.name).toBe('takes_unresolvable_quality_v0_36_1_1');
+  });
+
+  test('v74 is marked idempotent so re-runs are safe', () => {
+    expect(v74!.idempotent).toBe(true);
+  });
+
+  test("v74 widens the column-level CHECK to include 'unresolvable'", () => {
+    const sql = (v74!.sql ?? '').toLowerCase();
+    // Drops both possible names (auto-generated + explicitly-named) so
+    // pre-v74 brains converge regardless of which CHECK shape they had.
+    expect(sql).toContain('drop constraint if exists takes_resolved_quality_check');
+    expect(sql).toContain('drop constraint if exists takes_resolved_quality_values');
+    // The new CHECK enumerates all four valid quality states.
+    expect(sql).toContain('takes_resolved_quality_values');
+    expect(sql).toMatch(/'correct'/);
+    expect(sql).toMatch(/'incorrect'/);
+    expect(sql).toMatch(/'partial'/);
+    expect(sql).toMatch(/'unresolvable'/);
+  });
+
+  test('v74 widens the table-level takes_resolution_consistency CHECK', () => {
+    const sql = v74!.sql ?? '';
+    expect(sql).toContain('DROP CONSTRAINT IF EXISTS takes_resolution_consistency');
+    expect(sql).toContain('ADD CONSTRAINT takes_resolution_consistency CHECK');
+    // The new (quality, outcome) row for unresolvable joins partial as
+    // null-outcome. Pin the literal pair so regressions surface.
+    expect(sql).toMatch(/resolved_quality\s*=\s*'unresolvable'\s+AND\s+resolved_outcome\s+IS\s+NULL/i);
+  });
+
+  test('v74 keeps the existing four (quality, outcome) pairs intact', () => {
+    const sql = v74!.sql ?? '';
+    // Regression: shouldn't accidentally drop pre-existing legal states.
+    expect(sql).toMatch(/resolved_quality\s+IS\s+NULL\s+AND\s+resolved_outcome\s+IS\s+NULL/i);
+    expect(sql).toMatch(/resolved_quality\s*=\s*'correct'\s+AND\s+resolved_outcome\s*=\s*true/i);
+    expect(sql).toMatch(/resolved_quality\s*=\s*'incorrect'\s+AND\s+resolved_outcome\s*=\s*false/i);
+    expect(sql).toMatch(/resolved_quality\s*=\s*'partial'\s+AND\s+resolved_outcome\s+IS\s+NULL/i);
+  });
+});
+
+// E2E round-trip — runs against PGLite (no DATABASE_URL needed). Spins up a
+// fresh in-memory brain, applies all migrations through v74, then exercises
+// the regression checklist: R1 unresolvable persists, R2 pre-v74 (NULL,NULL)
+// rows survive, R3+R4 contradictory pairs still rejected, R5 the four legal
+// shapes all round-trip.
+describe('migrate v74 — CHECK widening end-to-end on PGLite', () => {
+  let engine: PGLiteEngine;
+
+  beforeAll(async () => {
+    engine = new PGLiteEngine();
+    await engine.connect({});
+    await engine.initSchema();
+  });
+
+  afterAll(async () => {
+    await engine.disconnect();
+  });
+
+  async function insertTake(rowNum: number): Promise<number> {
+    // Need a page row to satisfy the FK before we can write a take.
+    const slug = `wiki/people/v74-test-${rowNum}-${Math.random().toString(36).slice(2, 8)}`;
+    const page = await engine.putPage(slug, {
+      type: 'person',
+      title: `v74 test row ${rowNum}`,
+      compiled_truth: '',
+      timeline: '',
+      frontmatter: {},
+      content_hash: `v74-${rowNum}-${Math.random()}`,
+    });
+    await engine.executeRaw(
+      `INSERT INTO takes (page_id, row_num, claim, kind, holder, weight, active)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+      [page.id, rowNum, `claim ${rowNum}`, 'bet', 'garry', 0.5, true],
+    );
+    return page.id;
+  }
+
+  async function tryResolve(
+    pageId: number,
+    rowNum: number,
+    quality: string,
+    outcome: boolean | null,
+  ): Promise<{ ok: true } | { ok: false; err: string }> {
+    try {
+      await engine.executeRaw(
+        `UPDATE takes
+            SET resolved_at = now(),
+                resolved_quality = $1::text,
+                resolved_outcome = $2,
+                resolved_by = $3
+          WHERE page_id = $4 AND row_num = $5`,
+        [quality, outcome, 'gbrain:test', pageId, rowNum],
+      );
+      return { ok: true };
+    } catch (err) {
+      return { ok: false, err: err instanceof Error ? err.message : String(err) };
+    }
+  }
+
+  test('R1: writing quality=unresolvable + outcome=NULL succeeds post-v74', async () => {
+    const pageId = await insertTake(101);
+    const result = await tryResolve(pageId, 101, 'unresolvable', null);
+    expect(result.ok).toBe(true);
+
+    const row = (await engine.executeRaw<{ resolved_quality: string; resolved_outcome: boolean | null }>(
+      `SELECT resolved_quality, resolved_outcome FROM takes WHERE page_id = $1 AND row_num = $2`,
+      [pageId, 101],
+    ))[0];
+    expect(row.resolved_quality).toBe('unresolvable');
+    expect(row.resolved_outcome).toBeNull();
+  });
+
+  test('R2: pre-v74 row with quality=NULL AND outcome=NULL survives widened CHECK', async () => {
+    // After v74 ran on initSchema, inserting an unresolved take must still
+    // succeed — the (NULL, NULL) case is still legal.
+    const pageId = await insertTake(102);
+    const row = (await engine.executeRaw<{ resolved_quality: string | null; resolved_outcome: boolean | null }>(
+      `SELECT resolved_quality, resolved_outcome FROM takes WHERE page_id = $1 AND row_num = $2`,
+      [pageId, 102],
+    ))[0];
+    expect(row.resolved_quality).toBeNull();
+    expect(row.resolved_outcome).toBeNull();
+  });
+
+  test('R3 negative: quality=partial AND outcome=true STILL rejected', async () => {
+    const pageId = await insertTake(103);
+    const result = await tryResolve(pageId, 103, 'partial', true);
+    expect(result.ok).toBe(false);
+    expect((result as { ok: false; err: string }).err.toLowerCase()).toContain('check');
+  });
+
+  test('R4 negative: quality=unresolvable AND outcome=true STILL rejected', async () => {
+    // The widened CHECK admits unresolvable only with NULL outcome — same
+    // shape as partial. A truthy outcome remains illegal.
+    const pageId = await insertTake(104);
+    const result = await tryResolve(pageId, 104, 'unresolvable', true);
+    expect(result.ok).toBe(false);
+    expect((result as { ok: false; err: string }).err.toLowerCase()).toContain('check');
+  });
+
+  test('R4 negative: quality=unresolvable AND outcome=false STILL rejected', async () => {
+    const pageId = await insertTake(105);
+    const result = await tryResolve(pageId, 105, 'unresolvable', false);
+    expect(result.ok).toBe(false);
+    expect((result as { ok: false; err: string }).err.toLowerCase()).toContain('check');
+  });
+
+  test('R5: getScorecard surfaces unresolvable_count + unresolvable_rate as siblings', async () => {
+    // Seed three rows: one correct, one partial, one unresolvable. All under
+    // the same holder so the scorecard groups them. unresolvable_rate must
+    // come out as 1 / (2 + 1) since `resolved` stays 3-state (correct+partial).
+    const pid1 = await insertTake(201);
+    const pid2 = await insertTake(202);
+    const pid3 = await insertTake(203);
+    expect((await tryResolve(pid1, 201, 'correct', true)).ok).toBe(true);
+    expect((await tryResolve(pid2, 202, 'partial', null)).ok).toBe(true);
+    expect((await tryResolve(pid3, 203, 'unresolvable', null)).ok).toBe(true);
+
+    const scorecard = await engine.getScorecard({ holder: 'garry' }, undefined);
+    // Three rows total, 2 in the 3-state subset, 1 unresolvable.
+    expect(scorecard.resolved).toBeGreaterThanOrEqual(2);
+    expect(scorecard.unresolvable_count).toBeGreaterThanOrEqual(1);
+    // unresolvable_rate is computed against the 4-state denominator.
+    expect(scorecard.unresolvable_rate).not.toBeNull();
+    expect(scorecard.unresolvable_rate!).toBeGreaterThan(0);
+    // The legacy fields keep their pre-v74 meaning.
+    expect(typeof scorecard.accuracy).not.toBe('undefined');
+    expect(typeof scorecard.partial_rate).not.toBe('undefined');
+  });
+});

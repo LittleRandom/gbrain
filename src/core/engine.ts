@@ -168,13 +168,16 @@ export interface Take {
   resolved_at: string | null;
   resolved_outcome: boolean | null;
   /**
-   * v0.30.0: 3-state outcome label. Sits alongside `resolved_outcome` for
-   * back-compat. New writes populate both; legacy v0.28-resolved rows have
-   * `resolved_quality` backfilled by migration v40 from the boolean.
-   * Null on unresolved rows. Schema CHECK enforces (quality, outcome) consistency:
-   * `correct` ↔ `outcome=true`, `incorrect` ↔ `outcome=false`, `partial` ↔ `outcome=NULL`.
+   * v0.30.0: 3-state outcome label. v0.36.1.1 added 'unresolvable' as a 4th
+   * state for verdicts where evidence was insufficient to grade. Sits
+   * alongside `resolved_outcome` for back-compat. New writes populate both;
+   * legacy v0.28-resolved rows have `resolved_quality` backfilled by
+   * migration v40 from the boolean. Null on unresolved rows. Schema CHECK
+   * (widened in v74) enforces (quality, outcome) consistency:
+   * `correct` ↔ `outcome=true`, `incorrect` ↔ `outcome=false`,
+   * `partial` ↔ `outcome=NULL`, `unresolvable` ↔ `outcome=NULL`.
    */
-  resolved_quality: 'correct' | 'incorrect' | 'partial' | null;
+  resolved_quality: 'correct' | 'incorrect' | 'partial' | 'unresolvable' | null;
   resolved_value: number | null;
   resolved_unit: string | null;
   resolved_source: string | null;
@@ -221,11 +224,14 @@ export interface StaleTakeRow {
 /** Resolution metadata for resolveTake. */
 export interface TakeResolution {
   /**
-   * v0.30.0: primary 3-state input. When set, takes precedence over `outcome`
-   * and the engine writes both columns (quality directly; outcome derived:
-   * `correct→true`, `incorrect→false`, `partial→null`).
+   * v0.30.0: primary 3-state input; v0.36.1.1 widened to 4-state with
+   * 'unresolvable'. When set, takes precedence over `outcome` and the engine
+   * writes both columns (quality directly; outcome derived:
+   * `correct→true`, `incorrect→false`, `partial→null`, `unresolvable→null`).
+   * `unresolvable` marks rows where the judge ran but evidence was
+   * insufficient to grade; surfaces in `TakesScorecard.unresolvable_count`.
    */
-  quality?: 'correct' | 'incorrect' | 'partial';
+  quality?: 'correct' | 'incorrect' | 'partial' | 'unresolvable';
   /**
    * v0.28 back-compat input. Keep submitting for v0.28 callers; the engine
    * derives quality (`true→correct`, `false→incorrect`). When `quality` is
@@ -243,6 +249,12 @@ export interface TakeResolution {
 /** v0.30.0: scorecard aggregate. */
 export interface TakesScorecard {
   total_bets: number;
+  /**
+   * Count of resolved rows where `resolved_quality IN
+   * ('correct','incorrect','partial')`. v0.36.1.1 deliberately keeps this
+   * 3-state semantic to preserve historical comparisons. Unresolvable rows
+   * land in the sibling `unresolvable_count` field instead.
+   */
   resolved: number;
   correct: number;
   incorrect: number;
@@ -253,12 +265,27 @@ export interface TakesScorecard {
    * Brier score over rows where `resolved_quality IN ('correct','incorrect')`.
    * Maps `correct→1`, `incorrect→0`, computes `mean((weight − outcome)²)`.
    * Lower is better; 0 = perfect; 0.25 = always-50% baseline.
-   * Excludes partial — that label hides hedging behavior; `partial_rate`
-   * surfaces it as a separate signal. NULL when no correct+incorrect rows.
+   * Excludes partial AND unresolvable — both hide signal; the dedicated
+   * `partial_rate` and `unresolvable_rate` fields surface them separately.
+   * NULL when no correct+incorrect rows.
    */
   brier: number | null;
   /** partial / resolved. NULL when n=0. */
   partial_rate: number | null;
+  /**
+   * v0.36.1.1: count of rows where `resolved_quality = 'unresolvable'`.
+   * Sibling field to `resolved` so historical comparisons against pre-v74
+   * scorecards stay valid; `resolved` retains its 3-state meaning, and
+   * unresolvable rows count here separately.
+   */
+  unresolvable_count: number;
+  /**
+   * v0.36.1.1: `unresolvable_count / (resolved + unresolvable_count)`. NULL
+   * when both are 0. Surfaces the spec's headline calibration signal:
+   * "what fraction of grade-attempted takes couldn't be graded?" — high
+   * values signal weak evidence retrieval rather than wrong predictions.
+   */
+  unresolvable_rate: number | null;
 }
 
 export interface TakesScorecardOpts {

@@ -308,7 +308,7 @@ async function cmdResolve(engine: BrainEngine, args: string[]): Promise<void> {
   const qualityStr = flagValue(args, '--quality');
   const outcomeStr = flagValue(args, '--outcome');
   if (!slug || !rowNumStr || (!qualityStr && !outcomeStr)) {
-    console.error('Usage: gbrain takes resolve <slug> --row N --quality correct|incorrect|partial [--evidence "..."] [--value N --unit usd|pct|count] [--by <slug>]');
+    console.error('Usage: gbrain takes resolve <slug> --row N --quality correct|incorrect|partial|unresolvable [--evidence "..."] [--value N --unit usd|pct|count] [--by <slug>]');
     console.error('       (back-compat) gbrain takes resolve <slug> --row N --outcome true|false [...]');
     process.exit(1);
   }
@@ -319,12 +319,13 @@ async function cmdResolve(engine: BrainEngine, args: string[]): Promise<void> {
   const rowNum = parseInt(rowNumStr, 10);
 
   // v0.30.0: --quality is the new primary input. --outcome stays as a back-compat
-  // alias auto-mapping true→correct / false→incorrect; cannot express partial.
-  let quality: 'correct' | 'incorrect' | 'partial' | undefined;
+  // alias auto-mapping true→correct / false→incorrect; cannot express partial
+  // or unresolvable (v0.36.1.1).
+  let quality: 'correct' | 'incorrect' | 'partial' | 'unresolvable' | undefined;
   let outcome: boolean | undefined;
   if (qualityStr) {
-    if (qualityStr !== 'correct' && qualityStr !== 'incorrect' && qualityStr !== 'partial') {
-      console.error(`Invalid --quality "${qualityStr}". Expected: correct, incorrect, partial.`);
+    if (qualityStr !== 'correct' && qualityStr !== 'incorrect' && qualityStr !== 'partial' && qualityStr !== 'unresolvable') {
+      console.error(`Invalid --quality "${qualityStr}". Expected: correct, incorrect, partial, unresolvable.`);
       process.exit(1);
     }
     quality = qualityStr;
