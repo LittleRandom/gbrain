@@ -177,6 +177,37 @@ describe('parseMarkdown validation surface', () => {
       );
       expect(broken.length).toBeGreaterThan(0);
     });
+
+    // v0.37.9.0 — parity test (codex outside-voice review D7-3).
+    // The validator parses ONLY the value with safeLoad. Gray-matter parses
+    // the whole frontmatter document. These two can disagree on edge cases
+    // (e.g. a value valid in isolation but ambiguous in document context).
+    // For the load-bearing inputs this wave targets, both paths must agree:
+    // valid YAML doesn't trigger NESTED_QUOTES, and clearly broken YAML
+    // either triggers NESTED_QUOTES or YAML_PARSE (never silent).
+    test('parity: validator per-value safeLoad agrees with gray-matter full-document parse', () => {
+      const cases: { md: string; shouldFlag: boolean; label: string }[] = [
+        // Valid: gray-matter parses cleanly, validator should NOT flag.
+        { md: `${fence}\ntype: concept\ntags: ["yc", "w2025"]\n${fence}\n\nbody`, shouldFlag: false, label: 'JSON-style array (valid YAML)' },
+        { md: `${fence}\ntype: concept\ntags: ['yc', 'w2025']\n${fence}\n\nbody`, shouldFlag: false, label: 'single-quoted array' },
+        { md: `${fence}\ntype: concept\ntitle: 'a: "b" "c"'\n${fence}\n\nbody`, shouldFlag: false, label: 'single-quoted scalar with literal inner quotes' },
+        { md: `${fence}\ntype: concept\ntitle: ok\n${fence}\n\nbody`, shouldFlag: false, label: 'clean scalar' },
+        // Broken: gray-matter would fail OR produce ambiguous parse, validator
+        // should surface either NESTED_QUOTES or YAML_PARSE.
+        { md: `${fence}\ntype: concept\ntitle: "Foo "bar" baz "qux" end"\n${fence}\n\nbody`, shouldFlag: true, label: 'nested scalar quotes' },
+      ];
+      for (const c of cases) {
+        const parsed = parseMarkdown(c.md, undefined, { validate: true });
+        const errors = parsed.errors!.filter(
+          e => e.code === 'NESTED_QUOTES' || e.code === 'YAML_PARSE'
+        );
+        if (c.shouldFlag) {
+          expect(errors.length, `[${c.label}] expected at least one NESTED_QUOTES or YAML_PARSE error`).toBeGreaterThan(0);
+        } else {
+          expect(errors.length, `[${c.label}] expected no NESTED_QUOTES/YAML_PARSE errors but got ${JSON.stringify(errors)}`).toBe(0);
+        }
+      }
+    });
   });
 
   describe('EMPTY_FRONTMATTER', () => {

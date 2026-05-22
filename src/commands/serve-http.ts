@@ -349,7 +349,7 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
 
   app.post('/token', ccRateLimiter, express.urlencoded({ extended: false }), async (req, res, next) => {
     if (req.body?.grant_type !== 'client_credentials') {
-      return next(); // Fall through to SDK's token handler
+      return next(); // Fall through to confidential-client handler or SDK
     }
 
     try {
@@ -364,6 +364,80 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
     } catch (e) {
       const msg = e instanceof Error ? e.message : 'Unknown error';
       res.status(400).json({ error: 'invalid_grant', error_description: msg });
+    }
+  });
+
+  // ---------------------------------------------------------------------------
+  // v0.37.7.0 #1166: Custom authorization_code + refresh_token handler for
+  // CONFIDENTIAL clients. The MCP SDK's clientAuth middleware does plaintext
+  // `client.client_secret !== presented_secret` compare; we store
+  // SHA-256 hashes, so the SDK's compare always fails for confidential
+  // clients. This middleware verifies the secret hash ourselves before
+  // calling the provider's exchange methods directly.
+  //
+  // Public clients (token_endpoint_auth_method='none') fall through to
+  // the SDK's handler — the v0.34.1.0 PKCE path stays canonical.
+  // ---------------------------------------------------------------------------
+  app.post('/token', ccRateLimiter, async (req, res, next) => {
+    const grantType = req.body?.grant_type;
+    if (grantType !== 'authorization_code' && grantType !== 'refresh_token') {
+      return next();
+    }
+
+    // Detect confidential auth: either client_secret in body
+    // (client_secret_post) OR Authorization: Basic header
+    // (client_secret_basic). Public PKCE clients omit both.
+    const bodySecret: string | undefined = req.body?.client_secret;
+    let clientId: string | undefined = req.body?.client_id;
+    let presentedSecret: string | undefined = bodySecret;
+    const authHeader = (req.headers.authorization ?? '').toString();
+    if (!presentedSecret && authHeader.startsWith('Basic ')) {
+      try {
+        const decoded = Buffer.from(authHeader.slice('Basic '.length), 'base64').toString('utf8');
+        const idx = decoded.indexOf(':');
+        if (idx > -1) {
+          clientId ||= decodeURIComponent(decoded.slice(0, idx));
+          presentedSecret = decodeURIComponent(decoded.slice(idx + 1));
+        }
+      } catch {
+        // Malformed Basic header → falls through; SDK will reject
+      }
+    }
+    if (!clientId || !presentedSecret) {
+      return next(); // Public client path; SDK handles.
+    }
+
+    try {
+      const client = await oauthProvider.verifyConfidentialClientSecret(clientId, presentedSecret);
+      let tokens;
+      if (grantType === 'authorization_code') {
+        const code = req.body.code;
+        const redirectUri = req.body.redirect_uri;
+        const codeVerifier = req.body.code_verifier;
+        if (!code) {
+          res.status(400).json({ error: 'invalid_request', error_description: 'code required' });
+          return;
+        }
+        tokens = await oauthProvider.exchangeAuthorizationCode(client, code, codeVerifier, redirectUri);
+      } else {
+        const refreshToken = req.body.refresh_token;
+        const scopeParam = typeof req.body.scope === 'string' ? req.body.scope.split(/\s+/) : undefined;
+        if (!refreshToken) {
+          res.status(400).json({ error: 'invalid_request', error_description: 'refresh_token required' });
+          return;
+        }
+        tokens = await oauthProvider.exchangeRefreshToken(client, refreshToken, scopeParam);
+      }
+      res.json(tokens);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : 'Unknown error';
+      // RFC 6749: invalid_client for auth failures, invalid_grant for
+      // code/token problems. "Invalid client" → 401; everything else 400.
+      if (msg === 'Invalid client' || msg === 'Client has been revoked') {
+        res.status(401).json({ error: 'invalid_client', error_description: msg });
+      } else {
+        res.status(400).json({ error: 'invalid_grant', error_description: msg });
+      }
     }
   });
 

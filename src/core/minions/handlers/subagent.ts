@@ -285,12 +285,33 @@ export function makeSubagentHandler(deps: SubagentDeps) {
     // AND no subsequent user message has been synthesized yet, we crashed
     // mid-tool-dispatch. Finish those tools now so the next LLM call sees
     // a consistent conversation.
+    //
+    // v0.37.7.0 #1151: if the last persisted message is an assistant
+    // with NO tool_use blocks, the prior run already reached terminal
+    // end_turn. Sonnet 4.6+ rejects assistant-prefill, so calling
+    // messages.create here would dead-letter the job despite the work
+    // being already committed. Return immediately with the persisted
+    // text as finalText. Mirrors the live-loop terminal logic below.
     const last = priorMessages[priorMessages.length - 1];
     if (last && last.role === 'assistant') {
       const pendingToolUses = last.content_blocks.filter(
         (b): b is { type: 'tool_use'; id: string; name: string; input: unknown } & Record<string, unknown> =>
           b.type === 'tool_use',
       );
+      if (pendingToolUses.length === 0) {
+        const finalText = last.content_blocks
+          .filter((b): b is { type: 'text'; text: string } & Record<string, unknown> =>
+            b.type === 'text' && typeof (b as { text?: unknown }).text === 'string',
+          )
+          .map(b => b.text)
+          .join('\n');
+        return {
+          result: finalText,
+          turns_count: assistantTurns,
+          stop_reason: 'end_turn',
+          tokens: tokenTotals,
+        };
+      }
       if (pendingToolUses.length > 0) {
         const synthesizedResults: ContentBlock[] = [];
         for (const use of pendingToolUses) {

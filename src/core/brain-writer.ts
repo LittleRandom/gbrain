@@ -152,6 +152,75 @@ export function autoFixFrontmatter(
     }
   }
 
+  // Both step 3a and step 3 produce NESTED_QUOTES fix records on different
+  // patterns. When both fire on the same file, push ONE merged record rather
+  // than two — keeps the audit count honest about distinct files affected.
+  let nestedQuotesFixed = false;
+
+  // 3a. Canonical-style normalization for `tags:` / `aliases:` flow arrays.
+  //     Post-v0.37.5.0 validator (PR #1229), `tags: ["yc", "w2025"]` is already
+  //     valid YAML and no longer flagged. This pass rewrites it to the
+  //     canonical single-quoted form (`tags: ['yc', 'w2025']`) so disk-side
+  //     `frontmatter validate --fix` produces output consistent with the
+  //     v0.37.9.0 serializer. Allow-list keys deliberately scoped to
+  //     `tags` / `aliases` — extending to arbitrary keys would rewrite typed
+  //     arrays (e.g. `scores: ["1", "2"]` would lose numeric intent).
+  {
+    const lines = working.split('\n');
+    let firstNonEmpty = -1;
+    for (let i = 0; i < lines.length; i++) {
+      if (lines[i].trim().length > 0) { firstNonEmpty = i; break; }
+    }
+    if (firstNonEmpty >= 0 && lines[firstNonEmpty].trim() === '---') {
+      let closeIdx = lines.length;
+      for (let i = firstNonEmpty + 1; i < lines.length; i++) {
+        if (lines[i].trim() === '---') { closeIdx = i; break; }
+      }
+      let fixedAny = false;
+      for (let i = firstNonEmpty + 1; i < closeIdx; i++) {
+        // Allow-list: only `tags` and `aliases` (the keys this wave targets).
+        const arrMatch = lines[i].match(/^(\s*(?:tags|aliases)\s*:\s*)\[(.*)\]\s*$/);
+        if (!arrMatch || !arrMatch[2].includes('"')) continue;
+        const [, prefix, inner] = arrMatch;
+        // Quote-aware comma split — items may contain commas inside quotes.
+        const items: string[] = [];
+        let current = '';
+        let inQuote = false;
+        for (let j = 0; j < inner.length; j++) {
+          const ch = inner[j];
+          if (ch === '"' && (j === 0 || inner[j - 1] !== '\\')) {
+            inQuote = !inQuote;
+          } else if (ch === ',' && !inQuote) {
+            items.push(current.trim());
+            current = '';
+          } else {
+            current += ch;
+          }
+        }
+        if (current.trim()) items.push(current.trim());
+
+        // Re-quote: single quotes by default, double-quote fallback when the
+        // item contains an apostrophe (YAML's single-quoted form would need
+        // `''` escaping which the validator accepts but reads poorly).
+        const reQuoted = items.map(v => {
+          const clean = v.replace(/^"|"$/g, '').trim();
+          if (!clean) return "''";
+          return clean.includes("'") ? `"${clean}"` : `'${clean}'`;
+        });
+        lines[i] = `${prefix}[${reQuoted.join(', ')}]`;
+        fixedAny = true;
+      }
+      if (fixedAny) {
+        working = lines.join('\n');
+        fixes.push({
+          code: 'NESTED_QUOTES',
+          description: 'Normalized JSON-style double-quoted tag/alias arrays to single-quoted YAML',
+        });
+        nestedQuotesFixed = true;
+      }
+    }
+  }
+
   // 3. NESTED_QUOTES — rewrite `key: "...inner..."` lines that have 3+ unescaped
   //    double-quotes by switching the outer wrapper to single quotes and
   //    leaving inner quotes alone.
@@ -188,10 +257,13 @@ export function autoFixFrontmatter(
       }
       if (fixedAny) {
         working = lines.join('\n');
-        fixes.push({
-          code: 'NESTED_QUOTES',
-          description: 'Rewrote nested double-quoted YAML values to single-quoted',
-        });
+        if (!nestedQuotesFixed) {
+          fixes.push({
+            code: 'NESTED_QUOTES',
+            description: 'Rewrote nested double-quoted YAML values to single-quoted',
+          });
+          nestedQuotesFixed = true;
+        }
       }
     }
   }

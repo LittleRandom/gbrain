@@ -1,9 +1,29 @@
 # TODOS
 
 
-## v0.37.5.0 NESTED_QUOTES validator follow-up
+## v0.37.8.0 pre-existing master test regression (noticed during ship)
 
-- [ ] **v0.37.x+: unify `serializeFrontmatter` tag/title quoting with `brain-writer.ts:184`'s single-quote-with-`''`-escape style for consistency.** Cosmetic only now that the validator at `src/core/markdown.ts:219-238` is YAML-aware (v0.37.5.0). Today the emitter still produces `tags: ["yc"]` (double-quoted via `JSON.stringify`) while the repair path produces `tags: ['yc']` (single-quoted). Both are valid YAML and the validator accepts both, so this is cosmetic — but new writes drifting from repair-side output reads as inconsistency. Original signal: PR #1217 by @garrytan-agents (closed in favor of the validator fix). Touch `src/core/frontmatter-inference.ts:391-416` only; should be ~5 LOC + the existing test at `test/frontmatter-inference.test.ts:239` updated.
+- [x] **P0: `test/doctor-report-remote.test.ts:65` — `full report on healthy brain` fails with `health_score: 50` (expects `>=70`).** **Completed:** v0.37.10.0 (2026-05-21). Resolved structurally by the empty-brain-100/100 fix in `src/core/pglite-engine.ts` + `src/core/postgres-engine.ts` (commit 9aa571f3): pages-empty brains now get vacuous-truth full marks on every breakdown component (35/25/15/15/10), so the freshly-initialized test brain's composite stays >=70 even when `skill_brain_first` returns non-ok. Test file renamed to `test/doctor-report-remote.serial.test.ts` and made hermetic (isolates `GBRAIN_HOME` to a tempdir via beforeAll/afterAll per `scripts/check-test-isolation.sh` R1 — env mutation requires serial quarantine).
+
+## v0.37.7.0 federated-brains + autopilot safety follow-ups (v0.37.x+)
+
+- [ ] **.sql file indexing (#1173) — dropped from v0.37.7.0 because tree-sitter-sql.wasm is not in `src/assets/wasm/grammars/`.** The grammars directory ships 35 languages but SQL is not among them. Plan deliberately verify-first-gated this (codex CF11). Re-file as a dedicated wave that: (a) ships tree-sitter-sql.wasm (vendor from upstream), (b) extends the sync walker's `.md|.markdown|.txt` extension filter to include `.sql`, (c) routes `.sql` through `importCodeFile()` with `page_kind='code'`, (d) addresses the slug-shape collision codex flagged with #1172's punted "flatten extensions" work — `slugifyCodePath('docs/auth.sql')` produces a slug shape that may collide with `docs/auth.md` if #1172 ever ships. Verify-first the slug round-trip before merging.
+
+- [ ] **#1204 deeper investigation — `gbrain extract all` reports 0 links on federated brains with cross-source duplicate slugs.** v0.37.7.0 added `--source-id <id>` to scope extraction explicitly, which gives users a workaround. But the underlying "silent 0 links" bug on unscoped federated extracts has additional facets: the resolver path in `extractLinksFromDB` builds `slugToSources` from `listAllPageRefs`, then iterates `allRefs` and resolves wikilinks. For a slug that exists in 2+ sources, the resolver may pick the wrong target. Run `/investigate` against a fixture with 2 sources × overlapping slugs × cross-source wikilinks, characterize the failure mode, file a precise fix.
+
+- [ ] **Tier 5N doctor check — `subagent_terminal_dead_letters`.** v0.37.7.0 shipped T9 (the subagent dead-letter fix) but deferred the doctor sweep that surfaces historical dead-lettered jobs whose final message is a text-only assistant turn (the #1151 fingerprint). The fix prevents new occurrences; the doctor check would help users discover existing dead-letters from before the upgrade so they can `gbrain jobs prune --status dead --queue default` cleanly. Add the check in v0.37.8+ once a clean conflict-resolved doctor.ts is available.
+
+## v0.37.6.0 OpenRouter recipe follow-ups (v0.37.x+ / v0.38.x)
+
+- [ ] **v0.37.x: Verify `tool_use_id` stability through OpenRouter with a live test, then decide whether to relax `isAnthropicProvider()`'s subagent-only gate.** v0.37.6.0 ships `supports_subagent_loop: false` on the OR recipe as informational only — the real gate is `isAnthropicProvider()` in `src/core/model-config.ts`, which hard-rejects every non-Anthropic provider at subagent submit time. OR proxies Anthropic-direct models that DO support stable `tool_use_id` by contract, but OR's response normalization may strip or re-encode them. A short live test: spin up a real OR account, run a subagent loop via `openrouter:anthropic/claude-haiku-4.5`, deliberately abort mid-loop, retry. Assert tool_use_id blocks are byte-identical across attempts. If they are, the `isAnthropicProvider()` check could relax to allow Anthropic models proxied through OR, giving users OR's price/availability story for subagent work. This is a deeper structural change than a recipe-flag flip; needs its own /plan-eng-review pass. Filed during v0.37.6.0 codex review.
+
+- [ ] **v0.37.x: Quarterly OR catalog refresh.** v0.37.6.0 ships 8 curated chat slugs (gpt-5.2, gpt-5.2-chat, gpt-5.5, claude-haiku-4.5, claude-sonnet-4.6, claude-opus-4.7, gemini-3-flash-preview, deepseek-chat) with `price_last_verified: '2026-05-20'`. OR's catalog churns weekly; specific slugs get deprecated, renamed, or merged. Refresh cadence: every 90 days, walk https://openrouter.ai/models, prune deprecated slugs, add new frontier IDs that match the recipe's curation logic (frontier-tier + cheap-routing entry points). Bump `price_last_verified`. The shape-test regression in `test/ai/recipe-openrouter.test.ts` (`MODEL_SHAPE` regex) means typos surface immediately; the catalog refresh is about discovery, not validation.
+
+- [ ] **v0.37.x: Adopt `resolveDefaultHeaders` for Together / Groq / other attribution-bearing recipes.** v0.37.6.0's `default_headers` / `resolveDefaultHeaders` seam is generic — any recipe whose provider benefits from app-attribution headers can opt in. Together and Groq both have rankings/analytics tied to per-app headers. Add their respective attribution headers to each recipe, similar to OR's `HTTP-Referer` + `X-OpenRouter-Title`. No type-system or gateway changes needed; just `default_headers` blocks on the existing recipes plus `<PROVIDER>_REFERER` / `<PROVIDER>_TITLE` env vars in their `auth_env.optional`. Filed during v0.37.6.0 eng review as a D4 generalization opportunity.
+
+- [ ] **v0.37.x: Guard cli.ts `main()` so importing `buildGatewayConfig` doesn't print help.** v0.37.6.0 exported `buildGatewayConfig` from `src/cli.ts` for test access. Importing it triggers the file's top-level `main()` which prints help to stdout during tests — functionally harmless (tests pass) but noisy. Fix: wrap `main()` in `if (import.meta.main)` so it only runs when cli.ts is the entry point, not when imported. Touches one line; trivial. Filed during v0.37.6.0 implementation.
+
+
 ## v0.37.4.0 pgGraph CI scaffolding follow-ups (v0.37.x+)
 
 - [ ] **T8 truncation signal — defer until dedupe-then-cap SQL + Postgres parity E2E.** v0.37.4.0 ships `frontierCap` as the actually-useful protection but strips the `onTruncation` callback after /review adversarial pass (Claude + Codex both flagged). Two bugs in the v1 algorithm: (a) FALSE POSITIVE — `count == cap` at a depth fires the callback even when the graph organically has exactly cap unique nodes at that depth with no truncation; (b) FALSE NEGATIVE — recursive `LIMIT N` runs BEFORE outer `SELECT DISTINCT`, so diamond graphs (one parent fans out to N+5 candidates with duplicates) can have the LIMIT eat its slots on dupes, then DISTINCT collapses to <cap unique nodes, missing real truncation. Fix shape: rewrite both engine impls to dedupe candidates (by `(slug, id)` or page id, source-scoped) BEFORE applying the LIMIT — i.e., `(SELECT DISTINCT ON ... ORDER BY slug, id LIMIT N)` inside the recursive term instead of post-CTE DISTINCT. Then write the missing `test/e2e/engine-parity-frontier-cap.test.ts` (Postgres against PGLite, identical chosen slugs when cap fires + stable ordering). Restore `TruncationInfo` + `opts.onTruncation` to `TraverseGraphOpts` with the cap-after-dedupe shape. Callers that need truncation visibility in the interim can compare `result.length` against expected fanout bounds. /review found it; not a blocker for v0.37.4.0 because the cap itself works correctly and is back-compat (default unset = no behavior change).
@@ -215,17 +235,58 @@
   update PR. Or a release-cadence audit checklist item. Today: when the
   estimate looks off, hand-edit the constants.
 
-- [ ] **v0.32.x: interactive provider chooser in `gbrain init`.** The full
-  wizard piece of the v0.32 discoverability lane was deferred. Today
-  `gbrain init` (no flags, TTY) silently uses OpenAI default. Plan: hook
-  into `init.ts:resolveAIOptions`, when no `--model` AND TTY AND not
-  `--non-interactive`, call `runExplain([])` (non-JSON path) from
-  `providers.ts:233-350` to print the provider matrix, then prompt with
-  readline (mirror `supabaseWizard()` at `init.ts:108`). Suggest
-  recommended based on env detection. Refuse `user_provided_models`
-  shorthand (already done in v0.32.0). Tests:
-  `test/init-provider-wizard.test.ts` (TTY → prompt fires; non-TTY →
-  falls through; invalid choice → re-prompts).
+- [x] ~~**v0.32.x: interactive provider chooser in `gbrain init`.**~~
+  **SUPERSEDED by v0.37 — closed by the env-detection + hybrid picker wave.**
+  `src/commands/init-provider-picker.ts` mirrors this design: filters to
+  env-ready recipes, prompts via readline through `readLineSafe`, surfaces
+  the subagent-Anthropic caveat on non-Anthropic chat picks. Env detection
+  in `resolveAIOptions` auto-picks when env is unambiguous (one provider's
+  keys set), fires the picker when multiple providers are ready, and exits 1
+  with a paste-ready setup hint in non-TTY zero-key contexts (D3). See
+  `~/.claude/plans/system-instruction-you-are-working-enumerated-mccarthy.md`
+  for the full decision trail.
+
+## Embedding-provider follow-ups (v0.37+)
+
+- [ ] **v0.37+: dedicated migration script for v0.36 broken installs.** v0.37
+  ships D5 + step 11 of the env-detection wave, which surfaces v0.36 silent-
+  default brains in `gbrain doctor` with a paste-ready repair command. What's
+  not yet built: a one-shot orchestrator under `src/commands/migrations/v0_37_x.ts`
+  that detects the broken state (vector(1536) schema + empty
+  `config.embedding_model` + 0 embedded chunks) on `gbrain upgrade` and runs
+  the repair automatically. Same shape as `src/commands/migrations/v0_12_2.ts`.
+  Telemetry-gated: only worth writing if issues show widespread breakage.
+
+- [ ] **v0.37+: namespaced extension fields for `gbrain config set`.** v0.37
+  D6 ships strict unknown-key rejection with a `--force` escape hatch +
+  Levenshtein "did you mean" suggestion. Codex finding #8 from the eng review
+  argued for a `gbrain.ext.<key>` namespace pattern instead of `--force`
+  accepting arbitrary top-level keys; deferred for follow-up. Revisit if
+  `--force` shows misuse in practice (e.g. tooling writing dozens of unknown
+  keys, polluting `gbrain config show`).
+
+- [ ] **v0.37+: runtime config-key inventory audit.** Codex finding #12 from
+  the eng review: the `KNOWN_CONFIG_KEYS` allow-list in `src/core/config.ts`
+  is hand-maintained. A future runtime audit could walk every `cfg.X` access
+  site at startup and cross-check against the allow-list, catching drift
+  when new code paths read a key the maintainer forgot to declare. Pre-merge
+  manual grep (`grep -rE "config\.\w+" src/`) is sufficient today.
+
+- [ ] **v0.38+: env-key typo detection at `gbrain config set` time too.**
+  v0.37 D13 ships Levenshtein typo detection at init for env vars
+  (`OPENAPI_API_KEY` → `OPENAI_API_KEY`). The same logic isn't applied at
+  `gbrain config set` for value-level provider strings (e.g.
+  `gbrain config set embedding_model openai:text-embedign-3-large` —
+  notice the typo'd model name). Cheap to add: parse the value as
+  `provider:model`, suggest the nearest from the recipe's `models[]` list.
+
+- [ ] **v0.38+: extend init env-detection to multimodal explicitly via picker.**
+  v0.37 T11 hooks `resolveSchemaMultimodalDim` preflight into
+  `gbrain reindex --multimodal`. The picker doesn't yet have a 'multimodal'
+  touchpoint mode — multimodal model selection happens via
+  `gbrain config set embedding_multimodal_model` or env detection of
+  multimodal-capable providers. Future polish: extend the picker with a
+  fourth touchpoint case so first-time users discover the option at init.
 
 - [ ] **v0.32.x: real-credentials per-recipe smoke-test CI matrix.** Codex
   finding #6 noted that unit tests via `__setEmbedTransportForTests` prove
