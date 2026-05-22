@@ -4,16 +4,25 @@
 // the public CLI entrypoint. Hermetic — uses Bun's subprocess to run
 // the CLI like a user would.
 
-import { describe, expect, test } from 'bun:test';
+import { describe, expect, test, beforeEach, afterEach } from 'bun:test';
 import { spawnSync } from 'node:child_process';
+import { mkdtempSync, rmSync, existsSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 const REPO_ROOT = join(import.meta.dir, '..');
 
-function gbrain(args: string[]): { stdout: string; stderr: string; code: number } {
+function gbrain(
+  args: string[],
+  extraEnv: Record<string, string> = {},
+): { stdout: string; stderr: string; code: number } {
+  // bun's spawnSync does NOT inherit env mutations done via process.env = ...,
+  // so pass env explicitly. CLAUDE.md flags this pattern as load-bearing for
+  // any subprocess test that needs GBRAIN_HOME isolation.
   const result = spawnSync('bun', ['run', 'src/cli.ts', ...args], {
     cwd: REPO_ROOT,
     encoding: 'utf-8',
+    env: { ...process.env, ...extraEnv },
   });
   return {
     stdout: result.stdout ?? '',
@@ -80,5 +89,62 @@ describe('gbrain schema CLI (Phase C)', () => {
     const r = gbrain(['schema', 'use']);
     expect(r.code).toBe(2);
     expect(r.stderr).toContain('Usage:');
+  });
+});
+
+describe('gbrain schema use (Phase C, gap-fill T3)', () => {
+  let home: string;
+
+  beforeEach(() => {
+    home = mkdtempSync(join(tmpdir(), 'gbrain-schema-use-'));
+  });
+
+  afterEach(() => {
+    rmSync(home, { recursive: true, force: true });
+  });
+
+  test('writes schema_pack to ~/.gbrain/config.json on happy path', () => {
+    const r = gbrain(['schema', 'use', 'gbrain-base'], { GBRAIN_HOME: home });
+    expect(r.code).toBe(0);
+    expect(r.stdout).toContain('Active schema pack set to: gbrain-base');
+    expect(r.stdout).toContain('schema active');
+    const cfgPath = join(home, '.gbrain', 'config.json');
+    expect(existsSync(cfgPath)).toBe(true);
+    const cfg = JSON.parse(readFileSync(cfgPath, 'utf-8'));
+    expect(cfg.schema_pack).toBe('gbrain-base');
+  });
+
+  test('preserves pre-existing config fields when writing schema_pack', () => {
+    // Pre-seed a config with engine + a custom key so the merge preserves them.
+    mkdirSync(join(home, '.gbrain'), { recursive: true });
+    const cfgPath = join(home, '.gbrain', 'config.json');
+    writeFileSync(cfgPath, JSON.stringify({ engine: 'pglite', openai_key: 'sk-fake' }, null, 2), 'utf-8');
+    const r = gbrain(['schema', 'use', 'gbrain-base'], { GBRAIN_HOME: home });
+    expect(r.code).toBe(0);
+    const cfg = JSON.parse(readFileSync(cfgPath, 'utf-8'));
+    expect(cfg.engine).toBe('pglite');
+    expect(cfg.openai_key).toBe('sk-fake');
+    expect(cfg.schema_pack).toBe('gbrain-base');
+  });
+
+  test('overwrites prior schema_pack value on re-run', () => {
+    // First set a placeholder, then overwrite via the CLI.
+    mkdirSync(join(home, '.gbrain'), { recursive: true });
+    const cfgPath = join(home, '.gbrain', 'config.json');
+    writeFileSync(cfgPath, JSON.stringify({ engine: 'pglite', schema_pack: 'something-else' }, null, 2), 'utf-8');
+    const r = gbrain(['schema', 'use', 'gbrain-base'], { GBRAIN_HOME: home });
+    expect(r.code).toBe(0);
+    const cfg = JSON.parse(readFileSync(cfgPath, 'utf-8'));
+    expect(cfg.schema_pack).toBe('gbrain-base');
+  });
+
+  test('unknown pack rejected with exit 1 + paste-ready hint', () => {
+    const r = gbrain(['schema', 'use', 'no-such-pack-xyz'], { GBRAIN_HOME: home });
+    expect(r.code).toBe(1);
+    expect(r.stderr).toContain('Unknown pack');
+    expect(r.stderr).toContain('schema list');
+    // Importantly: a failed `use` must NOT have written a config.
+    const cfgPath = join(home, '.gbrain', 'config.json');
+    expect(existsSync(cfgPath)).toBe(false);
   });
 });
