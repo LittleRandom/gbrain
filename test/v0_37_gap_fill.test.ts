@@ -348,6 +348,18 @@ describe('reinit-pglite — backup + reinit', () => {
   let tmpHome: string;
   let origHome: string | undefined;
 
+  // Restore gateway state for downstream tests (defense-in-depth — earlier
+  // tests in this file already restore, but if this describe block ever
+  // mutates the gateway via a future test, the next file in the same
+  // bun-test shard process won't inherit it).
+  afterAll(() => {
+    configureGateway({
+      embedding_model: 'openai:text-embedding-3-large',
+      embedding_dimensions: 1536,
+      env: { ...process.env },
+    });
+  });
+
   beforeEach(() => {
     tmpHome = mkdtempSync(join(tmpdir(), 'gbrain-v37-reinit-'));
     origHome = process.env.GBRAIN_HOME;
