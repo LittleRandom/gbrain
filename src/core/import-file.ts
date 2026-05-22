@@ -214,6 +214,14 @@ export async function importFromContent(
      * the version bump.
      */
     forceRechunk?: boolean;
+    /**
+     * v0.39 T1.5: active schema pack for type inference. When set, parseMarkdown
+     * uses the pack's path_prefixes instead of the hardcoded gbrain-base table.
+     * When unset, falls back to pre-v0.39 behavior (parity gate stays green).
+     * Callers thread this from `loadActivePack(ctx)` once per command —
+     * NEVER per file inside sync (codex perf finding #7).
+     */
+    activePack?: { page_types: ReadonlyArray<{ name: string; path_prefixes: ReadonlyArray<string> }> };
   } = {},
 ): Promise<ImportResult> {
   // v0.18.0+ multi-source: when caller is syncing under a non-default source,
@@ -235,7 +243,7 @@ export async function importFromContent(
     };
   }
 
-  const parsed = parseMarkdown(content, slug + '.md');
+  const parsed = parseMarkdown(content, slug + '.md', { activePack: opts.activePack });
 
   // Hash includes ALL fields for idempotency (not just compiled_truth + timeline)
   const hash = createHash('sha256')
@@ -409,7 +417,18 @@ export async function importFromFile(
   engine: BrainEngine,
   filePath: string,
   relativePath: string,
-  opts: { noEmbed?: boolean; inferFrontmatter?: boolean; sourceId?: string; forceRechunk?: boolean } = {},
+  opts: {
+    noEmbed?: boolean;
+    inferFrontmatter?: boolean;
+    sourceId?: string;
+    forceRechunk?: boolean;
+    /**
+     * v0.39 T1.5: active schema pack threaded through to importFromContent so
+     * `parseMarkdown` uses pack-driven type inference. Load ONCE per command;
+     * never per file (codex perf finding #7).
+     */
+    activePack?: { page_types: ReadonlyArray<{ name: string; path_prefixes: ReadonlyArray<string> }> };
+  } = {},
 ): Promise<ImportResult> {
   // Defense-in-depth: reject symlinks before reading content.
   const lstat = lstatSync(filePath);
@@ -446,7 +465,7 @@ export async function importFromFile(
     }
   }
 
-  const parsed = parseMarkdown(content, relativePath);
+  const parsed = parseMarkdown(content, relativePath, { activePack: opts.activePack });
 
   // Enforce path-authoritative slug. parseMarkdown prefers frontmatter.slug over
   // the path-derived slug, so a mismatch here means the frontmatter is trying

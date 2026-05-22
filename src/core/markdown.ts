@@ -24,6 +24,17 @@ export interface ParseOpts {
   /** When validate is true and frontmatter has a `slug:` field that doesn't
    *  match expectedSlug, emits SLUG_MISMATCH. */
   expectedSlug?: string;
+  /**
+   * v0.39 T1.5 — active schema pack to drive type inference. When set,
+   * `inferType` uses the pack's `page_types[].path_prefixes` instead of
+   * the hardcoded gbrain-base table. When unset, falls back to the
+   * pre-v0.39 hardcoded behavior (preserves byte-for-byte parity gate
+   * `test/regressions/gbrain-base-equivalence.test.ts`).
+   *
+   * Callers thread this from `loadActivePack(ctx)` once per command —
+   * NEVER per file inside sync, per codex perf finding #7.
+   */
+  activePack?: { page_types: ReadonlyArray<{ name: string; path_prefixes: ReadonlyArray<string> }> };
 }
 
 export interface ParsedMarkdown {
@@ -94,7 +105,9 @@ export function parseMarkdown(
 
   const { compiled_truth, timeline } = splitBody(body);
 
-  const type = (frontmatter.type as string) || inferType(filePath);
+  const type = (frontmatter.type as string) || (
+    opts?.activePack ? inferTypeFromPack(filePath, opts.activePack) : inferType(filePath)
+  );
   const title = (frontmatter.title as string) || inferTitle(filePath);
   const tags = extractTags(frontmatter);
   const slug = (frontmatter.slug as string) || inferSlug(filePath);

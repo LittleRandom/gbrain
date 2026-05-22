@@ -585,9 +585,28 @@ const put_page: Operation = {
     // default-source clobber path. importFromContent already accepts
     // opts.sourceId (PR #707/#757 engine work); previously the op handler
     // just didn't pass it.
+    // v0.39 T1.5: load active pack ONCE per put_page invocation; thread to
+    // parseMarkdown via importFromContent so type inference honors user-defined
+    // page_types. Best-effort: pack load failure falls back to legacy inferType
+    // (parity gate preserved). Federated-read closure correction is T19's scope.
+    let activePack: { page_types: ReadonlyArray<{ name: string; path_prefixes: ReadonlyArray<string> }> } | undefined;
+    try {
+      const { loadActivePack } = await import('./schema-pack/load-active.ts');
+      const { loadConfig } = await import('./config.ts');
+      const resolved = await loadActivePack({
+        cfg: loadConfig(),
+        remote: ctx.remote === false ? false : true,
+        sourceId: ctx.sourceId,
+      });
+      activePack = { page_types: resolved.manifest.page_types };
+    } catch {
+      // Pack load failed; fall through to legacy inferType behavior.
+      activePack = undefined;
+    }
     const result = await importFromContent(ctx.engine, slug, p.content as string, {
       noEmbed,
       ...(ctx.sourceId ? { sourceId: ctx.sourceId } : {}),
+      ...(activePack ? { activePack } : {}),
     });
 
     // Auto-link post-hook: runs AFTER importFromContent (which is its own
