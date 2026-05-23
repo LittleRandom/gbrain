@@ -24,6 +24,7 @@
  */
 
 import { createHash } from 'crypto';
+import { CR_MODES, type CRMode } from '../types.ts';
 
 export type SearchMode = 'conservative' | 'balanced' | 'tokenmax';
 
@@ -162,6 +163,35 @@ export interface ModeBundle {
    * Fires for <1% of queries when on; ~$0.0001 per escalation.
    */
   cross_modal_llm_intent: boolean;
+
+  /**
+   * v0.40.3.0 — contextual retrieval tier per mode. Wraps chunks at embed
+   * time so the embedder sees document-level orientation alongside the
+   * chunk. Wrapper is built JUST IN TIME and never persisted as
+   * `content_chunks.chunk_text` (D20-T1 — search snippets, FTS, reranker,
+   * debug all read the canonical chunk_text).
+   *
+   * Per-mode defaults (D1+D2):
+   *   conservative → 'none' (minimum surface)
+   *   balanced     → 'title' (free at runtime — pure string concat)
+   *   tokenmax     → 'per_chunk_synopsis' (Anthropic's published method)
+   *
+   * Override resolution chain (D5+D6+D15): page frontmatter > source row >
+   * global mode bundle. Mount-frontmatter overrides honored only when
+   * `sources.trust_frontmatter_overrides` is true (host id='default' is
+   * always trusted). See `src/core/contextual-retrieval-resolver.ts`.
+   */
+  contextual_retrieval: CRMode;
+
+  /**
+   * v0.40.3.0 — soft kill switch (D18). When true, `hybridSearch` treats
+   * all tiers as 'none' at query time AND `import-file.ts` skips wrapper
+   * resolution entirely. Existing wrapped vectors in `content_chunks`
+   * keep serving queries (cosine similarity is preserved between wrapped
+   * documents and raw queries). Single config-key rollback if quality
+   * regresses post-deploy.
+   */
+  contextual_retrieval_disabled: boolean;
 }
 
 /**
@@ -198,6 +228,9 @@ export const MODE_BUNDLES: Readonly<Record<SearchMode, Readonly<ModeBundle>>> = 
     unified_multimodal: false,
     unified_multimodal_only: false,
     cross_modal_llm_intent: false,
+    // v0.40.3.0 contextual retrieval — none for conservative (minimum surface).
+    contextual_retrieval: 'none' as CRMode,
+    contextual_retrieval_disabled: false,
   }),
   balanced: Object.freeze({
     cache_enabled: true,
@@ -231,6 +264,11 @@ export const MODE_BUNDLES: Readonly<Record<SearchMode, Readonly<ModeBundle>>> = 
     unified_multimodal: false,
     unified_multimodal_only: false,
     cross_modal_llm_intent: false,
+    // v0.40.3.0 contextual retrieval — title-only for balanced (free at
+    // runtime; pure string concat, no Haiku). Default mode for most users
+    // per the cost-tier philosophy.
+    contextual_retrieval: 'title' as CRMode,
+    contextual_retrieval_disabled: false,
   }),
   tokenmax: Object.freeze({
     cache_enabled: true,
@@ -261,6 +299,11 @@ export const MODE_BUNDLES: Readonly<Record<SearchMode, Readonly<ModeBundle>>> = 
     unified_multimodal: false,
     unified_multimodal_only: false,
     cross_modal_llm_intent: false,
+    // v0.40.3.0 contextual retrieval — per-chunk Haiku synopsis for tokenmax
+    // (Anthropic's published method). One-time backfill cost ~$5-50 for a
+    // 10K-page brain; documented in the post-upgrade cost prompt.
+    contextual_retrieval: 'per_chunk_synopsis' as CRMode,
+    contextual_retrieval_disabled: false,
   }),
 });
 
@@ -302,6 +345,9 @@ export interface SearchKeyOverrides {
   unified_multimodal?: boolean;
   unified_multimodal_only?: boolean;
   cross_modal_llm_intent?: boolean;
+  // v0.40.3.0 contextual retrieval. CRMode override + soft kill switch.
+  contextual_retrieval?: CRMode;
+  contextual_retrieval_disabled?: boolean;
 }
 
 /**
@@ -335,6 +381,9 @@ export interface SearchPerCallOpts {
   unified_multimodal?: boolean;
   unified_multimodal_only?: boolean;
   cross_modal_llm_intent?: boolean;
+  // v0.40.3.0 contextual retrieval per-call overrides.
+  contextual_retrieval?: CRMode;
+  contextual_retrieval_disabled?: boolean;
 }
 
 /**
@@ -403,6 +452,9 @@ export function resolveSearchMode(input: ResolveSearchModeInput): ResolvedSearch
     unified_multimodal: pick('unified_multimodal'),
     unified_multimodal_only: pick('unified_multimodal_only'),
     cross_modal_llm_intent: pick('cross_modal_llm_intent'),
+    // v0.40.3.0 contextual retrieval — resolved via the same pick chain.
+    contextual_retrieval: pick('contextual_retrieval'),
+    contextual_retrieval_disabled: pick('contextual_retrieval_disabled'),
     resolved_mode,
     mode_valid: valid,
   };
@@ -471,7 +523,14 @@ export function attributeKnob<K extends keyof ModeBundle>(
 // image-mode caller). v0.35.6.0's floor_ratio bump and v0.36's cross-modal
 // extensions both land under v=3, with cross-modal fields appended after
 // the floor_ratio entry (CDX2-F13 append-only convention).
-export const KNOBS_HASH_VERSION = 3;
+//
+// v0.39 T21 (master): schema_pack identity fields added under v=4.
+//
+// v0.40.3.0 (this branch, per D8 sequencing): contextual_retrieval and
+// contextual_retrieval_disabled added under v=5. Sequenced behind salem's
+// pending v=4 graph signals work — first to land claims v=4; second
+// rebases to v=5 (we did, since master's v=4 already landed before us).
+export const KNOBS_HASH_VERSION = 5;
 
 /**
  * v0.36 (D8 / CDX-2) — second-arg context for the cache key. The
@@ -549,12 +608,20 @@ export function knobsHash(
     // must never be served from a row that ran against `embedding`.
     `col=${ctx?.embeddingColumn ?? 'embedding'}`,
     `prov=${ctx?.embeddingModel ?? 'default'}`,
-    // v0.39 T21 + codex finding #5: schema-pack name + version. Cross-pack
-    // contamination is structurally impossible — a query that resolved
-    // type `researcher` against pack A cannot be served from a row that
-    // resolved against pack B.
+    // v=4 additions (append-only). v0.39 T21 + codex finding #5: schema-pack
+    // name + version. Cross-pack contamination is structurally impossible
+    // — a query that resolved type `researcher` against pack A cannot be
+    // served from a row that resolved against pack B.
     `pack=${ctx?.schemaPack ?? 'none'}`,
     `pver=${ctx?.schemaPackVersion ?? 'none'}`,
+    // v=5 contextual retrieval additions (v0.40.3.0, per D8 sequencing
+    // behind salem's pending v=4 graph signals). A query against a brain
+    // on tokenmax (per-chunk synopsis) must NEVER be served from a cache
+    // row written when the brain was on balanced (title-only) — different
+    // embedding spaces. Soft kill switch participates too so flipping it
+    // neutralizes prior cache rows.
+    `cr=${knobs.contextual_retrieval}`,
+    `crd=${knobs.contextual_retrieval_disabled ? 1 : 0}`,
   ];
   const h = createHash('sha256');
   h.update(parts.join('|'));
@@ -685,6 +752,15 @@ export function loadOverridesFromConfig(
   if (lli !== undefined) {
     out.cross_modal_llm_intent = lli === '1' || lli.toLowerCase() === 'true';
   }
+  // v0.40.3.0 contextual retrieval. tier override + soft kill switch.
+  const cr = get('search.contextual_retrieval');
+  if (cr !== undefined && (CR_MODES as readonly string[]).includes(cr.trim().toLowerCase())) {
+    out.contextual_retrieval = cr.trim().toLowerCase() as CRMode;
+  }
+  const crd = get('search.contextual_retrieval_disabled');
+  if (crd !== undefined) {
+    out.contextual_retrieval_disabled = crd === '1' || crd.toLowerCase() === 'true';
+  }
 
   return out;
 }
@@ -714,6 +790,11 @@ export const SEARCH_MODE_CONFIG_KEYS: ReadonlyArray<string> = Object.freeze([
   'search.unified_multimodal',
   'search.unified_multimodal_only',
   'search.cross_modal.llm_intent',
+  // v0.40.3.0 contextual retrieval — tier override + soft kill switch.
+  // Per-mode default lives in the bundle; this key lets power users
+  // override at the per-key level without flipping the global mode.
+  'search.contextual_retrieval',
+  'search.contextual_retrieval_disabled',
 ]);
 
 /**

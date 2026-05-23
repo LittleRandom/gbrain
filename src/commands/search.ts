@@ -62,6 +62,9 @@ const KNOB_DESCRIPTIONS: Record<keyof ModeBundle, string> = {
   unified_multimodal: 'Phase 3 — route all queries through embedding_multimodal column',
   unified_multimodal_only: 'Phase 3 strict — bypass dual-column fallback when unified is on',
   cross_modal_llm_intent: 'Commit 4 — Haiku tie-break for ambiguous modality classification',
+  // v0.40.3.0 contextual retrieval
+  contextual_retrieval: 'CR tier (none|title|per_chunk_synopsis) — wraps chunks at embed time',
+  contextual_retrieval_disabled: 'Soft kill switch — neutralizes CR wrapping for queries + new embeds',
 };
 
 interface SearchModesReport {
