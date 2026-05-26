@@ -1,5 +1,5 @@
 /**
- * v0.41.13.0 — Targeted assertions for the 3 new doctor checks.
+ * v0.41.16.0 — Targeted assertions for the 3 new doctor checks.
  *
  * Spawns `bun src/cli.ts doctor --json --fast` as a subprocess and
  * parses the JSON envelope to verify:
@@ -10,7 +10,7 @@
  *
  * are present with stable shapes. The full doctor surface is covered
  * by test/doctor.test.ts; this file is a structural regression guard
- * for the 3 new v0.41.13.0 checks.
+ * for the 3 new v0.41.16.0 checks.
  *
  * Spawning the subprocess matches the actual user experience (`gbrain
  * doctor`) and avoids the in-process env/stdout-capture brittleness
@@ -56,7 +56,7 @@ function runDoctor(): DoctorEnvelope {
   return JSON.parse(jsonLine) as DoctorEnvelope;
 }
 
-describe('doctor — v0.41.13.0 new checks emit', () => {
+describe('doctor — v0.41.16.0 new checks emit', () => {
   test('all 3 new checks present in JSON envelope', () => {
     const env = runDoctor();
     const checkNames = env.checks.map((c) => c.name);
@@ -91,7 +91,7 @@ describe('doctor — v0.41.13.0 new checks emit', () => {
     );
   });
 
-  test('schema_version is stable (2 at v0.41.13.0)', () => {
+  test('schema_version is stable (2 at v0.41.16.0)', () => {
     const env = runDoctor();
     expect(env.schema_version).toBe(2);
   });

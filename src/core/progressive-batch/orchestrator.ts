@@ -1,5 +1,5 @@
 /**
- * v0.41.13.0 — Progressive-batch primitive orchestrator.
+ * v0.41.16.0 — Progressive-batch primitive orchestrator.
  *
  * The single seam every batch-style gbrain operation routes through.
  * Replaces 12+ ad-hoc cost-prompt / TTY-grace / ramp-up patterns

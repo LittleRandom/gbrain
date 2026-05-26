@@ -1,5 +1,5 @@
 /**
- * v0.41.13.0 — LLM fallback for the conversation parser.
+ * v0.41.16.0 — LLM fallback for the conversation parser.
  *
  * When every regex pattern matches 0 lines on a page, AND the user
  * has explicitly opted in via

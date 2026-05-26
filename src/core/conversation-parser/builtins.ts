@@ -1,5 +1,5 @@
 /**
- * v0.41.13.0 — Built-in conversation parser pattern registry.
+ * v0.41.16.0 — Built-in conversation parser pattern registry.
  *
  * Twelve hand-vetted patterns covering the chat-export formats this
  * codebase is most likely to encounter. Each pattern's regex was

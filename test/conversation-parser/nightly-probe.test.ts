@@ -1,5 +1,5 @@
 /**
- * v0.41.13.0 — Nightly probe unit tests.
+ * v0.41.16.0 — Nightly probe unit tests.
  *
  * Hermetic via NightlyProbeDeps injection. No real LLM calls.
  *

@@ -1,5 +1,5 @@
 /**
- * v0.41.13.0 — Conversation parser orchestrator tests.
+ * v0.41.16.0 — Conversation parser orchestrator tests.
  *
  * Covers:
  *   - PR #1461's 6 telegram-bracket cases verbatim (REGRESSION pin)

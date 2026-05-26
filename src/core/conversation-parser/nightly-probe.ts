@@ -1,5 +1,5 @@
 /**
- * v0.41.13.0 — Nightly conversation-parser quality probe.
+ * v0.41.16.0 — Nightly conversation-parser quality probe.
  *
  * Per D10: mode-gated default. When `search.mode=tokenmax` is set the
  * probe runs ON by default; for `conservative` and `balanced` it's
@@ -18,7 +18,7 @@
  * by the active BudgetTracker the autopilot loop creates per-tick.
  *
  * **Wiring into the autopilot loop is deferred to a follow-up**
- * (filed in TODOS.md). v0.41.13.0 ships the phase as a callable
+ * (filed in TODOS.md). v0.41.16.0 ships the phase as a callable
  * module so doctor + future cron drivers can invoke it; the
  * scheduler wire-up follows the same shape as
  * `src/core/cycle/nightly-quality-probe.ts` (v0.40.1.0 Track D / T6).

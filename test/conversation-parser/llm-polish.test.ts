@@ -1,5 +1,5 @@
 /**
- * v0.41.13.0 — LLM polish unit tests.
+ * v0.41.16.0 — LLM polish unit tests.
  *
  * Pins:
  *   - applyPolish pure function: merge + drop + edits

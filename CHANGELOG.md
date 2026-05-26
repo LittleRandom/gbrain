@@ -2,7 +2,7 @@
 
 All notable changes to GBrain will be documented in this file.
 
-## [0.41.15.0] - 2026-05-26
+## [0.41.16.0] - 2026-05-26
 
 **Your brain now understands every common chat format, not just iMessage.**
 
@@ -240,7 +240,7 @@ its shape needs more design.
 - Real-corpus-redacted fixtures (5-10 production pages scrubbed via
   one-shot script; production-recovery signal vs synthetic-only).
 
-## To take advantage of v0.41.15.0
+## To take advantage of v0.41.16.0
 
 `gbrain upgrade` should do this automatically. If it didn't, or if
 `gbrain doctor` warns about a partial migration:

@@ -1,8 +1,8 @@
 # TODOS
 
-## v0.41.15.0 conversation parser + progressive-batch follow-ups (v0.41.14.0+)
+## v0.41.16.0 conversation parser + progressive-batch follow-ups (v0.41.14.0+)
 
-The v0.41.15.0 cathedral shipped the parser primitive + progressive-batch
+The v0.41.16.0 cathedral shipped the parser primitive + progressive-batch
 primitive + ONE proven consumer (extract-conversation-facts). Per D2 (codex
 outside voice acknowledged + user accepted the trade), the wider 9-site
 retrofit + 5 architectural follow-ups land as structured waves to keep each
@@ -68,7 +68,7 @@ PR bisectable.
   fallback-parsed messages to a judge model and score correctness.
   Why: catches hallucinated parses (LLM "inventing" speakers/timestamps
   on adversarial input). Pros: closes a quality gap. Cons: cost;
-  needs budget policy + judge model selection. Context: v0.41.15.0
+  needs budget policy + judge model selection. Context: v0.41.16.0
   catches hallucination only via the adversarial fixture set in the
   nightly probe (5 fixtures). Real adversarial drift = more
   fixtures + judge scoring. Priority: P2.

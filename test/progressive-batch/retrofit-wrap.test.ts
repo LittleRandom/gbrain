@@ -1,7 +1,7 @@
 /**
- * v0.41.13.0 — retrofitWrap helper unit tests.
+ * v0.41.16.0 — retrofitWrap helper unit tests.
  *
- * Pins the thin wrapper used by 8 of the 9 v0.41.13.0 retrofits:
+ * Pins the thin wrapper used by 8 of the 9 v0.41.16.0 retrofits:
  *   - Default opt-out of D3 safety net + zero ramp grace.
  *   - Audit JSONL still writes.
  *   - Cost projection rolls up correctly.

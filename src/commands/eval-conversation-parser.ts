@@ -1,5 +1,5 @@
 /**
- * v0.41.13.0 — `gbrain eval conversation-parser <fixture.jsonl>` CLI verb.
+ * v0.41.16.0 — `gbrain eval conversation-parser <fixture.jsonl>` CLI verb.
  *
  * Per Layer 4a: fixture-corpus CI gate. Deterministic; runs in PR CI
  * with `--no-llm` so built-in regex regressions block PRs WITHOUT
@@ -68,7 +68,7 @@ function parseArgs(args: string[]): CliArgs {
 function printHelp(): void {
   process.stdout.write(`Usage: gbrain eval conversation-parser [options] <fixture.jsonl>
 
-Run the v0.41.13.0 conversation parser against a JSONL fixture
+Run the v0.41.16.0 conversation parser against a JSONL fixture
 corpus and report per-fixture quality + an aggregate verdict.
 
 Options:

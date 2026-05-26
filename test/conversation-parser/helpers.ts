@@ -1,5 +1,5 @@
 /**
- * v0.41.13.0 — Test helpers for conversation-parser unit tests.
+ * v0.41.16.0 — Test helpers for conversation-parser unit tests.
  *
  * `makeChatResult(text)` builds a fully-typed `ChatResult` stub so
  * test transports satisfy the gateway's type contract without each

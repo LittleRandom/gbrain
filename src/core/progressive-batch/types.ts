@@ -1,5 +1,5 @@
 /**
- * v0.41.13.0 — Progressive-batch primitive type surface.
+ * v0.41.16.0 — Progressive-batch primitive type surface.
  *
  * Shared types for `runProgressiveBatch` and its consumers. Lives in its
  * own file so type-only imports don't drag the orchestrator's runtime

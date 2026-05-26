@@ -1,5 +1,5 @@
 /**
- * v0.41.13.0 — Stage report formatter.
+ * v0.41.16.0 — Stage report formatter.
  *
  * Pure formatter for human + JSON stage reports. The orchestrator
  * invokes this from its default `Policy.onStageReport` handler when

@@ -1,5 +1,5 @@
 /**
- * v0.41.13.0 — Shared LLM base for conversation-parser polish + fallback.
+ * v0.41.16.0 — Shared LLM base for conversation-parser polish + fallback.
  *
  * Per D6: polish and fallback share ~80% of code (provider probe,
  * content-hash cache, fail-open semantics, audit). Extract once;

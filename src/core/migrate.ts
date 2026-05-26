@@ -4557,7 +4557,7 @@ export const MIGRATIONS: Migration[] = [
   {
     version: 98,
     name: 'conversation_parser_llm_cache_table',
-    // v0.41.15.0 — content-hash-keyed cache for the conversation
+    // v0.41.16.0 — content-hash-keyed cache for the conversation
     // parser's LLM polish + fallback calls. Per D17 (codex outside
     // voice), there is NO conversation_parser_inferred_patterns
     // table: persisting LLM-inferred regex from a 20-line sample

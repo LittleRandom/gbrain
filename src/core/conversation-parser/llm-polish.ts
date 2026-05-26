@@ -1,5 +1,5 @@
 /**
- * v0.41.13.0 — LLM polish for regex-matched conversation output.
+ * v0.41.16.0 — LLM polish for regex-matched conversation output.
  *
  * Runs on regex-matched pages when:
  *   - `conversation_parser.llm_polish_enabled` is true (D15: opt-IN

@@ -1,5 +1,5 @@
 /**
- * v0.41.13.0 — Progressive-batch primitive unit tests.
+ * v0.41.16.0 — Progressive-batch primitive unit tests.
  *
  * Pins every verdict branch of runProgressiveBatch (D3 fail-closed
  * budget, D20 discriminated verifier shapes, D21 honest jump-to-full,

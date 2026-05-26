@@ -1,5 +1,5 @@
 /**
- * v0.41.13.0 — `gbrain conversation-parser` debug CLI tests.
+ * v0.41.16.0 — `gbrain conversation-parser` debug CLI tests.
  *
  * Pins:
  *   - list-builtins prints all 12 patterns + accepts --json
@@ -137,7 +137,7 @@ describe('runConversationParser — validate', () => {
     const json = JSON.parse(cap.out.join('').trim());
     expect(json.schema_version).toBe(1);
     expect(json.status).toBe('deferred');
-    expect(json.todo_ref).toContain('v0.41.13.0');
+    expect(json.todo_ref).toContain('v0.41.16.0');
   });
 
   test('exits 2 on missing file path', async () => {

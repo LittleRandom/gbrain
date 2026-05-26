@@ -1,5 +1,5 @@
 /**
- * v0.41.13.0 — Conversation parser type surface.
+ * v0.41.16.0 — Conversation parser type surface.
  *
  * The orchestrator's contract surface. Built-in patterns + user-
  * declared simple_patterns + LLM polish + LLM fallback all flow

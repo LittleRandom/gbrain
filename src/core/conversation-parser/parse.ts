@@ -1,5 +1,5 @@
 /**
- * v0.41.13.0 — Conversation parser orchestrator.
+ * v0.41.16.0 — Conversation parser orchestrator.
  *
  * Drives the per-page parse pipeline:
  *

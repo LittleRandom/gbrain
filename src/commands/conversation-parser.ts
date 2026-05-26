@@ -1,5 +1,5 @@
 /**
- * v0.41.13.0 — `gbrain conversation-parser` debug CLI.
+ * v0.41.16.0 — `gbrain conversation-parser` debug CLI.
  *
  * Three subcommands for operators:
  *   - scan <slug>       Dry-run the parser on a page; report which
@@ -139,7 +139,7 @@ function runValidate(args: string[], json: boolean): void {
     message:
       'User-declared simple_pattern compilation is deferred to v0.42+. ' +
       'v1 supports only the 12 built-in patterns (see `list-builtins`).',
-    todo_ref: 'TODOS.md v0.41.13.0 follow-ups #1, #2',
+    todo_ref: 'TODOS.md v0.41.16.0 follow-ups #1, #2',
   };
   if (json) {
     process.stdout.write(JSON.stringify(payload, null, 2) + '\n');

@@ -1,5 +1,5 @@
 /**
- * v0.41.13.0 — E2E test for the conversation parser cathedral against
+ * v0.41.16.0 — E2E test for the conversation parser cathedral against
  * a real PGLite brain.
  *
  * For each of the 12 built-in formats: seed a page through

@@ -1,5 +1,5 @@
 /**
- * v0.41.13.0 — Progressive-batch audit JSONL writer.
+ * v0.41.16.0 — Progressive-batch audit JSONL writer.
  *
  * Wraps the shared `createAuditWriter` primitive (v0.40.4.0) for the
  * progressive-batch trail. ISO-week-rotated at
