@@ -10,8 +10,9 @@
 //   - Body is human-readable + machine-readable frontmatter is the
 //     load-bearing surface
 
-import { describe, expect, test } from 'bun:test';
+import { describe, expect, test, beforeAll, afterAll, beforeEach } from 'bun:test';
 import { PGLiteEngine } from '../../src/core/pglite-engine.ts';
+import { resetPgliteState } from '../helpers/reset-pglite.ts';
 import {
   receiptSlug,
   shortRunId,
@@ -88,114 +89,91 @@ describe('shortRunId / dateFromIso — pure helpers', () => {
 });
 
 describe('writeReceipt — frontmatter D-EXTRACT-19 belt+suspenders', () => {
+  // Canonical PGLite block per CLAUDE.md test-isolation R3+R4.
+  // One engine per file; TRUNCATE between tests is ~2 orders of magnitude
+  // faster than re-running 99 migrations per test.
   let engine: PGLiteEngine;
 
-  // Set up engine ONCE per file per CLAUDE.md test-isolation R3+R4
-  // canonical PGLite block. resetPgliteState between tests would be
-  // nice but the public API doesn't surface a truncate path; the test
-  // suite is small enough (5 cases) that re-creating the engine per
-  // test isn't expensive on first invocation.
-  test('stamps type:extract_receipt + dream_generated:true regardless of input', async () => {
+  beforeAll(async () => {
     engine = new PGLiteEngine();
     await engine.connect({});
     await engine.initSchema();
-    try {
-      const { slug, page } = await writeReceipt(engine, BASE_INPUT);
-      expect(slug).toBe('extracts/2026-05-27/facts.conversation/default/a1b2c3d4/round-full');
-      expect(page.type).toBe('extract_receipt');
-      // belt + suspenders: both anti-loop flags are present
-      expect(page.frontmatter?.type).toBe('extract_receipt');
-      expect(page.frontmatter?.dream_generated).toBe(true);
-    } finally {
-      await engine.disconnect();
-    }
+  });
+
+  afterAll(async () => {
+    await engine.disconnect();
+  });
+
+  beforeEach(async () => {
+    await resetPgliteState(engine);
+  });
+
+  test('stamps type:extract_receipt + dream_generated:true regardless of input', async () => {
+    const { slug, page } = await writeReceipt(engine, BASE_INPUT);
+    expect(slug).toBe('extracts/2026-05-27/facts.conversation/default/a1b2c3d4/round-full');
+    expect(page.type).toBe('extract_receipt');
+    // belt + suspenders: both anti-loop flags are present
+    expect(page.frontmatter?.type).toBe('extract_receipt');
+    expect(page.frontmatter?.dream_generated).toBe(true);
   });
 
   test('stamps optional model_id + eval_pass + eval_score when supplied', async () => {
-    engine = new PGLiteEngine();
-    await engine.connect({});
-    await engine.initSchema();
-    try {
-      const { page } = await writeReceipt(engine, {
-        ...BASE_INPUT,
-        run_id: 'eval-pass-run-id',
-        model_id: 'claude-haiku-4-5',
-        eval_pass: true,
-        eval_score: 8.7,
-      });
-      expect(page.frontmatter?.model_id).toBe('claude-haiku-4-5');
-      expect(page.frontmatter?.eval_pass).toBe(true);
-      expect(page.frontmatter?.eval_score).toBe(8.7);
-    } finally {
-      await engine.disconnect();
-    }
+    const { page } = await writeReceipt(engine, {
+      ...BASE_INPUT,
+      run_id: 'eval-pass-run-id',
+      model_id: 'claude-haiku-4-5',
+      eval_pass: true,
+      eval_score: 8.7,
+    });
+    expect(page.frontmatter?.model_id).toBe('claude-haiku-4-5');
+    expect(page.frontmatter?.eval_pass).toBe(true);
+    expect(page.frontmatter?.eval_score).toBe(8.7);
   });
 
   test('omits eval_pass / model_id when not supplied (deterministic extractor)', async () => {
-    engine = new PGLiteEngine();
-    await engine.connect({});
-    await engine.initSchema();
-    try {
-      const { page } = await writeReceipt(engine, {
-        ...BASE_INPUT,
-        run_id: 'deterministic-run-id',
-        kind: 'links',
-        cost_usd: 0,
-      });
-      expect(page.frontmatter?.model_id).toBeUndefined();
-      expect(page.frontmatter?.eval_pass).toBeUndefined();
-      expect(page.frontmatter?.eval_score).toBeUndefined();
-      // Anti-loop flags STILL present even on deterministic extractors
-      expect(page.frontmatter?.type).toBe('extract_receipt');
-      expect(page.frontmatter?.dream_generated).toBe(true);
-    } finally {
-      await engine.disconnect();
-    }
+    const { page } = await writeReceipt(engine, {
+      ...BASE_INPUT,
+      run_id: 'deterministic-run-id',
+      kind: 'links',
+      cost_usd: 0,
+    });
+    expect(page.frontmatter?.model_id).toBeUndefined();
+    expect(page.frontmatter?.eval_pass).toBeUndefined();
+    expect(page.frontmatter?.eval_score).toBeUndefined();
+    // Anti-loop flags STILL present even on deterministic extractors
+    expect(page.frontmatter?.type).toBe('extract_receipt');
+    expect(page.frontmatter?.dream_generated).toBe(true);
   });
 
   test('idempotent on resume: same run_id+round overwrites prior receipt', async () => {
-    engine = new PGLiteEngine();
-    await engine.connect({});
-    await engine.initSchema();
-    try {
-      const first = await writeReceipt(engine, {
-        ...BASE_INPUT,
-        run_id: 'idem-run',
-        total_rows: 10,
-      });
-      const second = await writeReceipt(engine, {
-        ...BASE_INPUT,
-        run_id: 'idem-run',
-        total_rows: 47, // updated count on resume
-      });
-      expect(first.slug).toBe(second.slug);
-      // Read back: row count is the latest write
-      expect(second.page.frontmatter?.total_rows).toBe(47);
-    } finally {
-      await engine.disconnect();
-    }
+    const first = await writeReceipt(engine, {
+      ...BASE_INPUT,
+      run_id: 'idem-run',
+      total_rows: 10,
+    });
+    const second = await writeReceipt(engine, {
+      ...BASE_INPUT,
+      run_id: 'idem-run',
+      total_rows: 47, // updated count on resume
+    });
+    expect(first.slug).toBe(second.slug);
+    // Read back: row count is the latest write
+    expect(second.page.frontmatter?.total_rows).toBe(47);
   });
 
   test('body contains human-readable summary + machine-readable fields', async () => {
-    engine = new PGLiteEngine();
-    await engine.connect({});
-    await engine.initSchema();
-    try {
-      const { page } = await writeReceipt(engine, {
-        ...BASE_INPUT,
-        run_id: 'body-test-run',
-        summary: 'Extracted 47 facts from 6 conversation pages.',
-        model_id: 'claude-haiku-4-5',
-        eval_pass: true,
-        eval_score: 9.1,
-      });
-      expect(page.compiled_truth).toContain('facts.conversation');
-      expect(page.compiled_truth).toContain('Extracted 47 facts from 6 conversation pages.');
-      expect(page.compiled_truth).toContain('default');
-      expect(page.compiled_truth).toContain('claude-haiku-4-5');
-      expect(page.compiled_truth).toMatch(/PASS/);
-    } finally {
-      await engine.disconnect();
-    }
+    const { page } = await writeReceipt(engine, {
+      ...BASE_INPUT,
+      run_id: 'body-test-run',
+      summary: 'Extracted 47 facts from 6 conversation pages.',
+      model_id: 'claude-haiku-4-5',
+      eval_pass: true,
+      eval_score: 9.1,
+    });
+    expect(page.compiled_truth).toContain('facts.conversation');
+    expect(page.compiled_truth).toContain('Extracted 47 facts from 6 conversation pages.');
+    expect(page.compiled_truth).toContain('default');
+    expect(page.compiled_truth).toContain('claude-haiku-4-5');
+    expect(page.compiled_truth).toMatch(/PASS/);
   });
 });
