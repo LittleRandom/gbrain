@@ -1,5 +1,49 @@
 # TODOS
 
+## v0.41.19.0 status + doctor-categories wave follow-ups (v0.42+)
+
+- **TODO-V19-A (P3)**: Persistent `cycle_runs` table. v0.41.19.0 infers
+  "last full cycle" by querying `minion_jobs WHERE name = 'autopilot-cycle'`
+  for the most recent completed row. This works but conflates "cycle ran
+  via the autopilot scheduler" with "cycle ran." A dedicated `cycle_runs`
+  table written from `runCycle` directly would let `gbrain status`
+  surface manual `gbrain dream` invocations + per-source partial cycles
+  separately. Defer until the inference's accuracy limits actually bite
+  someone.
+
+- **TODO-V19-B (P2)**: Surface `extract_atoms` + `synthesize_concepts`
+  counts in `CycleReport.totals` top-level. Today the counts live inside
+  each phase's `details` field; the v0.41.19.0 `gbrain status` cycle
+  section can't surface them without per-phase parsing. Bump the
+  `CycleReport.totals` shape additively (the existing field is
+  documented as additive) and add `atoms_inserted` +
+  `concepts_inserted` next to `facts_consolidated`.
+
+- **TODO-V19-C (P3)**: Check-registry refactor for `gbrain doctor`. The
+  v0.41.19.0 `--scope=brain` uses explicit early-skip gates inline at
+  each call site (~40 LOC across resolver + skill_conformance +
+  skill_brain_first + whoknows). If we want to add more scope
+  dimensions later (e.g. `--scope=ops`, `--exclude-skill`), the right
+  next step is a check registry: each check declares
+  `{name, category, run}`, `buildChecks` becomes "run all entries
+  whose category is in scope." ~300 LOC, touches every check site.
+  Considered + rejected for v0.41.19.0 as too large for a single fix
+  wave (D9-B option in the plan).
+
+- **TODO-V19-D (P3)**: Read installed launchd/cron/systemd schedule
+  to compute a real "next autopilot tick" timestamp. v0.41.19.0
+  status surfaces "Autopilot: running (PID N)" instead. Cross-OS
+  scheduler probing is a separate, larger problem; macOS launchd
+  plist parsing alone is ~80 LOC.
+
+- **TODO-V19-E (P2)**: Apply category-aware exit codes to
+  `gbrain doctor`. Today doctor exits 0 on all-ok, 1 on any fail.
+  After categorization, a CI gate could opt into "fail only on
+  brain-category failures" via `--scope=brain` (already shipping) or
+  a `--fail-on=brain` flag. Filing this as a discoverability
+  follow-up — the `--scope=brain` flag already covers most of the
+  use case.
+
 ## v0.41.18.0 onboard wave follow-ups (v0.42.1+)
 
 - **TODO-A (P2)**: Pack-aware `linkable: boolean` per-type field on schema-pack
