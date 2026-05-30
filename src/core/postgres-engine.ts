@@ -4473,6 +4473,53 @@ export class PostgresEngine implements BrainEngine {
     }
   }
 
+  async resolveAliases(
+    aliasNorms: string[],
+    opts?: { sourceId?: string; sourceIds?: string[] },
+  ): Promise<Map<string, string[]>> {
+    const out = new Map<string, string[]>();
+    if (!aliasNorms || aliasNorms.length === 0) return out;
+    const sql = this.sql;
+    const sources =
+      opts?.sourceIds && opts.sourceIds.length > 0
+        ? opts.sourceIds
+        : opts?.sourceId
+          ? [opts.sourceId]
+          : null;
+    const rows = sources
+      ? await sql`
+          SELECT alias_norm, slug
+          FROM page_aliases
+          WHERE alias_norm = ANY(${aliasNorms}::text[])
+            AND source_id = ANY(${sources}::text[])
+          ORDER BY alias_norm, slug`
+      : await sql`
+          SELECT alias_norm, slug
+          FROM page_aliases
+          WHERE alias_norm = ANY(${aliasNorms}::text[])
+          ORDER BY alias_norm, slug`;
+    for (const r of rows) {
+      const a = r.alias_norm as string;
+      const list = out.get(a) ?? [];
+      if (!list.includes(r.slug as string)) list.push(r.slug as string);
+      out.set(a, list);
+    }
+    return out;
+  }
+
+  async setPageAliases(slug: string, sourceId: string, aliasNorms: string[]): Promise<void> {
+    const sql = this.sql;
+    const uniq = Array.from(new Set(aliasNorms.filter(a => a.length > 0)));
+    await sql.begin(async tx => {
+      await tx`DELETE FROM page_aliases WHERE source_id = ${sourceId} AND slug = ${slug}`;
+      if (uniq.length === 0) return;
+      await tx`
+        INSERT INTO page_aliases (source_id, alias_norm, slug)
+        SELECT ${sourceId}, a, ${slug} FROM unnest(${uniq}::text[]) AS a
+        ON CONFLICT (source_id, alias_norm, slug) DO NOTHING`;
+    });
+  }
+
   // Config
   async getConfig(key: string): Promise<string | null> {
     const sql = this.sql;

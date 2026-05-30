@@ -4447,6 +4447,46 @@ export class PGLiteEngine implements BrainEngine {
     }
   }
 
+  async resolveAliases(
+    aliasNorms: string[],
+    opts?: { sourceId?: string; sourceIds?: string[] },
+  ): Promise<Map<string, string[]>> {
+    const out = new Map<string, string[]>();
+    if (!aliasNorms || aliasNorms.length === 0) return out;
+    const sources =
+      opts?.sourceIds && opts.sourceIds.length > 0
+        ? opts.sourceIds
+        : opts?.sourceId
+          ? [opts.sourceId]
+          : null;
+    let q = `SELECT alias_norm, slug FROM page_aliases WHERE alias_norm = ANY($1::text[])`;
+    const params: unknown[] = [aliasNorms];
+    if (sources) {
+      params.push(sources);
+      q += ` AND source_id = ANY($2::text[])`;
+    }
+    q += ` ORDER BY alias_norm, slug`;
+    const { rows } = await this.db.query(q, params);
+    for (const r of rows as Array<{ alias_norm: string; slug: string }>) {
+      const list = out.get(r.alias_norm) ?? [];
+      if (!list.includes(r.slug)) list.push(r.slug);
+      out.set(r.alias_norm, list);
+    }
+    return out;
+  }
+
+  async setPageAliases(slug: string, sourceId: string, aliasNorms: string[]): Promise<void> {
+    const uniq = Array.from(new Set(aliasNorms.filter(a => a.length > 0)));
+    await this.db.query(`DELETE FROM page_aliases WHERE source_id = $1 AND slug = $2`, [sourceId, slug]);
+    if (uniq.length === 0) return;
+    await this.db.query(
+      `INSERT INTO page_aliases (source_id, alias_norm, slug)
+       SELECT $1, a, $2 FROM unnest($3::text[]) AS a
+       ON CONFLICT (source_id, alias_norm, slug) DO NOTHING`,
+      [sourceId, slug, uniq],
+    );
+  }
+
   // Config
   async getConfig(key: string): Promise<string | null> {
     const { rows } = await this.db.query('SELECT value FROM config WHERE key = $1', [key]);
