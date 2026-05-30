@@ -4,6 +4,19 @@
  * Pins both code paths that must respect the v0.23.2 marker:
  *   - extractFactsFromTurn(isDreamGenerated:true) → []
  *   - put_page backstop on dream_generated:true frontmatter → skipped:dream_generated
+ *
+ * SERIAL (own process) — the two `put_page` cases drive `dispatchToolCall →
+ * put_page`, which touches process-global singletons (the facts queue,
+ * the AI gateway used by importFromContent's embed step). Run inside the
+ * shard matrix (78 files / 1 bun process), some sibling file's residual
+ * global state made put_page's pre-backstop path fail in CI shard 2 — both
+ * engine-dependent put_page tests failed while the two engine-free
+ * extractFactsFromTurn tests passed. The failure was NOT reproducible
+ * alone, in a Linux container, or in a full local shard-2 run; it only
+ * surfaced on the CI runner. Per CLAUDE.md's test-isolation rules, a test
+ * coupled to shared process state belongs in its own process — the serial
+ * job (scripts/run-serial-tests.sh) runs each *.serial.test.ts in a fresh
+ * `bun test` invocation, which this file passes deterministically.
  */
 
 import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
@@ -13,16 +26,9 @@ import { extractFactsFromTurn } from '../src/core/facts/extract.ts';
 
 let engine: PGLiteEngine;
 
-// 60s hook timeout — when this file runs deep in a shard process that's
-// already created ~20 PGLite engines, the WASM cold-start + the full
-// migration chain on a fresh DB legitimately exceeds bun's 5s hook default.
-// CI shard 4 hit this on v0.41.17.0 (95 migrations × 21 files × 1 bun
-// process) and the budget was bumped to 30s. The chain is now 111
-// migrations (retrieval-cathedral added page_aliases + telemetry on top of
-// the v0.41.31/.32 columns), so the 30s budget was again too tight under
-// load — only the engine-dependent put_page tests in this file failed in
-// CI shard 2 (the engine-free extractFactsFromTurn tests passed), the
-// signature of a partially-failed init. Bumped to 60s.
+// 60s hook timeout — generous budget for the PGLite WASM cold-start + full
+// migration chain (111 migrations) on a fresh DB, well above bun's 5s
+// hook default.
 beforeAll(async () => {
   engine = new PGLiteEngine();
   await engine.connect({});

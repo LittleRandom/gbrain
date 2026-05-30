@@ -274,7 +274,7 @@
   "test/extract.test.ts": 24,
   "test/extractable-pack.test.ts": 76,
   "test/facts-absorb-log.test.ts": 3161,
-  "test/facts-anti-loop.test.ts": 2478,
+  "test/facts-anti-loop.serial.test.ts": 2478,
   "test/facts-backstop-gating.test.ts": 3278,
   "test/facts-backstop-integration.test.ts": 23696,
   "test/facts-backstop.test.ts": 3118,
