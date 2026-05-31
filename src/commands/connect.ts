@@ -83,6 +83,13 @@ export function isLinkLocalOrMetadata(hostname: string): boolean {
   if (/^169\.254\.\d{1,3}\.\d{1,3}$/.test(h)) return true; // IPv4 link-local incl. cloud metadata
   if (h.startsWith('fe80:')) return true;                  // IPv6 link-local
   if (h === 'fd00:ec2::254') return true;                  // AWS IMDSv2 over IPv6
+  // IPv4-mapped IPv6 (e.g. ::ffff:169.254.169.254 dotted, or ::ffff:a9fe:xxxx
+  // hex where a9fe == 169.254) must not slip past the dotted-IPv4 check.
+  const mapped = h.match(/^::ffff:(.+)$/);
+  if (mapped) {
+    if (/^169\.254\.\d{1,3}\.\d{1,3}$/.test(mapped[1])) return true;
+    if (mapped[1].startsWith('a9fe:')) return true;
+  }
   return false;
 }
 
@@ -181,10 +188,18 @@ export function buildClaudeMcpAddArgv(p: { name: string; url: string; headerToke
   return ['mcp', 'add', p.name, '-t', 'http', p.url, '-H', `Authorization: Bearer ${p.headerToken}`];
 }
 
-/** Render an argv to a copy-pasteable `claude ...` shell string (double-quotes args with spaces/quotes). */
+/**
+ * Render an argv to a copy-pasteable `claude ...` shell string. Args that
+ * aren't already shell-safe are POSIX single-quoted (so `$()`, backticks, etc.
+ * in a bearer token are inert literals when the block is pasted into a shell —
+ * double-quoting would still allow command substitution).
+ */
+function shellQuote(arg: string): string {
+  if (/^[A-Za-z0-9_.:/@-]+$/.test(arg)) return arg;
+  return `'${arg.replace(/'/g, "'\\''")}'`;
+}
 export function claudeMcpAddCmdString(argv: string[]): string {
-  const quoted = argv.map((a) => (/[\s"']/.test(a) ? `"${a.replace(/(["\\])/g, '\\$1')}"` : a));
-  return `claude ${quoted.join(' ')}`;
+  return `claude ${argv.map(shellQuote).join(' ')}`;
 }
 
 export function redactToken(s: string, token: string | null): string {

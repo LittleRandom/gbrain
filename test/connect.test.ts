@@ -1,6 +1,7 @@
 import { test, expect, describe } from 'bun:test';
 import {
   normalizeMcpUrl,
+  isLinkLocalOrMetadata,
   validateToken,
   resolveToken,
   isValidName,
@@ -110,6 +111,15 @@ describe('normalizeMcpUrl', () => {
     expect(normalizeMcpUrl('http://192.168.1.50:3131/mcp').ok).toBe(true);
     expect(normalizeMcpUrl('https://10.0.0.5/mcp').ok).toBe(true);
   });
+
+  test('IPv4-mapped IPv6 metadata addresses do not bypass the guard', () => {
+    // dotted and hex (a9fe == 169.254) IPv4-mapped forms
+    expect(isLinkLocalOrMetadata('::ffff:169.254.169.254')).toBe(true);
+    expect(isLinkLocalOrMetadata('::ffff:a9fe:a9fe')).toBe(true);
+    expect(isLinkLocalOrMetadata('[::ffff:169.254.169.254]')).toBe(true);
+    // a normal mapped LAN/public address is not flagged
+    expect(isLinkLocalOrMetadata('::ffff:192.168.1.5')).toBe(false);
+  });
 });
 
 describe('validateToken', () => {
@@ -173,9 +183,15 @@ describe('argv + command string', () => {
       'mcp', 'add', 'gbrain', '-t', 'http', 'https://h/mcp', '-H', 'Authorization: Bearer TOK',
     ]);
   });
-  test('command string double-quotes the header', () => {
+  test('command string single-quotes the header (paste-safe)', () => {
     const cmd = claudeMcpAddCmdString(buildClaudeMcpAddArgv({ name: 'gbrain', url: 'https://h/mcp', headerToken: 'TOK' }));
-    expect(cmd).toBe('claude mcp add gbrain -t http https://h/mcp -H "Authorization: Bearer TOK"');
+    expect(cmd).toBe("claude mcp add gbrain -t http https://h/mcp -H 'Authorization: Bearer TOK'");
+  });
+  test('a token with shell metacharacters cannot trigger command substitution on paste', () => {
+    const cmd = claudeMcpAddCmdString(buildClaudeMcpAddArgv({ name: 'gbrain', url: 'https://h/mcp', headerToken: 'gbrain_$(touch /tmp/pwned)`x`' }));
+    // Single-quoted → the $() and backticks are inert literals, not double-quoted.
+    expect(cmd).toContain("'Authorization: Bearer gbrain_$(touch /tmp/pwned)`x`'");
+    expect(cmd).not.toContain('"Authorization');
   });
 });
 
@@ -195,7 +211,7 @@ describe('redactToken', () => {
 describe('buildConnectBlock', () => {
   test('claude-code with a literal token inlines it + learn instruction', () => {
     const block = buildConnectBlock({ agent: 'claude-code', name: 'gbrain', url: 'https://h/mcp', token: 'TOK' });
-    expect(block).toContain('claude mcp add gbrain -t http https://h/mcp -H "Authorization: Bearer TOK"');
+    expect(block).toContain("claude mcp add gbrain -t http https://h/mcp -H 'Authorization: Bearer TOK'");
     expect(block).toContain(LEARN_INSTRUCTION);
     expect(block).not.toContain(PLACEHOLDER_TOKEN);
     expect(block).toMatch(/long-lived, full-access secret/);
@@ -514,7 +530,7 @@ describe('runConnect print mode', () => {
       installDeps(),
     );
     expect(r.exitCode).toBeUndefined();
-    expect(r.out.join('\n')).toContain('claude mcp add gbrain -t http https://brain.example.com/mcp -H "Authorization: Bearer gbrain_tok"');
+    expect(r.out.join('\n')).toContain("claude mcp add gbrain -t http https://brain.example.com/mcp -H 'Authorization: Bearer gbrain_tok'");
   });
 
   test('--json redacts the token', async () => {
