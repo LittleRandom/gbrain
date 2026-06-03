@@ -48,7 +48,11 @@ describe('serve stdio round-trip E2E (local PGLite → real MCP tool calls)', ()
     // served brain actually use PGLite even when the shell/CI has DATABASE_URL
     // set (otherwise the subprocess comes up on Postgres → `engine: pglite`
     // assertion fails).
-    const env = { ...process.env, GBRAIN_HOME: home };
+    // Build a concrete Record<string,string> (StdioClientTransport.env rejects
+    // undefined values), dropping the ambient DB URLs so the subprocess is PGLite.
+    const env: Record<string, string> = {};
+    for (const [k, v] of Object.entries(process.env)) if (v !== undefined) env[k] = v;
+    env.GBRAIN_HOME = home;
     delete env.DATABASE_URL;
     delete env.GBRAIN_DATABASE_URL;
 

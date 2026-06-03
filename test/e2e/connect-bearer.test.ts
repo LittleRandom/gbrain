@@ -38,7 +38,7 @@ describe('connect bearer probe E2E (PGLite + real serve --http)', () => {
     // spawned `serve` actually use PGLite. Without this, a dev/CI shell with
     // DATABASE_URL set leaks it into the subprocess and the brain comes up on
     // Postgres, breaking the `engine: pglite` assertion.
-    const env = { ...process.env, GBRAIN_HOME: home };
+    const env: Record<string, string | undefined> = { ...process.env, GBRAIN_HOME: home };
     delete env.DATABASE_URL;
     delete env.GBRAIN_DATABASE_URL;
 
