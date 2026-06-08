@@ -2,6 +2,20 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.42.33.0] - 2026-06-07
+
+**`gbrain sync` will never delete a repo it didn't create.** If a source was registered with a `remote_url` but its `local_path` pointed at a working tree you manage yourself (not a gbrain-managed clone), a failed or degraded code sync could remove that directory and re-clone over it. Sync now re-clones **only** clones gbrain actually created — identified by an ownership marker, or by gbrain's own clone location for clones made before this release. Anything else, including your live working tree, is treated as read-only: indexed, never deleted. On an unowned path, sync aborts loudly **before touching the filesystem** and tells you how to fix the source registration. Thanks to @zaqwery for the report.
+
+The re-clone path is also crash-safer now: it clones into a sibling temp on the same filesystem and swaps atomically (old aside → new in → drop old), so a cross-device rename can't leave a source deleted-but-not-restored. If the swap ever fails, the error names exactly where your original clone is preserved.
+
+### Fixed
+- **`gbrain sync` never deletes an unowned working tree (gbrain#1881).** Re-clone is confined to clones gbrain created (`config.managed_clone` marker, or the default clone location for pre-marker clones). A `remote_url` source whose `local_path` is your own working tree is synced read-only and refused — loudly, before any filesystem op — never removed. `gbrain sources restore` on such a source warns and keeps the tree instead of deleting it. Reported by @zaqwery.
+- **Safer re-clone swap.** Re-clone uses a same-filesystem sibling temp plus an atomic swap (no cross-device "deleted but not re-cloned" window); a symlinked clone path is refused; a failed swap reports where the original is preserved.
+
+### To take advantage of v0.42.33.0
+
+Upgrade. Nothing to configure. New `--url` sources are marked gbrain-owned automatically, and existing managed clones at the default location keep auto-recovering. If you registered a source whose `local_path` is a working tree you maintain yourself, `gbrain sync` now syncs it read-only and prints how to re-register it if you want gbrain to manage the clone.
+
 ## [0.42.29.0] - 2026-06-07
 
 **The background-job queue stops thrashing on long jobs, the cycle stops wedging itself, and you can no longer run two supervisors against one queue by accident.** Three fixes plus a voice-agent feature.
