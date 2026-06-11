@@ -2382,8 +2382,14 @@ export async function checkStaleLocks(
     }
     const lines = stale.slice(0, 10).map(s => {
       const ageH = Math.floor(s.age_ms / 3600_000);
-      const source = s.id.startsWith('gbrain-sync:') ? s.id.slice('gbrain-sync:'.length) : null;
-      const breakHint = source ? `gbrain sync --break-lock --source ${source}` : `gbrain sync --break-lock`;
+      let breakHint = 'gbrain doctor';
+      if (s.id.startsWith('gbrain-sync:')) {
+        breakHint = `gbrain sync --break-lock --source ${s.id.slice('gbrain-sync:'.length)}`;
+      } else if (s.id.startsWith('gbrain-cycle:')) {
+        breakHint = `gbrain dream --break-lock --source ${s.id.slice('gbrain-cycle:'.length)}`;
+      } else if (s.id === 'gbrain-cycle') {
+        breakHint = 'gbrain dream --break-lock';
+      }
       return `  ${s.id} (pid ${s.holder_pid} on ${s.holder_host}, age ${ageH}h) → ${breakHint}`;
     });
     const tail = stale.length > 10 ? `  ... and ${stale.length - 10} more.` : null;
@@ -2611,7 +2617,7 @@ async function checkEmbeddingEnvOverride(engine: BrainEngine): Promise<Check> {
   };
 }
 
-async function checkSubagentCapability(engine: BrainEngine): Promise<Check> {
+export async function checkSubagentCapability(engine: BrainEngine): Promise<Check> {
   try {
     const { classifyCapabilities } = await import('../core/ai/capabilities.ts');
     const tierSubagent = await engine.getConfig('models.tier.subagent');
@@ -2672,8 +2678,11 @@ async function checkSubagentCapability(engine: BrainEngine): Promise<Check> {
       const { loadConfig } = await import('../core/config.ts');
       const cfg = loadConfig();
       const chatModel = cfg?.chat_model;
+      const gatewayLoopRaw = await engine.getConfig('agent.use_gateway_loop').catch(() => null);
+      const gatewayLoopEnabled = typeof gatewayLoopRaw === 'string'
+        && ['true', '1', 'yes', 'on'].includes(gatewayLoopRaw.trim().toLowerCase());
       const { isAnthropicProvider } = await import('../core/model-config.ts');
-      if (chatModel && !isAnthropicProvider(chatModel) && !process.env.ANTHROPIC_API_KEY) {
+      if (chatModel && !isAnthropicProvider(chatModel) && !process.env.ANTHROPIC_API_KEY && !gatewayLoopEnabled) {
         return {
           name: 'subagent_capability',
           status: 'warn',
@@ -5511,8 +5520,29 @@ export async function buildChecks(
       "SELECT COUNT(*)::int AS count FROM pages WHERE type IN ('entity', 'person', 'company', 'organization')",
     ))[0]?.count ?? 0;
 
-    const linkPct = ((health.link_coverage ?? 0) * 100).toFixed(0);
-    const timelinePct = ((health.timeline_coverage ?? 0) * 100).toFixed(0);
+    // Compute coverage against eligible entities only — exclude test fixtures
+    // (`tools/gbrain/test/*`) and template stubs (`templates/new-person`) so
+    // that brains seeded only with code sources don't get spurious warnings
+    // about missing link/timeline coverage on pages that are test fixtures, not
+    // real knowledge entities.
+    const eligibleStats = (await engine.executeRaw<{ entities: number; linked_from: number; timeline: number }>(
+      `WITH eligible AS (
+        SELECT id FROM pages
+        WHERE type IN ('entity','person','company','organization')
+          AND slug NOT LIKE 'tools/gbrain/test/%'
+          AND slug <> 'templates/new-person'
+      )
+      SELECT
+        (SELECT count(*)::int FROM eligible) AS entities,
+        (SELECT count(DISTINCT from_page_id)::int FROM links WHERE from_page_id IN (SELECT id FROM eligible)) AS linked_from,
+        (SELECT count(DISTINCT page_id)::int FROM timeline_entries WHERE page_id IN (SELECT id FROM eligible)) AS timeline`,
+    ))[0] ?? { entities: entityCount, linked_from: 0, timeline: 0 };
+
+    const eligibleEntityCount = Number(eligibleStats.entities ?? entityCount);
+    const linkCoverage = eligibleEntityCount > 0 ? Number(eligibleStats.linked_from ?? 0) / eligibleEntityCount : 0;
+    const timelineCoverage = eligibleEntityCount > 0 ? Number(eligibleStats.timeline ?? 0) / eligibleEntityCount : 0;
+    const linkPct = (linkCoverage * 100).toFixed(0);
+    const timelinePct = (timelineCoverage * 100).toFixed(0);
     if (entityCount === 0) {
       // Markdown-only / journal / wiki brain — no entity pages to compute
       // coverage against. Coverage formula is structurally inapplicable.
@@ -5521,13 +5551,19 @@ export async function buildChecks(
         status: 'ok',
         message: 'No entity pages — graph_coverage not applicable (markdown-only brain)',
       });
-    } else if ((health.link_coverage ?? 0) >= 0.5 && (health.timeline_coverage ?? 0) >= 0.5) {
+    } else if (eligibleEntityCount === 0) {
+      checks.push({
+        name: 'graph_coverage',
+        status: 'ok',
+        message: `Only code/test fixture entity pages found (${entityCount}); graph_coverage not applicable`,
+      });
+    } else if (linkCoverage >= 0.5 && timelineCoverage >= 0.5) {
       checks.push({ name: 'graph_coverage', status: 'ok', message: `Entity link coverage ${linkPct}%, timeline ${timelinePct}%` });
     } else {
       checks.push({
         name: 'graph_coverage',
         status: 'warn',
-        message: `Entity link coverage ${linkPct}%, timeline ${timelinePct}% (${entityCount} entity pages). Run: gbrain extract all`,
+        message: `Entity link coverage ${linkPct}%, timeline ${timelinePct}% (${eligibleEntityCount} entity pages). Run: gbrain extract all`,
       });
     }
 
@@ -6063,12 +6099,29 @@ export async function buildChecks(
         .slice(0, 3)
         .map(([s, n]) => `${s}=${n}`)
         .join(', ');
+      // Audit events are evidence, not automatically breakage. A large code
+      // source can legitimately emit many WARN events (oversize/markup-heavy)
+      // while remaining searchable and intentionally flagged. Fail on hard
+      // dispositions (content actually blocked or hidden); warn on soft
+      // dispositions or volume. This keeps doctor from treating expected
+      // code-corpus telemetry as an unhealthy brain.
+      //
+      // v0.42 renamed the hard path: a rejected page emits `reject` and a
+      // quarantined (hidden) junk page emits `quarantine`; `hard_block` is now
+      // only the pre-v0.42 legacy alias. Counting `hard_block` alone let fresh
+      // junk-ingest evidence (`reject`/`quarantine`) clear as `ok` whenever
+      // fewer than 10 events landed. `flag` is a warn disposition (still
+      // searchable, agent warned on retrieval), so it joins `soft_block`.
+      const hardBlocked =
+        summary.by_type.hard_block + summary.by_type.reject + summary.by_type.quarantine;
+      const softBlocked = summary.by_type.soft_block + summary.by_type.flag;
       const status: 'ok' | 'warn' | 'fail' =
-        events.length >= 100 ? 'fail' : events.length >= 10 ? 'warn' : 'ok';
+        hardBlocked > 0 ? 'fail' :
+          (softBlocked > 0 || events.length >= 10) ? 'warn' : 'ok';
       checks.push({
         name: 'content_sanity_audit_recent',
         status,
-        message: `${events.length} events (hard=${summary.by_type.hard_block} soft=${summary.by_type.soft_block} warn=${summary.by_type.warn})${topPatterns ? ', patterns: ' + topPatterns : ''}${topSources ? ', sources: ' + topSources : ''}. (Local audit only — multi-host operators set GBRAIN_AUDIT_DIR.)`,
+        message: `${events.length} events (hard=${hardBlocked} [hard_block=${summary.by_type.hard_block} reject=${summary.by_type.reject} quarantine=${summary.by_type.quarantine}] soft=${softBlocked} [soft_block=${summary.by_type.soft_block} flag=${summary.by_type.flag}] warn=${summary.by_type.warn})${topPatterns ? ', patterns: ' + topPatterns : ''}${topSources ? ', sources: ' + topSources : ''}. (Local audit only — multi-host operators set GBRAIN_AUDIT_DIR.)`,
       });
     }
   } catch (err) {
@@ -7046,7 +7099,10 @@ export async function runDoctor(
     } catch { /* best-effort */ }
   }
 
-  process.exit(hasFail ? 1 : 0);
+  // Use process.exitCode instead of process.exit() so cleanup handlers
+  // (e.g. Bun unload events, open database connections) still run before
+  // the process terminates. process.exit() is a hard kill that bypasses them.
+  process.exitCode = hasFail ? 1 : 0;
 }
 
 // ---------------------------------------------------------------------------
