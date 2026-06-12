@@ -73,7 +73,14 @@ export async function startMcpServer(engine: BrainEngine) {
           engine,
           req.sourceId || defaultSource,
           req.candidates ?? [],
-          { priorContextText: req.priorContextText, maxPointers: req.maxPointers },
+          {
+            priorContextText: req.priorContextText,
+            maxPointers: req.maxPointers,
+            suppression: req.suppression,
+            // v0.43 (#2095, codex D11): the IPC resolve path IS the ambient
+            // reflex channel — log volunteered pointers so stats see it.
+            logChannel: 'reflex',
+          },
         ),
       );
     }

@@ -180,6 +180,24 @@ function getLastUserText(messages: AgentMessage[]): string {
 }
 
 /**
+ * v0.43 (#2095): the rolling extraction window — the most recent
+ * user/assistant turns (oldest → newest, current turn last), capped here at
+ * a generous max; the reflex slices to its configured
+ * retrieval_reflex_window_turns (default 4).
+ */
+const WINDOW_TURNS_HARD_CAP = 12;
+function getWindowTurns(messages: AgentMessage[]): Array<{ role: 'user' | 'assistant'; text: string }> {
+  const out: Array<{ role: 'user' | 'assistant'; text: string }> = [];
+  for (const m of messages) {
+    if (m?.role !== 'user' && m?.role !== 'assistant') continue;
+    const text = messageText(m.content);
+    if (!text) continue;
+    out.push({ role: m.role, text });
+  }
+  return out.slice(-WINDOW_TURNS_HARD_CAP);
+}
+
+/**
  * Joined text of everything the agent has ALREADY seen — every message EXCEPT
  * the current turn (the last user message). Used for "already in context"
  * suppression; MUST exclude the current turn or the triggering mention would
@@ -649,6 +667,9 @@ export function createGBrainContextEngine(ctx: {
         workspaceDir,
         currentUserText: getLastUserText(messages),
         priorContextText: getPriorContextText(messages),
+        // v0.43 (#2095): rolling window — assistant-introduced entities and
+        // named-antecedent follow-ups from recent turns now resolve too.
+        windowTurns: getWindowTurns(messages),
         resolveEntities: ctx.resolveEntities,
       });
 

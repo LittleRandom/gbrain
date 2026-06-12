@@ -182,3 +182,110 @@ describe('context-engine assemble() — Retrieval Reflex integration', () => {
     });
   });
 });
+
+describe('v0.43 (#2095) — rolling window extraction through assemble()', () => {
+  const REFLEX_ON = { GBRAIN_RETRIEVAL_REFLEX: 'true' };
+
+  test('entity named ONLY in a previous assistant turn yields a pointer now', async () => {
+    await withEnv(REFLEX_ON, async () => {
+      await seed('people/alice-example', 'Alice Example', 'Alice is a founder.');
+      const ce = createGBrainContextEngine({
+        workspaceDir: '/tmp/rr-test-ws-w1',
+        resolveEntities: (candidates, opts) =>
+          resolveEntitiesToPointers(engine, 'default', candidates, opts),
+      });
+      // Current turn is a pronoun follow-up; the antecedent was NAMED two
+      // turns back by the ASSISTANT. Pre-window this never fired.
+      const res = await ce.assemble({
+        sessionId: 'w1',
+        messages: [
+          { role: 'user', content: 'who should I talk to about the seed round?' },
+          { role: 'assistant', content: 'Alice Example led a similar round last year.' },
+          { role: 'user', content: 'what did she invest in?' },
+        ],
+      });
+      expect(res.systemPromptAddition).toContain('people/alice-example');
+    });
+  });
+
+  test('window=1 reproduces the legacy current-turn-only behavior', async () => {
+    await withEnv({ ...REFLEX_ON, GBRAIN_RETRIEVAL_REFLEX_WINDOW_TURNS: '1' }, async () => {
+      await seed('people/alice-example', 'Alice Example', 'Alice is a founder.');
+      const ce = createGBrainContextEngine({
+        workspaceDir: '/tmp/rr-test-ws-w2',
+        resolveEntities: (candidates, opts) =>
+          resolveEntitiesToPointers(engine, 'default', candidates, opts),
+      });
+      const res = await ce.assemble({
+        sessionId: 'w2',
+        messages: [
+          { role: 'assistant', content: 'Alice Example led a similar round last year.' },
+          { role: 'user', content: 'what did she invest in?' },
+        ],
+      });
+      // Current turn has no extractable entity; window=1 must NOT widen.
+      expect(res.systemPromptAddition).not.toContain('people/alice-example');
+    });
+  });
+
+  test('windowed suppression is slug-only: a prior-turn MENTION does not suppress (codex D7)', async () => {
+    await withEnv(REFLEX_ON, async () => {
+      await seed('people/alice-example', 'Alice Example', 'A founder.');
+      const ce = createGBrainContextEngine({
+        workspaceDir: '/tmp/rr-test-ws-w3',
+        resolveEntities: (candidates, opts) =>
+          resolveEntitiesToPointers(engine, 'default', candidates, opts),
+      });
+      // "Alice Example" appears in a PRIOR turn (a bare mention — prior
+      // context contains the TITLE). Under the legacy title rule the pointer
+      // would be suppressed; slug-only windowing must still fire.
+      const res = await ce.assemble({
+        sessionId: 'w3',
+        messages: [
+          { role: 'user', content: 'I met Alice Example yesterday' },
+          { role: 'assistant', content: 'How did the meeting with Alice Example go?' },
+          { role: 'user', content: 'she wants to invest — thoughts?' },
+        ],
+      });
+      expect(res.systemPromptAddition).toContain('people/alice-example');
+    });
+  });
+
+  test('windowed suppression still drops an already-surfaced page (slug in prior context)', async () => {
+    await withEnv(REFLEX_ON, async () => {
+      await seed('people/alice-example', 'Alice Example', 'A founder.');
+      const ce = createGBrainContextEngine({
+        workspaceDir: '/tmp/rr-test-ws-w4',
+        resolveEntities: (candidates, opts) =>
+          resolveEntitiesToPointers(engine, 'default', candidates, opts),
+      });
+      const res = await ce.assemble({
+        sessionId: 'w4',
+        messages: [
+          { role: 'assistant', content: 'Pointer: **Alice Example** → `people/alice-example` (use get_page)' },
+          { role: 'user', content: 'tell me more about Alice Example' },
+        ],
+      });
+      expect(res.systemPromptAddition).not.toContain('Brain pages mentioned this turn');
+    });
+  });
+
+  test('fail-open: a throwing resolver under windowing never breaks the turn', async () => {
+    await withEnv(REFLEX_ON, async () => {
+      await seed('people/alice-example', 'Alice Example', 'A founder.');
+      const ce = createGBrainContextEngine({
+        workspaceDir: '/tmp/rr-test-ws-w5',
+        resolveEntities: async () => { throw new Error('resolver exploded'); },
+      });
+      const res = await ce.assemble({
+        sessionId: 'w5',
+        messages: [
+          { role: 'assistant', content: 'Alice Example is relevant here.' },
+          { role: 'user', content: 'ok tell me about her' },
+        ],
+      });
+      expect(res.systemPromptAddition).toContain('Live Context');
+      expect(res.systemPromptAddition).not.toContain('Brain pages mentioned this turn');
+    });
+  });
+});

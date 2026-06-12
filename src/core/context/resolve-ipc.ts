@@ -35,6 +35,8 @@ export interface ResolveRequest {
   priorContextText?: string;
   maxPointers?: number;
   sourceId?: string;
+  /** v0.43 (#2095, codex D7): suppression mode — 'slug-only' under windowing. */
+  suppression?: 'slug-and-title' | 'slug-only';
 }
 
 export type ResolveHandler = (req: ResolveRequest) => Promise<PointerBlock | null>;

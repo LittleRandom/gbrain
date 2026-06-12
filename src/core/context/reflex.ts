@@ -20,7 +20,12 @@ import { join } from 'node:path';
 import { mkdirSync, appendFileSync } from 'node:fs';
 import { loadConfig, type GBrainConfig } from '../config.ts';
 import type { BrainEngine } from '../engine.ts';
-import { extractCandidates, type EntityCandidate } from './entity-salience.ts';
+import {
+  extractCandidates,
+  extractCandidatesFromWindow,
+  type EntityCandidate,
+  type WindowTurn,
+} from './entity-salience.ts';
 import {
   resolveEntitiesToPointers,
   DEFAULT_MAX_POINTERS,
@@ -28,20 +33,45 @@ import {
 } from './retrieval-reflex.ts';
 import { resolveViaIpc, resolveSocketPath, IPC_UNAVAILABLE } from './resolve-ipc.ts';
 
+/** Per-turn resolver options shared by every rung of the ladder. */
+export interface ResolveEntitiesOpts {
+  priorContextText?: string;
+  maxPointers?: number;
+  /** v0.43 (#2095): 'slug-only' under windowing — see ResolvePointersOpts. */
+  suppression?: 'slug-and-title' | 'slug-only';
+}
+
 /** Host capability shape (D1=A): candidates in, pointers out. Narrow by design. */
 export type ResolveEntitiesFn = (
   candidates: EntityCandidate[],
-  opts: { priorContextText?: string; maxPointers?: number },
+  opts: ResolveEntitiesOpts,
 ) => Promise<PointerBlock | null>;
 
 export interface ReflexParams {
   workspaceDir: string;
-  /** The current turn's user text (drives extraction). */
+  /** The current turn's user text (drives extraction when no window is given). */
   currentUserText: string;
   /** Joined PRIOR turns + loaded page bodies — EXCLUDES the current turn (suppression). */
   priorContextText: string;
+  /**
+   * v0.43 (#2095): recent turns (oldest → newest, current turn last). When
+   * present and the configured window is > 1, extraction widens to the last
+   * N turns (assistant-introduced entities + named-antecedent follow-ups now
+   * resolve) and suppression switches to slug-only (codex D7 — the title rule
+   * would suppress every entity merely mentioned in a prior window turn).
+   */
+  windowTurns?: WindowTurn[];
   /** Host-provided resolver, if the OpenClaw plugin contract supplied one. */
   resolveEntities?: ResolveEntitiesFn;
+}
+
+/** Default extraction window (turns). 1 = legacy current-turn-only. */
+export const DEFAULT_WINDOW_TURNS = 4;
+
+export function windowTurnCount(cfg: GBrainConfig | null): number {
+  const n = cfg?.retrieval_reflex_window_turns;
+  if (typeof n === 'number' && Number.isFinite(n) && n >= 1) return Math.floor(n);
+  return DEFAULT_WINDOW_TURNS;
 }
 
 const TIMEOUT_MS = 1500; // generous per-turn ceiling; the work is usually <100ms
@@ -68,11 +98,22 @@ export async function buildReflexAddition(params: ReflexParams): Promise<string 
     const cfg = loadConfig();
     if (!reflexEnabled(cfg)) return null;
 
-    // Zero-candidate fast path: one regex pass, no brain touch.
-    const candidates = extractCandidates(params.currentUserText);
+    // v0.43 (#2095): widen extraction across the last N turns when a window
+    // is supplied and configured > 1. Window=1 reproduces the legacy
+    // current-turn-only behavior exactly (including suppression mode).
+    const windowN = windowTurnCount(cfg);
+    const windowed = windowN > 1 && (params.windowTurns?.length ?? 0) > 0;
+    const candidates: EntityCandidate[] = windowed
+      ? extractCandidatesFromWindow(params.windowTurns!.slice(-windowN))
+      : extractCandidates(params.currentUserText);
+    // Zero-candidate fast path: regex passes only, no brain touch.
     if (!candidates.length) return null;
 
-    const opts = { priorContextText: params.priorContextText, maxPointers: maxPointers(cfg) };
+    const opts: ResolveEntitiesOpts = {
+      priorContextText: params.priorContextText,
+      maxPointers: maxPointers(cfg),
+      suppression: windowed ? 'slug-only' : 'slug-and-title',
+    };
     const block = await withTimeout(resolve(params, cfg, candidates, opts), TIMEOUT_MS);
     if (!block || !block.pointers.length) return null;
 
@@ -87,7 +128,7 @@ async function resolve(
   params: ReflexParams,
   cfg: GBrainConfig | null,
   candidates: EntityCandidate[],
-  opts: { priorContextText?: string; maxPointers?: number },
+  opts: ResolveEntitiesOpts,
 ): Promise<PointerBlock | null> {
   // 1. Host capability (any engine).
   if (params.resolveEntities) {
@@ -105,7 +146,9 @@ async function resolve(
     if (!engine) return null;
     const { resolveSourceId } = await import('../source-resolver.ts');
     const sourceId = await resolveSourceId(engine, null, params.workspaceDir);
-    return resolveEntitiesToPointers(engine, sourceId, candidates, opts);
+    // logChannel (codex D11): the ambient reflex channel logs its volunteered
+    // pointers so `volunteer-context --stats` measures the default-on path.
+    return resolveEntitiesToPointers(engine, sourceId, candidates, { ...opts, logChannel: 'reflex' });
   }
   // 4. Disabled (PGLite with no serve / unknown engine). Policy skill carries.
   return null;

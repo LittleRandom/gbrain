@@ -104,6 +104,16 @@ export interface ResolvePointersOpts {
    * arm uses source_id = ANY(...) in one query.
    */
   sourceIds?: string[];
+  /**
+   * v0.43 (#2095, codex D11) — when set, fire-and-forget a volunteer event
+   * per returned pointer on this channel (through the drained
+   * volunteer-events sink). Set by the REFLEX server-side paths (serve IPC,
+   * direct Postgres) so `volunteer-context --stats` measures the default-on
+   * ambient channel. The volunteer layer does NOT set it — it logs its own
+   * events with boosted confidence. Host-injected resolvers (no gbrain
+   * engine) can't log; documented gap.
+   */
+  logChannel?: 'reflex';
 }
 
 interface PageRow {
@@ -273,6 +283,27 @@ export async function resolveEntitiesToPointers(
   }
 
   if (!pointers.length) return null;
+
+  // v0.43 (#2095, codex D11): ambient-channel feedback logging. Lazy import
+  // keeps the reflex hot path dependency-free when logging is off.
+  if (opts.logChannel) {
+    try {
+      const { logVolunteerEventsFireAndForget } = await import('./volunteer-events.ts');
+      logVolunteerEventsFireAndForget(
+        engine,
+        pointers.map((p) => ({
+          source_id: p.source_id,
+          slug: p.slug,
+          confidence: p.confidence,
+          match_arm: p.arm,
+          rationale: `${p.arm} match "${p.display}"`,
+          channel: opts.logChannel as 'reflex',
+        })),
+      );
+    } catch {
+      /* telemetry only — never blocks the pointer block */
+    }
+  }
   return { pointers, text: renderPointerBlock(pointers) };
 }
 
