@@ -1394,6 +1394,9 @@ describe('BUG 4 — in-progress sync via live lock, not stale freshness', () => 
     expect(result.status).toBe('ok');
     expect(result.details?.synced_recently_count).toBe(1);
     expect(result.details?.stale_count).toBe(0);
+    // BUG 4: operator sees the in-progress holder, not silence.
+    expect(result.message).toContain('sync in progress');
+    expect(result.message).toContain('pid 4242');
   });
 
   test('never-synced source WITH a live lock → ok (initial sync in progress)', async () => {
@@ -1403,6 +1406,7 @@ describe('BUG 4 — in-progress sync via live lock, not stale freshness', () => 
     const result = await checkSyncFreshness(engine);
     expect(result.status).toBe('ok');
     expect(result.details?.synced_recently_count).toBe(1);
+    expect(result.message).toContain('sync in progress');
   });
 
   test('never-synced source with NO lock → fail (unchanged behavior)', async () => {
