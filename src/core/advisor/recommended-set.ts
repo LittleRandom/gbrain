@@ -19,7 +19,7 @@ export const RECOMMENDED: RecommendedSkill[] = [
   {
     slug: 'book-mirror',
     description:
-      'FLAGSHIP. Take any book (EPUB/PDF), produce a personalized chapter-by-chapter analysis that maps every idea to your life using brain context.',
+      'FLAGSHIP. Take any book (EPUB/PDF), produce a personalized two-column chapter-by-chapter analysis that maps every idea to your life using brain context.',
   },
   {
     slug: 'article-enrichment',
