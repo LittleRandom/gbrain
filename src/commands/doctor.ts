@@ -4355,7 +4355,7 @@ export async function buildChecks(
     // Consult the queue-scoped DB singleton lock (#1849, HOME-independent) before
     // warning. PID-reuse-safe (isLockHolderLive keys on lock freshness).
     let detectedViaDbLock = false;
-    if (!pidfileRunning) {
+    if (!pidfileRunning && engine) {
       try {
         const { inspectLock, isLockHolderLive } = await import('../core/db-lock.ts');
         const { supervisorLockId, SUPERVISOR_LOCK_TTL_MIN } = await import('../core/minions/supervisor.ts');
