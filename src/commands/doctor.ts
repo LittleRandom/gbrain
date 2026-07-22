@@ -3056,7 +3056,7 @@ export async function computeConversationFactsBacklogCheck(
     const typesRaw = await engine.getConfig(
       'cycle.conversation_facts_backfill.types',
     );
-    let types = ['conversation', 'meeting', 'slack', 'email'];
+    let types = ['conversation', 'meeting', 'slack', 'email', 'imessage', 'imessage-daily'];
     if (typesRaw) {
       try {
         const parsed = JSON.parse(typesRaw);
@@ -4345,7 +4345,7 @@ export async function buildChecks(
 
   // 2. Skill conformance (SKILL group — gated)
   if (scope === 'all' && skillsDir) {
-    const conformanceResult = checkSkillConformance(skillsDir);
+    const conformanceResult = skillConformanceCheck(skillsDir);
     checks.push(conformanceResult);
   }
 
@@ -4927,8 +4927,8 @@ export async function buildChecks(
     try {
       const { readConversationBodyForParsing } = await import('../core/conversation-parser/body.ts');
       const { parseConversation } = await import('../core/conversation-parser/parse.ts');
-      const allowedTypes = ['conversation', 'meeting', 'slack', 'email'] as const;
-      // PageFilters supports singular `type` only; iterate the 4 types
+      const allowedTypes = ['conversation', 'meeting', 'slack', 'email', 'imessage', 'imessage-daily'] as const;
+      // PageFilters supports singular `type` only; iterate the allowed types
       // and cap at ~50/each to land at ~200 total max.
       const sample: import('../core/types.ts').Page[] = [];
       for (const t of allowedTypes) {
@@ -5138,13 +5138,7 @@ export async function buildChecks(
         checks.push({
           name: 'multi_source_drift',
           status: 'warn',
-          message:
-            `${result.count} page slug(s) appear at 'default' but NOT at the intended source ` +
-            `(e.g., ${sampleStr}). Two possible causes: (1) pre-v0.30.3 putPage misroutes; ` +
-            `(2) source X never completed initial sync and the default page is unrelated. ` +
-            `Verify with 'gbrain sources status', then either re-sync with ` +
-            `'gbrain sync --source <id> --full' or 'gbrain delete <slug>' if the default-source ` +
-            `row is the misroute. (A 'gbrain sources rehome' cleanup command is tracked for v0.32.0.)`,
+          message: multiSourceDriftAdvice(result.count, sampleStr),
         });
       } else {
         checks.push({
@@ -7184,9 +7178,17 @@ export async function buildChecks(
       let vanished = 0;
       const vanishedPaths: string[] = [];
       const fs = await import('node:fs');
+      const nodePath = await import('node:path');
+      // storage_path is repo-relative for sync-ingested assets. Resolving
+      // against cwd made this check a false-positive WARN whenever doctor
+      // ran outside the brain repo.
+      const repoRoot = (await engine.getConfig('sync.repo_path')) ?? process.cwd();
       for (const r of rows) {
+        const abs = nodePath.isAbsolute(r.storage_path)
+          ? r.storage_path
+          : nodePath.join(repoRoot, r.storage_path);
         try {
-          fs.statSync(r.storage_path);
+          fs.statSync(abs);
         } catch {
           vanished++;
           if (vanishedPaths.length < 5) vanishedPaths.push(r.storage_path);
@@ -7430,15 +7432,13 @@ function printAutoFixReport(report: AutoFixReport, dryRun: boolean, jsonOutput: 
 
 
 /** Quick skill conformance check — frontmatter + required sections */
-function checkSkillConformance(skillsDir: string): Check {
-  const manifestPath = join(skillsDir, 'manifest.json');
-  if (!existsSync(manifestPath)) {
-    return { name: 'skill_conformance', status: 'warn', message: 'manifest.json not found' };
-  }
-
+export function skillConformanceCheck(skillsDir: string): Check {
   try {
-    const manifest = JSON.parse(readFileSync(manifestPath, 'utf-8'));
-    const skills = manifest.skills || [];
+    // Host workspaces are allowed to omit a gbrain-specific manifest. Keep
+    // conformance aligned with resolver_health and skill_brain_first by using
+    // the canonical fallback that derives entries from direct SKILL.md files.
+    const manifest = loadOrDeriveManifest(skillsDir);
+    const skills = manifest.skills;
     let passing = 0;
     const failing: string[] = [];
 
@@ -7458,7 +7458,8 @@ function checkSkillConformance(skillsDir: string): Check {
     }
 
     if (failing.length === 0) {
-      return { name: 'skill_conformance', status: 'ok', message: `${passing}/${skills.length} skills pass` };
+      const derivedNote = manifest.derived ? ' (derived from SKILL.md files)' : '';
+      return { name: 'skill_conformance', status: 'ok', message: `${passing}/${skills.length} skills pass${derivedNote}` };
     }
     return {
       name: 'skill_conformance',
@@ -7466,7 +7467,7 @@ function checkSkillConformance(skillsDir: string): Check {
       message: `${passing}/${skills.length} pass. Failing: ${failing.join(', ')}`,
     };
   } catch {
-    return { name: 'skill_conformance', status: 'warn', message: 'Could not parse manifest.json' };
+    return { name: 'skill_conformance', status: 'warn', message: 'Could not load or derive skills manifest' };
   }
 }
 
@@ -8073,4 +8074,25 @@ async function checkSchemaPackSourceDrift(engine: BrainEngine): Promise<Check> {
       message: `Skipped: ${(e as Error).message}`,
     };
   }
+}
+
+/**
+ * #1123 — multi_source_drift remediation advice. Exported so the regression
+ * test can pin that it only references CLI surfaces that actually exist
+ * (the pre-fix text pointed at 'gbrain sources rehome', which was never
+ * built, and at 'gbrain delete <slug>' without explaining that delete
+ * targets the ACTIVE source — following it literally on a multi-source
+ * brain deletes the correctly-routed row).
+ */
+export function multiSourceDriftAdvice(count: number, sampleStr: string): string {
+  return (
+    `${count} page slug(s) appear at 'default' but NOT at the intended source ` +
+    `(e.g., ${sampleStr}). Two possible causes: (1) pre-v0.30.3 putPage misroutes; ` +
+    `(2) the intended source never completed initial sync and the default page is unrelated. ` +
+    `Verify with 'gbrain sources status', then re-sync with ` +
+    `'gbrain sync --source <id> --full' (reconciles drift without deleting data). ` +
+    `If a misrouted default-source row remains after re-sync, remove it with ` +
+    `'GBRAIN_SOURCE=default gbrain delete <slug>' — delete targets the active source, ` +
+    `so pin it to 'default' explicitly.`
+  );
 }
