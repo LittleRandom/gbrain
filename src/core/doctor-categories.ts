@@ -127,11 +127,17 @@ export const BRAIN_CHECK_NAMES: ReadonlySet<string> = new Set([
  * skill-flavored name) live under 'brain'.
  */
 export const SKILL_CHECK_NAMES: ReadonlySet<string> = new Set([
+  'memory_verbs_usage',
   'resolver_health',
   'retrieval_reflex_health',
+  // Harness hook adapters: per-channel push-context visibility (sibling of
+  // retrieval_reflex_health — same "is my agent's context wiring live?" question).
+  'volunteer_channels',
   'skill_brain_first',
   'skill_conformance',
   'skills_manifest_integrity',
+  'skill_currency',
+  'skill_preconditions',
   'whoknows_health',
 ]);
 
@@ -142,6 +148,12 @@ export const OPS_CHECK_NAMES: ReadonlySet<string> = new Set([
   'alternative_providers',
   'autopilot_fanout_concurrency',
   'autopilot_lock_scope',
+  'bootstrap_hook_schema_pairing',
+  'bootstrap_hooks_heartbeat',
+  'bootstrap_last_verify',
+  'bootstrap_push_health',
+  'bootstrap_runbook_skew',
+  'bootstrap_serve_lock',
   'batch_retry_health',
   'brainstorm_health',
   'connection',
@@ -153,6 +165,7 @@ export const OPS_CHECK_NAMES: ReadonlySet<string> = new Set([
   'oauth_confidential_client_health',
   'orphan_clones',
   'pgbouncer_prepare',
+  'pglite_data_dir',
   'pgvector',
   'pool_budget',
   'progressive_batch_audit_health',
