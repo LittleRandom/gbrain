@@ -102,6 +102,10 @@ function facadeExpansion(p: string): string[] {
   if (rel === 'src/core/operations.ts') return collect(join(ROOT, 'src/core/ops'));
   if (rel === 'src/commands/doctor.ts') return collect(join(ROOT, 'src/commands/doctor'));
   if (rel === 'src/commands/skillpack.ts') return collect(join(ROOT, 'src/commands/skillpack'));
+  // connectors is a peeled command dir (index.ts dispatches to auth/sync/status);
+  // scan the whole dir at module depth so a safety flag consumed in a subcommand
+  // module (sync.ts: `=== '--dry-run'`) carries its evidence into depth-zero.
+  if (rel === 'src/commands/connectors/index.ts') return collect(join(ROOT, 'src/commands/connectors'));
   if (rel === 'src/commands/sync.ts') {
     // Only the modules PEELED OUT of sync.ts (their text used to live inside
     // it). Pre-existing sync-* siblings were always ordinary deps — sweeping
@@ -169,7 +173,15 @@ export function buildFlagRegistry(): Record<string, string[]> {
   // standalone literal (`includes('--dry-run')`, `has('--dry-run')`,
   // `=== '--dry-run'`). Prose bleed embeds the flag inside a longer string, so
   // it never has quotes on both sides of the bare flag.
-  const SAFETY_FLAGS = new Set(['--dry-run']);
+  const SAFETY_FLAGS = new Set(['--dry-run', '--allow-noncanonical-root']);
+  // Reindex scope/mode flags can bleed through upgrade's imported modules even
+  // though upgrade does not forward them. Require direct consumption on the
+  // affected dispatch surfaces so callers never get silently ignored selectors.
+  const SCOPING_FLAGS_BY_COMMAND: Record<string, string[]> = {
+    reindex: ['--type'],
+    upgrade: ['--type', '--aliases'],
+    'post-upgrade': ['--type', '--aliases'],
+  };
   const consumes = (text: string, flag: string): boolean =>
     new RegExp(`['"\`]${flag}['"\`]`).test(text);
 
@@ -203,6 +215,9 @@ export function buildFlagRegistry(): Record<string, string[]> {
 
     for (const f of EXTRA_FLAGS[command] ?? []) { flags.add(f); depthZero.add(f); }
     for (const f of SAFETY_FLAGS) {
+      if (flags.has(f) && !consumes(depthZeroText, f)) flags.delete(f);
+    }
+    for (const f of SCOPING_FLAGS_BY_COMMAND[command] ?? []) {
       if (flags.has(f) && !consumes(depthZeroText, f)) flags.delete(f);
     }
     registry[command] = [...flags].sort();

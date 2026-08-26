@@ -323,6 +323,7 @@ describe('runExtractConversationFactsCore', () => {
   let repoDir: string;
   let chatFailure: Error | null = null;
   let chatHook: (() => Promise<void>) | null = null;
+  let mainChatCalls = 0;
   let chatStopReason: ChatResult['stopReason'] = 'end';
   let chatTextOverride: string | null = null;
   let fallbackCalls = 0;
@@ -378,6 +379,7 @@ describe('runExtractConversationFactsCore', () => {
           providerId: 'stub',
         };
       }
+      mainChatCalls++;
       if (chatFailure) throw chatFailure;
       const hook = chatHook;
       chatHook = null;
@@ -425,6 +427,7 @@ describe('runExtractConversationFactsCore', () => {
   beforeEach(async () => {
     chatFailure = null;
     chatHook = null;
+    mainChatCalls = 0;
     chatStopReason = 'end';
     chatTextOverride = null;
     fallbackCalls = 0;
@@ -681,6 +684,32 @@ describe('runExtractConversationFactsCore', () => {
     });
   });
 
+  test('extraction BudgetExhausted halts the run after one attempt (#3669)', async () => {
+    // Regression: extractFactsFromTurnWithOutcome folds a BudgetExhausted
+    // thrown by the provider into `{ ok: false, error }`; the per-segment
+    // failure branch used to wrap it in a plain Error, stripping the
+    // BUDGET_EXHAUSTED tag. The worker pool's D13 must-abort check never
+    // fired, so every remaining page burned a doomed reserve-denied attempt
+    // instead of the run halting with budget_exhausted = true.
+    chatFailure = new BudgetExhausted('reserve denied', {
+      reason: 'cost',
+      spent: 5,
+      cap: 5,
+    });
+    await withEnv({ ANTHROPIC_API_KEY: 'sk-test' }, async () => {
+      const result = await runExtractConversationFactsCore(engine, {
+        sourceId: 'default',
+        sleepMs: 0,
+      });
+      // Halted-with-receipt, not a per-page failure loop: exactly ONE
+      // extraction attempt (not one per eligible page), and the partial
+      // result reports the budget stop.
+      expect(result.budget_exhausted).toBe(true);
+      expect(mainChatCalls).toBe(1);
+      expect(result.pages_failed).toBe(0);
+    });
+  });
+
   test('provider AbortError fails open while the caller signal is live', async () => {
     await engine.setConfig('conversation_parser.llm_fallback_enabled', 'true');
     fallbackControlError = Object.assign(new Error('provider timeout'), { name: 'AbortError' });
@@ -804,6 +833,58 @@ describe('runExtractConversationFactsCore', () => {
       [TERMINAL_AUDIT_SOURCE, `${TERMINAL_AUDIT_SOURCE}:conversations/imessage/alice-example:page-%`],
     );
     expect(Number(terminalRows[0]?.count ?? 0)).toBe(1);
+  });
+
+  test('canonicalizes a raw LLM entity display name before writing facts.entity_slug', async () => {
+    chatTextOverride = JSON.stringify({
+      facts: [{
+        fact: 'Alice Example signed the offer letter.',
+        kind: 'event',
+        entity: 'Alice Example',
+        confidence: 1.0,
+        notability: 'high',
+      }],
+    });
+
+    await runExtractConversationFactsCore(engine, {
+      sourceId: 'default',
+      slug: 'conversations/imessage/alice-example',
+      sleepMs: 0,
+    });
+
+    const rows = await engine.executeRaw<{ entity_slug: string | null }>(
+      `SELECT entity_slug FROM facts
+        WHERE source = $1 AND source_markdown_slug = $2`,
+      [PER_SEGMENT_SOURCE_PREFIX, 'conversations/imessage/alice-example'],
+    );
+    expect(rows.length).toBeGreaterThan(0);
+    expect(rows.every((row) => row.entity_slug === 'people/alice-example')).toBe(true);
+  });
+
+  test('preserves an already-canonical LLM entity slug', async () => {
+    chatTextOverride = JSON.stringify({
+      facts: [{
+        fact: 'Alice Example started the new role.',
+        kind: 'event',
+        entity: 'people/alice-example',
+        confidence: 1.0,
+        notability: 'high',
+      }],
+    });
+
+    await runExtractConversationFactsCore(engine, {
+      sourceId: 'default',
+      slug: 'conversations/imessage/alice-example',
+      sleepMs: 0,
+    });
+
+    const rows = await engine.executeRaw<{ entity_slug: string | null }>(
+      `SELECT entity_slug FROM facts
+        WHERE source = $1 AND source_markdown_slug = $2`,
+      [PER_SEGMENT_SOURCE_PREFIX, 'conversations/imessage/alice-example'],
+    );
+    expect(rows.length).toBeGreaterThan(0);
+    expect(rows.every((row) => row.entity_slug === 'people/alice-example')).toBe(true);
   });
 
   test('terminal outcome skips a completed page after checkpoint GC', async () => {

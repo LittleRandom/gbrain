@@ -69,9 +69,14 @@ describe('recipe: openrouter', () => {
     const r = getRecipe('openrouter')!;
     expect(r.touchpoints.chat).toBeDefined();
     expect(r.touchpoints.chat!.supports_tools).toBe(true);
-    // supports_subagent_loop is informational; isAnthropicProvider() is the
-    // real gate. Field stays false per the recipe docstring.
-    expect(r.touchpoints.chat!.supports_subagent_loop).toBe(false);
+    const loop = r.touchpoints.chat!.supports_subagent_loop;
+    expect(typeof loop).toBe('function');
+    if (typeof loop === 'function') {
+      expect(loop('anthropic/claude-haiku-4.5')).toBe(true);
+      expect(loop('anthropic/claude-sonnet-4.6')).toBe(true);
+      expect(loop('openai/gpt-5.2')).toBe(false);
+      expect(loop('deepseek/deepseek-chat')).toBe(false);
+    }
     expect(() =>
       assertTouchpoint(r, 'chat', 'some/provider-model'),
     ).not.toThrow();
@@ -181,8 +186,19 @@ describe('recipe: openrouter', () => {
     expect(openrouterSupportsPromptCache('openai/text-embedding-3-small')).toBe(false);
     expect(openrouterSupportsPromptCache('anthropic/claude-sonnet-4.6')).toBe(true);
     expect(openrouterSupportsPromptCache('anthropic/claude-opus-4.7')).toBe(true);
-    expect(openrouterSupportsPromptCache('deepseek/deepseek-chat')).toBe(false);
+    // DeepSeek routes cache automatically, same as the OpenAI ones — and the
+    // native `deepseek` recipe says so too, so the two routes must agree.
+    expect(openrouterSupportsPromptCache('deepseek/deepseek-chat')).toBe(true);
     expect(openrouterSupportsPromptCache('google/gemini-3-flash-preview')).toBe(false);
+
+    // Routing variants (`:online`, `:nitro`, `:floor`, …) are an OpenRouter
+    // concept, not part of the upstream model id, so they must not change the
+    // answer either way.
+    expect(openrouterSupportsPromptCache('openai/gpt-4o:online')).toBe(true);
+    expect(openrouterSupportsPromptCache('openai/gpt-4.1:nitro')).toBe(true);
+    expect(openrouterSupportsPromptCache('openai/o1:floor')).toBe(true);
+    expect(openrouterSupportsPromptCache('openai/gpt-4-turbo:online')).toBe(false);
+    expect(openrouterSupportsPromptCache('deepseek/deepseek-chat:free')).toBe(true);
   });
 
   test('13. only Anthropic Claude routes require the explicit cache_control rewrite', () => {

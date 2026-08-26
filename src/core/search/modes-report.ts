@@ -21,6 +21,7 @@ export const KNOB_DESCRIPTIONS: Record<keyof ModeBundle, string> = {
   cache_similarity_threshold: 'Cosine-similarity floor for cache hits (0..1)',
   cache_ttl_seconds: 'Per-row cache TTL',
   intentWeighting: 'Zero-LLM intent classifier weight adjustments',
+  keywordOrFallback: 'Keyword-arm AND→OR zero-recall fallback',
   tokenBudget: 'Per-call token-budget cap (undefined = no cap)',
   expansion: 'LLM multi-query expansion (Haiku call per search)',
   searchLimit: 'Default `limit` for the operation layer',
@@ -50,6 +51,7 @@ export const KNOB_DESCRIPTIONS: Record<keyof ModeBundle, string> = {
   // v0.42.3.0 autocut
   autocut: 'Score-discontinuity result-sizing (cuts at the rerank-score cliff; no-op without a reranker)',
   autocut_jump: 'Autocut sensitivity: min normalized score gap that counts as a cliff (0..1, 0.20 default)',
+  autocut_min_keep: 'Autocut floor: never trim the returned set below this many results (integer >= 1, 1 default)',
   // v0.43 relational recall
   relationalRetrieval: 'Typed-edge relational recall arm (relational queries walk the graph; no-op otherwise)',
   relational_retrieval_depth: 'Max hops for relational traversal (1..3, 2 default)',
@@ -76,6 +78,7 @@ export async function buildModesReport(engine: BrainEngine): Promise<SearchModes
     'cache_similarity_threshold',
     'cache_ttl_seconds',
     'intentWeighting',
+    'keywordOrFallback',
     'tokenBudget',
     'expansion',
     'searchLimit',
@@ -87,6 +90,8 @@ export async function buildModesReport(engine: BrainEngine): Promise<SearchModes
     // floor surfaced so config drift on the new knobs is legible.
     'evidence_cosine_floor',
     'autocut_min_top',
+    // #3621 — the documented autocut floor, surfaced alongside the weak-top floor.
+    'autocut_min_keep',
   ];
 
   const attributions = {} as SearchModesReport['resolved'];

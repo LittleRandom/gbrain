@@ -71,6 +71,18 @@ export interface FactsBackstopCtx {
   visibility?: 'private' | 'world';
   /** Override the chat model (extract_facts forwards user's model param when set). */
   model?: string;
+  /**
+   * #4206: caller-supplied event time. Fallback ONLY — a valid_from the
+   * extractor derives from the turn itself wins; absent both, now(). Lets
+   * historical imports (old transcripts) avoid import-time stamping.
+   */
+  validFrom?: Date;
+  /**
+   * #4206: slug of the page/transcript the turn came from (e.g.
+   * 'meetings/2026-04-03'). Written to facts.context so the recall /
+   * context_pack / delta projections surface the provenance.
+   */
+  sourceSlug?: string;
 }
 
 /** Discriminated return shape based on FactsBackstopCtx.mode. */
@@ -346,10 +358,8 @@ export async function runFactsBackstop(
       try {
         await runPipeline(parsedPage, ctx, signal);
       } catch (err) {
-        const { classifyFactsAbsorbError, writeFactsAbsorbLog } = await import('./absorb-log.ts');
-        const reason = classifyFactsAbsorbError(err);
-        const msg = err instanceof Error ? err.message : String(err);
-        await writeFactsAbsorbLog(ctx.engine, parsedPage.slug, reason, msg, ctx.sourceId);
+        const { writeFactsAbsorbFailure } = await import('./absorb-log.ts');
+        await writeFactsAbsorbFailure(ctx.engine, parsedPage.slug, err, ctx.sourceId);
       }
     }, ctx.sessionId ?? parsedPage.slug);
 
@@ -614,19 +624,33 @@ async function runPipelineWithBody(
 
   // Phase 3: look up source.local_path once for the fence path. Null
   // means thin-client / no FS — fall through to legacy DB-only for
-  // every fact.
-  const localPath = await lookupSourceLocalPath(ctx.engine, ctx.sourceId);
+  // every fact. The `sync.write_through` opt-out takes the same DB-only
+  // route (no fence file, no stub page, no commit) without the
+  // thin-client warning — the operator chose it.
+  const { isWriteThroughDisabled } = await import('../write-through.ts');
+  const writeThroughDisabled = await isWriteThroughDisabled(ctx.engine);
+  const localPath = writeThroughDisabled
+    ? null
+    : await lookupSourceLocalPath(ctx.engine, ctx.sourceId);
 
   // Phase 4: legacy DB-only fallback for unparented + thin-client.
   // Single-row engine.insertFact preserves the v0.31 semantics for
   // these structurally-unfenceable cases.
   const legacyBucket: SurvivedFact[] = [];
   if (localPath === null) {
-    warnOnce(
-      'facts:thin-client-fallback',
-      '[facts] sources.local_path unset for source_id=' + ctx.sourceId +
-      ' — falling through to DB-only inserts. Configure local_path via `gbrain sources update` to enable system-of-record fence writes.',
-    );
+    if (!writeThroughDisabled) {
+      // #4489: name the REAL remedy. The sources dispatcher has no
+      // "update" verb — attaching a working tree to a path-less source goes
+      // through `gbrain sources add <id> --path <dir>` (the #3903
+      // non-destructive attach path in sources-ops.ts). Pinned by
+      // test/facts-backstop-remedy-verb.test.ts.
+      warnOnce(
+        'facts:thin-client-fallback',
+        '[facts] sources.local_path unset for source_id=' + ctx.sourceId +
+        ' — falling through to DB-only inserts. Attach a working tree via `gbrain sources add ' + ctx.sourceId +
+        ' --path <dir>` to enable system-of-record fence writes.',
+      );
+    }
     for (const s of survived) legacyBucket.push(s);
   } else {
     for (const s of unparented) legacyBucket.push(s);
@@ -643,6 +667,9 @@ async function runPipelineWithBody(
       source_session: f.source_session ?? null,
       confidence: f.confidence,
       embedding: f.embedding ?? null,
+      // #4206: caller event-time fallback + provenance context.
+      valid_from: f.valid_from ?? ctx.validFrom,
+      context: ctx.sourceSlug ?? null,
     };
     const result = await ctx.engine.insertFact(newFact, { source_id: ctx.sourceId }); // gbrain-allow-direct-insert: legacy DB-only fallback for unparented / thin-client facts (no entity page to fence onto)
     fact_ids.push(result.id);
@@ -668,10 +695,14 @@ async function runPipelineWithBody(
       kind: f.kind,
       notability: f.notability,
       source: f.source,
-      context: null,
+      // #4206: the caller's source_slug (which page/transcript the turn came
+      // from) lands in the fence context cell — visible in recall projections.
+      context: ctx.sourceSlug ?? null,
       visibility,
       confidence: f.confidence,
-      validFrom: f.valid_from ?? new Date(),
+      // #4206: extractor-derived date wins; then the caller's event time
+      // (historical imports); then import time.
+      validFrom: f.valid_from ?? ctx.validFrom ?? new Date(),
       embedding: f.embedding ?? null,
       sessionId: f.source_session ?? null,
     }));
@@ -690,9 +721,11 @@ async function runPipelineWithBody(
       // would write rows to a DB index whose fence is broken.
       continue;
     }
-    if (result.stubGuardBlocked) {
+    if (result.stubGuardBlocked || result.targetUnresolvable) {
       // v0.34.5: writeFactsToFence refused to spawn a phantom
       // unprefixed entity page (e.g. `jared.md` at brain root).
+      // #4204: or the shared page-target resolver found the source
+      // tree unusable (deleted dir / hostile source_path row).
       // Route these facts to the legacy DB-only path so they
       // aren't dropped — the slug stays attached but no markdown
       // file is created.
@@ -707,8 +740,11 @@ async function runPipelineWithBody(
           source_session: f.source_session ?? null,
           confidence: f.confidence,
           embedding: f.embedding ?? null,
+          // #4206: caller event-time fallback + provenance context.
+          valid_from: f.valid_from ?? ctx.validFrom,
+          context: ctx.sourceSlug ?? null,
         };
-        const legacyResult = await ctx.engine.insertFact(newFact, { source_id: ctx.sourceId }); // gbrain-allow-direct-insert: stub-guard fallback for unprefixed entity slugs (no fenceable page)
+        const legacyResult = await ctx.engine.insertFact(newFact, { source_id: ctx.sourceId }); // gbrain-allow-direct-insert: stub-guard / unresolvable-target fallback (no fenceable page or usable tree)
         fact_ids.push(legacyResult.id);
         if (legacyResult.status === 'inserted') inserted += 1;
         else if ((legacyResult.status as FactInsertStatus) === 'duplicate') duplicate += 1;
@@ -717,12 +753,35 @@ async function runPipelineWithBody(
       continue;
     }
     if (result.legacyFallback) {
-      // Defensive: writeFactsToFence sees localPath as null. We
-      // checked above so this shouldn't fire — log loud + skip.
+      // writeFactsToFence saw the brain as DB-only even though phase 3
+      // didn't (null-localPath echo, or the write_through flag flipped
+      // mid-pipeline across the config-cache TTL). Route the group to the
+      // legacy DB-only path — never drop facts.
       warnOnce(
         'facts:fence-write-unexpected-fallback',
-        `[facts] writeFactsToFence returned legacyFallback for slug=${slug} despite localPath being set — investigation needed.`,
+        `[facts] writeFactsToFence returned legacyFallback for slug=${slug} despite localPath being set — routing to DB-only inserts.`,
       );
+      for (const { f } of group) {
+        const newFact: NewFact = {
+          fact: f.fact,
+          kind: f.kind,
+          entity_slug: slug,
+          visibility,
+          notability: f.notability,
+          source: f.source,
+          source_session: f.source_session ?? null,
+          confidence: f.confidence,
+          embedding: f.embedding ?? null,
+          // #4206: caller event-time fallback + provenance context.
+          valid_from: f.valid_from ?? ctx.validFrom,
+          context: ctx.sourceSlug ?? null,
+        };
+        const legacyResult = await ctx.engine.insertFact(newFact, { source_id: ctx.sourceId }); // gbrain-allow-direct-insert: DB-only fallback when the fence lane declined the write (write_through opt-out race / localPath echo)
+        fact_ids.push(legacyResult.id);
+        if (legacyResult.status === 'inserted') inserted += 1;
+        else if ((legacyResult.status as FactInsertStatus) === 'duplicate') duplicate += 1;
+        else superseded += 1;
+      }
       continue;
     }
 

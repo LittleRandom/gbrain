@@ -31,12 +31,12 @@ import { createAnthropic } from '@ai-sdk/anthropic';
 import { createOpenAICompatible } from '@ai-sdk/openai-compatible';
 import { z } from 'zod';
 
+import { truncateUtf8 } from '../text-safe.ts';
 import {
   BudgetTracker,
   extractUsageFromError as _extractUsageFromError,
   type BudgetKind,
 } from '../budget/budget-tracker.ts';
-
 import type {
   AIGatewayConfig,
   EmbedMultimodalOpts,
@@ -47,6 +47,7 @@ import type {
   TouchpointKind,
 } from './types.ts';
 import { resolveRecipe, assertTouchpoint, parseModelId, embeddingDimsForModel } from './model-resolver.ts';
+import { recordChatUsage } from './chat-usage.ts';
 import {
   OPENROUTER_CACHE_HEADER,
   openrouterRequiresExplicitPromptCache,
@@ -55,13 +56,13 @@ import { resolveModel, resolveModelDetailed, resolveEffectiveChatModel, resolveE
 import { parseLlmJson } from '../llm-json.ts';
 import type { BrainEngine } from '../engine.ts';
 import { dimsProviderOptions } from './dims.ts';
-import { hasAnthropicKey } from './anthropic-key.ts';
+import { hasAnthropicKey, stashGatewayAnthropicKeyFromEnv } from './anthropic-key.ts';
 import { AIConfigError, AITransientError, normalizeAIError } from './errors.ts';
 import { runGuardrails, hasGuardrails, type GuardrailHook } from '../guardrails.ts';
 import { loadConfig } from '../config.ts';
 import type { GBrainConfig } from '../config.ts';
 import { mergedProviderEnv } from './provider-env.ts';
-import { buildGatewayConfig } from './build-gateway-config.ts';
+import { buildGatewayConfig, foldNativeBaseUrlsFromFilePlane } from './build-gateway-config.ts';
 
 // ---- Gateway-wide AI-HTTP timeout (v0.42.20.0, #1762/#1775) ----
 //
@@ -113,6 +114,7 @@ import {
   DEFAULT_EMBEDDING_MODEL,
   DEFAULT_EMBEDDING_DIMENSIONS,
   NEW_INSTALL_DEFAULT_EMBEDDING_MODEL,
+  LEGACY_DEFAULT_RERANKER_MODEL,
   renderCanonicalMigrationCommands,
 } from './defaults.ts';
 const DEFAULT_EXPANSION_MODEL = 'anthropic:claude-haiku-4-5-20251001';
@@ -120,12 +122,11 @@ const DEFAULT_CHAT_MODEL = 'anthropic:claude-sonnet-4-6';
 // v0.35.0.0+: reranker default. Used only when search.reranker.enabled is set
 // AND no explicit reranker_model is configured. Mode bundles' per-mode
 // `reranker_model` default to this same value but can be overridden.
-// v0.46.3: stays on the LEGACY zerank-2 until the September removal (reranker
-// split-default: existing ZE-keyed brains keep their working reranker until
-// the API dies; voyage-keyed NEW installs get an explicit
-// `search.reranker.model voyage:rerank-2.5` override written at init, and
-// keyed non-voyage installs get explicit `search.reranker.enabled false`).
-const DEFAULT_RERANKER_MODEL = 'zeroentropyai:zerank-2';
+// v0.46.3: stays on the LEGACY zerank-2 until the September removal (split-default: existing
+// ZE-keyed brains keep their working reranker until the API dies; NEW installs get explicit
+// `search.reranker.*` config at init — `voyage:rerank-2.5` with a Voyage key, `enabled false`
+// otherwise). #3657 seam: ONE constant in defaults.ts, shared with the mode bundles.
+const DEFAULT_RERANKER_MODEL = LEGACY_DEFAULT_RERANKER_MODEL;
 
 let _config: AIGatewayConfig | null = null;
 const _modelCache = new Map<string, any>();
@@ -480,6 +481,7 @@ export function configureGateway(config: AIGatewayConfig): void {
     provider_chat_options: config.provider_chat_options,
     env: config.env,
   };
+  stashGatewayAnthropicKeyFromEnv(config.env); // #2119: filter + rationale in anthropic-key.ts
   _modelCache.clear();
   _shrinkState.clear();
   warnRecipesMissingBatchTokens();
@@ -501,7 +503,12 @@ export function refreshGatewayEnvFromFilePlane(): void {
   } catch {
     cfg = null;
   }
-  _config = { ..._config, env: mergedProviderEnv(cfg, process.env) };
+  // #3350: re-apply the file-plane native base-URL fold — without it a worker
+  // refresh would silently drop ANTHROPIC_BASE_URL/OPENAI_BASE_URL that the
+  // boot fold installed from provider_base_urls.{anthropic,openai}. File-plane
+  // only (cfg is loadConfig() here), preserving the mount-safety rule that
+  // DB-plane base_urls never steer native keys.
+  _config = { ..._config, env: foldNativeBaseUrlsFromFilePlane(cfg, mergedProviderEnv(cfg, process.env)) };
   _modelCache.clear();
 }
 
@@ -690,6 +697,7 @@ export function __setGatewayResetBaselineForTests(
 /** Clear every piece of module state. Shared by both reset flavors. */
 function clearGatewayState(): void {
   _config = null;
+  stashGatewayAnthropicKeyFromEnv(undefined); // gateway-owned snapshot dies with the config
   _modelCache.clear();
   _shrinkState.clear();
   _embedTransport = embedMany;
@@ -1656,6 +1664,22 @@ function instantiateEmbedding(recipe: Recipe, modelId: string, cfg: AIGatewayCon
 const MIN_SUB_BATCH = 1;
 
 /**
+ * #3875: default per-call item cap for `no_batch_cap` recipes (Ollama,
+ * LiteLLM proxy). These recipes declare no static token/item cap because the
+ * backend's capacity is user-launched — but the per-SDK-call
+ * AI_EMBED_TIMEOUT_MS (60s default) then bounded a whole FILE's chunks in one
+ * request. A slow local model (CPU Ollama) embedding a large file timed out
+ * deterministically and every retry re-sent the same oversized batch. Capping
+ * items per sub-batch makes the 60s timeout a per-BATCH budget: 16 chunks per
+ * call finishes comfortably even on CPU-bound local models, and a genuinely
+ * wedged provider still surfaces the timeout loudly on the first sub-batch.
+ * An explicit `max_batch_items` on the recipe always wins over this default.
+ *
+ * @internal exported for tests; not part of the public gateway API.
+ */
+export const NO_BATCH_CAP_SUB_BATCH_ITEMS = 16;
+
+/**
  * Embed many texts. Truncates to MAX_CHARS, then dispatches based on whether
  * the recipe declares a per-batch token budget.
  *
@@ -1759,7 +1783,7 @@ export async function embed(texts: string[], opts?: EmbedOpts): Promise<Float32A
   const resolveTarget = opts?.embeddingModel ?? getEmbeddingModel();
   const tracker = __budgetStore.getStore() ?? null;
   const { model, recipe, modelId } = await resolveEmbeddingProvider(resolveTarget);
-  const truncated = texts.map(t => (t ?? '').slice(0, MAX_CHARS));
+  const truncated = texts.map(t => truncateUtf8(t ?? '', MAX_CHARS));
 
   // Reserve up front for the worst-case batch token count. Embeddings have
   // no output rate, so maxOutputTokens=0. record() at the end uses the
@@ -1801,7 +1825,18 @@ export async function embed(texts: string[], opts?: EmbedOpts): Promise<Float32A
 
   // Hard COUNT cap (e.g. llama-server's "maximum allowed batch size 32").
   // Token budget can't bound item count, so re-split any oversized batch.
-  const maxBatchItems = embedding?.max_batch_items;
+  //
+  // #3875: recipes that declare `no_batch_cap` (Ollama, LiteLLM proxy) have
+  // NO static token cap AND no item cap, so a large file used to ride to the
+  // provider as ONE request — and the 60s AI_EMBED_TIMEOUT_MS (per SDK call)
+  // became a per-FILE budget. A slow local model embedding hundreds of chunks
+  // hit the timeout deterministically, and no amount of retrying could ever
+  // succeed. Default those recipes to a conservative item cap so the per-call
+  // timeout bounds a fixed amount of work; an explicit max_batch_items still
+  // wins.
+  const maxBatchItems =
+    embedding?.max_batch_items ??
+    (embedding?.no_batch_cap === true ? NO_BATCH_CAP_SUB_BATCH_ITEMS : undefined);
   const batches = maxBatchItems
     ? tokenBatches.flatMap(b => capBatchItems(b, maxBatchItems))
     : tokenBatches;
@@ -2932,9 +2967,19 @@ export type ChatRole = 'system' | 'user' | 'assistant' | 'tool';
  * on the rebuilt part in toModelMessages(), and carried through the replay shim
  * (adaptContentBlocksToChatBlocks). Attached ONLY when the provider sent one —
  * blocks from providers without per-part state stay byte-identical.
+ *
+ * `reasoning` blocks are the same #4201 shape applied to OpenAI's Responses
+ * API reasoning models (o-series, gpt-5.x family): every response `reasoning`
+ * part carries `providerMetadata.openai.itemId` (+ optional
+ * `reasoningEncryptedContent`), and OpenAI's server REJECTS a later turn whose
+ * history has a `function_call` item with no matching `reasoning` item —
+ * "Item '<fc_id>' of type 'function_call' was provided without its required
+ * 'reasoning' item: '<rs_id>'." A reasoning-model tool-loop conversation dies
+ * on turn 2 without this: `chat()` previously never captured the part at all.
  */
 export type ChatBlock =
   | { type: 'text'; text: string; providerMetadata?: Record<string, unknown> }
+  | { type: 'reasoning'; text: string; providerMetadata?: Record<string, unknown> }
   | { type: 'tool-call'; toolCallId: string; toolName: string; input: unknown; providerMetadata?: Record<string, unknown> }
   | { type: 'tool-result'; toolCallId: string; toolName: string; output: unknown; isError?: boolean; providerMetadata?: Record<string, unknown> };
 
@@ -3050,18 +3095,26 @@ export function toModelMessages(messages: ChatMessage[]): unknown[] {
     }
     return {
       role: m.role,
-      // Drop text blocks whose `text` isn't a string: reasoning models
-      // (DeepSeek v4, etc.) surface `text: null/undefined` thinking parts that
-      // AI SDK v6's Zod schema rejects, poisoning the whole call. `''` is valid
-      // and kept.
+      // Drop text/reasoning blocks whose `text` isn't a string: reasoning
+      // models (DeepSeek v4, etc.) surface `text: null/undefined` thinking
+      // parts that AI SDK v6's Zod schema rejects, poisoning the whole call.
+      // `''` is valid and kept.
       content: blocks
-        .filter((b) => b.type !== 'text' || typeof b.text === 'string')
+        .filter((b) => (b.type !== 'text' && b.type !== 'reasoning') || typeof b.text === 'string')
         .map((b) => {
           // #4201: `providerOptions` echoes per-part provider state (e.g.
-          // Gemini 3.x thoughtSignature) — attached only when captured.
+          // Gemini 3.x thoughtSignature, OpenAI reasoning-item id) — attached
+          // only when captured.
           if (b.type === 'text') {
             return {
               type: 'text' as const,
+              text: b.text,
+              ...(b.providerMetadata ? { providerOptions: b.providerMetadata } : {}),
+            };
+          }
+          if (b.type === 'reasoning') {
+            return {
+              type: 'reasoning' as const,
               text: b.text,
               ...(b.providerMetadata ? { providerOptions: b.providerMetadata } : {}),
             };
@@ -3169,8 +3222,13 @@ export interface ChatOpts {
   maxTokens?: number;
   abortSignal?: AbortSignal;
   /**
-   * Anthropic-specific: cache the system prompt + last tool def. Silently
-   * ignored on providers without `supports_prompt_cache`.
+   * Ask for the stable prefix (system prompt + last tool def) to be cached.
+   * Silently ignored on providers whose recipe declares no prompt caching.
+   *
+   * Only Anthropic reads the resulting `cache_control` markers. Providers that
+   * cache prefixes automatically (OpenAI, DeepSeek) need no markers, and the
+   * Anthropic-namespace `providerOptions` this attaches never reach their
+   * request body — the AI SDK routes provider options by provider key.
    */
   cacheSystem?: boolean;
 }
@@ -3344,8 +3402,10 @@ function mapStopReason(
 
 /**
  * Run one chat completion turn. Provider-neutral wrapper over Vercel AI SDK's
- * `generateText`. Tool-use blocks are normalized; cache_control markers are
- * applied only on Anthropic when `cacheSystem: true`.
+ * `generateText`. Tool-use blocks are normalized. `cacheSystem: true` engages
+ * the caching path on any provider whose recipe declares prompt caching; the
+ * `cache_control` markers it attaches are read only by Anthropic, and are inert
+ * on providers that cache prefixes automatically.
  *
  * Crash-resumable replay is the caller's responsibility (subagent.ts persists
  * blocks via the provider-neutral schema landing in commit 2a).
@@ -3553,6 +3613,18 @@ export async function chat(opts: ChatOpts): Promise<ChatResult> {
     let threw: unknown = null;
     try {
       res = await _chatTransport(opts);
+      // #4218 success boundary (test-transport lane): same accounting call as
+      // the production path below so transport-driven tests exercise it.
+      recordChatUsage({
+        model: res.model ?? modelStrEarly,
+        provider: res.providerId ?? null,
+        usage: {
+          input_tokens: res.usage.input_tokens,
+          output_tokens: res.usage.output_tokens,
+          cache_read_tokens: res.usage.cache_read_tokens,
+          cache_write_tokens: res.usage.cache_creation_tokens,
+        },
+      });
       return res;
     } catch (err) {
       threw = err;
@@ -3727,13 +3799,16 @@ export async function chat(opts: ChatOpts): Promise<ChatResult> {
     if (Array.isArray(rawContent) && rawContent.length > 0) {
       for (const part of rawContent) {
         // #4201: capture per-part providerMetadata (Gemini 3.x thoughtSignature
-        // arrives on functionCall/text parts and must be echoed back next turn).
-        // `reasoning` parts stay deliberately dropped: the echo requirement is
-        // on functionCall parts; reasoning text never re-enters the transcript.
+        // and OpenAI reasoning-item ids arrive on functionCall/reasoning/text
+        // parts and must be echoed back next turn — see the ChatBlock doc
+        // comment for the OpenAI Responses API's specific requirement).
         const partMeta = part.providerMetadata && typeof part.providerMetadata === 'object'
           ? { providerMetadata: part.providerMetadata as Record<string, unknown> }
           : {};
         if (part.type === 'text') blocks.push({ type: 'text', text: part.text, ...partMeta });
+        else if (part.type === 'reasoning') {
+          blocks.push({ type: 'reasoning', text: typeof part.text === 'string' ? part.text : '', ...partMeta });
+        }
         else if (part.type === 'tool-call') {
           blocks.push({
             type: 'tool-call',
@@ -3766,19 +3841,27 @@ export async function chat(opts: ChatOpts): Promise<ChatResult> {
     const { inputTokens: inTok, outputTokens: outTok } = normalizeSdkUsage(usage);
     _recordBudget(`${recipe.id}:${modelId}`, inTok, outTok);
 
+    const usageOut = {
+      input_tokens: inTok,
+      output_tokens: outTok,
+      // `usage.cachedInputTokens` is the AI SDK's provider-neutral cache-read
+      // count — it's how OpenAI-compatible routes (OpenRouter's
+      // prompt_tokens_details.cached_tokens) surface cache hits.
+      cache_read_tokens: Number(anthropicCache.cacheReadInputTokens ?? anthropicCache.cache_read_input_tokens ?? usage.cachedInputTokens ?? 0),
+      cache_creation_tokens: Number(anthropicCache.cacheCreationInputTokens ?? anthropicCache.cache_creation_input_tokens ?? 0),
+    };
+    // #4218 success boundary: durable usage ledger (fire-and-forget, fail-open).
+    recordChatUsage({
+      model: `${recipe.id}:${modelId}`,
+      provider: recipe.id,
+      usage: { ...usageOut, cache_write_tokens: usageOut.cache_creation_tokens },
+    });
+
     return {
       text: blocks.filter(b => b.type === 'text').map(b => (b as { type: 'text'; text: string }).text).join(''),
       blocks,
       stopReason: mapStopReason((result as any).finishReason, providerMetadata),
-      usage: {
-        input_tokens: inTok,
-        output_tokens: outTok,
-        // `usage.cachedInputTokens` is the AI SDK's provider-neutral cache-read
-        // count — it's how OpenAI-compatible routes (OpenRouter's
-        // prompt_tokens_details.cached_tokens) surface cache hits.
-        cache_read_tokens: Number(anthropicCache.cacheReadInputTokens ?? anthropicCache.cache_read_input_tokens ?? usage.cachedInputTokens ?? 0),
-        cache_creation_tokens: Number(anthropicCache.cacheCreationInputTokens ?? anthropicCache.cache_creation_input_tokens ?? 0),
-      },
+      usage: usageOut,
       model: `${recipe.id}:${modelId}`,
       providerId: recipe.id,
       providerMetadata,
@@ -3842,7 +3925,11 @@ export interface ToolLoopOpts {
   /** Per-turn max output tokens. Default 4096. */
   maxTokens?: number;
   abortSignal?: AbortSignal;
-  /** Apply Anthropic cache_control to system + last tool. Silently ignored elsewhere. */
+  /**
+   * Ask for the stable prefix (system + last tool) to be cached. Forwarded to
+   * `chat()`; see `ChatOpts.cacheSystem` for what each provider does with it.
+   * Silently ignored on recipes that declare no prompt caching.
+   */
   cacheSystem?: boolean;
 
   /** Crash-replay state. When set, the loop resumes from the recorded position. */

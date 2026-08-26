@@ -92,8 +92,10 @@ import { parseWorkers, resolveWorkersWithClamp } from '../core/sync-concurrency.
 import { withRefreshingLock, LockUnavailableError } from '../core/db-lock.ts';
 import { assertFactsEmbeddingDimMatchesConfig } from '../core/embedding-dim-check.ts';
 import { writeReceipt, shortRunId } from '../core/extract/receipt-writer.ts';
-import { upsertExtractRollup } from '../core/extract/rollup-writer.ts';
+import { upsertExtractRollup, classifyRunStop } from '../core/extract/rollup-writer.ts';
 import { ALLOWED_TYPES, type AllowedType } from '../core/facts/conversation-types.ts';
+import { TERMINAL_AUDIT_SOURCE, NON_EXTRACTABLE_AUDIT_SOURCE } from '../core/facts/audit-sources.ts';
+import { resolveEntitySlug } from '../core/entities/resolve.ts';
 
 // Re-exported verbatim so existing importers (this file's own helpers below
 // and this file's tests) keep working unchanged; doctor.ts, jobs.ts,
@@ -103,6 +105,12 @@ import { ALLOWED_TYPES, type AllowedType } from '../core/facts/conversation-type
 // own CLI flag surface.
 export { ALLOWED_TYPES };
 export type { AllowedType };
+
+// Re-exported for existing importers (test/extract-conversation-facts.test.ts,
+// test/doctor-conversation-facts-backlog.test.ts, src/eval/brainbench/metrics/write-back.ts).
+// The values themselves now live in ../core/facts/audit-sources.ts — see that
+// leaf module's docstring for why (engine-live static-import requirement).
+export { TERMINAL_AUDIT_SOURCE, NON_EXTRACTABLE_AUDIT_SOURCE };
 
 // ---------------------------------------------------------------------------
 // Tunables (exported for tests).
@@ -220,21 +228,13 @@ export const CHECKPOINT_OP = 'extract-conversation-facts';
  */
 export const PER_SEGMENT_SOURCE_PREFIX = 'cli:extract-conversation-facts';
 
-/**
- * Source string written on the page-level terminal audit row (Eng-v2 C7).
- * Doctor's backlog query matches THIS source + source_session, not
- * the per-segment source. Partial extraction = no terminal row = page
- * stays in backlog.
- */
-export const TERMINAL_AUDIT_SOURCE = 'cli:extract-conversation-facts:terminal:v2';
-
-/**
- * Durable outcome for a successfully scanned page that contains no eligible
- * multi-message segment. Kept distinct from successful extraction so operator
- * surfaces can report the truth without rescanning the page forever.
- */
-export const NON_EXTRACTABLE_AUDIT_SOURCE =
-  'cli:extract-conversation-facts:non-extractable:v2';
+// TERMINAL_AUDIT_SOURCE / NON_EXTRACTABLE_AUDIT_SOURCE: defined in
+// ../core/facts/audit-sources.ts, imported + re-exported above. (Doctor's
+// backlog query matches TERMINAL_AUDIT_SOURCE + source_session, not the
+// per-segment source; partial extraction = no terminal row = page stays in
+// backlog. NON_EXTRACTABLE_AUDIT_SOURCE is kept distinct from successful
+// extraction so operator surfaces can report the truth without rescanning
+// the page forever.)
 
 // ---------------------------------------------------------------------------
 // Public types.
@@ -1084,6 +1084,12 @@ async function processPage(
         abortSignal: state.signal,
       });
       if (!extraction.ok) {
+        // #3669 — rethrow BudgetExhausted UNWRAPPED. Wrapping it in a plain
+        // Error strips the BUDGET_EXHAUSTED tag, so the worker pool's D13
+        // must-abort check never fires and every remaining page burns a
+        // reserve_denied attempt instead of the run halting with a
+        // budget_exhausted receipt (core catch → halted receipt → return).
+        if (extraction.error instanceof BudgetExhausted) throw extraction.error;
         const detail = extraction.error instanceof Error
           ? `: ${extraction.error.message}`
           : '';
@@ -1099,11 +1105,12 @@ async function processPage(
     state.result.facts_extracted += extracted.length;
 
     if (!state.dryRun && extracted.length > 0) {
-      // Eng-v2 C1 / E11: page-global row_num. Each fact in this batch gets
-      // a unique row_num within (source_id, source_markdown_slug); the
-      // accumulator increments across the segment loop.
-      const rows = extracted.map((fact, i) => ({
+      // Eng-v2 C1 / E11: page-global row_num stays unique across segments.
+      const rows = await Promise.all(extracted.map(async (fact, i) => ({
         ...fact,
+        entity_slug: fact.entity_slug
+          ? await resolveEntitySlug(state.engine, state.sourceId, fact.entity_slug)
+          : null,
         row_num: rowNum + i,
         source_markdown_slug: page.slug,
         source: PER_SEGMENT_SOURCE_PREFIX,
@@ -1116,7 +1123,7 @@ async function processPage(
           : {}),
         context:
           fact.context ?? `from ${page.slug} segment ${seg.startIso}..${seg.endIso}`,
-      }));
+      })));
       const ins = await state.engine.insertFacts(rows, { source_id: state.sourceId }); // gbrain-allow-direct-insert: canonical bulk extraction path for conversation pages — fences-as-system-of-record doesn't apply because conversations don't carry `## Facts` fences (the chat-log shape is the source-of-truth)
       pageInsertedTotal += ins.inserted;
       state.result.facts_inserted += ins.inserted;
@@ -1647,13 +1654,20 @@ async function writeRunReceiptAndRollup(
   // Rollup UPSERT: ALWAYS fire so doctor's extract_health sees the
   // cycle ran (even no-op runs are signal — they prove the extractor
   // was alive). Best-effort per F-OUT-19.
-  const incomplete = halted || result.pages_failed > 0;
+  //
+  // #4482: a run that stopped ONLY because it hit its per-source budget cap
+  // is working as designed (partial progress banked; the backlog drains over
+  // future runs) — record it as expected_limit_delta, not halt_delta, so
+  // doctor's extract_health failure rate stops warning on normal
+  // bigger-backlog-than-budget operation. Per-page failures stay error halts.
   await upsertExtractRollup(engine, {
     kind: 'facts.conversation',
     source_id: sourceId,
     cost_delta: result.spent_usd ?? 0,
-    round_completed_delta: incomplete ? 0 : 1,
-    halt_delta: incomplete ? 1 : 0,
+    ...classifyRunStop({
+      budget_exhausted: halted,
+      error: result.pages_failed > 0,
+    }),
   });
 }
 

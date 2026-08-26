@@ -73,6 +73,8 @@ interface IngestCliOpts {
   all?: boolean;
   json?: boolean;
   quiet?: boolean;
+  /** #4472: include gbrain's own claude-cli subprocess sessions in discovery. */
+  includeSelf?: boolean;
 }
 
 /**
@@ -112,6 +114,7 @@ export function parseIngestArgs(args: string[]): IngestCliOpts | { help: true } 
     if (a === '--embed') { opts.embed = true; continue; }
     if (a === '--facts') { opts.facts = true; continue; }
     if (a === '--all') { opts.all = true; continue; }
+    if (a === '--include-self') { opts.includeSelf = true; continue; }
     if (a === '--format') {
       const v = args[++i] as TranscriptFormat | undefined;
       if (!v || !FORMATS.includes(v)) {
@@ -190,6 +193,9 @@ skip). Embedding is OFF by default; run the embed backfill later or opt in.
 
   --all             Import every session log discovered under the harness
                     roots (claude/codex/openclaw projects + the hermes store)
+  --include-self    Also discover gbrain's OWN claude-cli subprocess sessions
+                    (recorded by Claude Code for the provider's scratch cwds;
+                    excluded by default to avoid a self-ingestion loop)
   --format F        claude-code | codex | openclaw | hermes | chatgpt |
                     claude-export (auto-detected when omitted)
   --dry-run         Parse + redact + report; writes nothing
@@ -204,7 +210,10 @@ skip). Embedding is OFF by default; run the embed backfill later or opt in.
                     for a multi-GB hermes store). Omit to keep each
                     format's native safety default. Changing it starts a
                     fresh --since last scope (caps are part of the
-                    checkpoint fingerprint)
+                    checkpoint fingerprint). Adapters differ over budget:
+                    codex degrades to a bounded head+tail read, while
+                    claude-code, openclaw and hermes reject the file
+                    outright — so LOWERING this can drop those formats
   --json            Machine-readable result
   --quiet           Suppress the human summary
 
@@ -262,7 +271,7 @@ async function expandPaths(specs: string[]): Promise<string[]> {
   return [...new Set(out)].filter((p) => !isOpenclawCheckpointFile(p));
 }
 
-function fmtSummary(r: TranscriptsIngestResult): string {
+export function fmtSummary(r: TranscriptsIngestResult): string {
   const byHarness = new Map<string, number>();
   for (const f of r.files) {
     for (const s of f.sessions) {
@@ -287,6 +296,12 @@ function fmtSummary(r: TranscriptsIngestResult): string {
     lines.push(
       `DRIFT WARNING: ${r.driftFiles} file(s) parsed to zero sessions — the host ` +
         `format may have changed; see the adapter SPEC_TARGET runbook`,
+    );
+  }
+  if (r.truncatedFiles > 0) {
+    lines.push(
+      `TRUNCATED: ${r.truncatedFiles} file(s) only partially scanned (byte cap) — ` +
+        `watermark frozen; re-run with a larger --max-bytes to cover the skipped window`,
     );
   }
   for (const f of r.files) {
@@ -333,7 +348,9 @@ async function runIngest(engine: BrainEngine, args: string[]): Promise<void> {
   // histories); with it, import the discovered set.
   if (parsed.paths.length === 0) {
     const { discoverTranscriptFiles } = await import('../core/transcripts/discover.ts');
-    const discovered = discoverTranscriptFiles();
+    // #4472: discovery excludes gbrain's own claude-cli subprocess sessions
+    // (self-ingestion loop) unless --include-self is passed.
+    const discovered = discoverTranscriptFiles(undefined, { includeSelf: parsed.includeSelf });
     if (discovered.length === 0) {
       console.log('discovery: no session logs found under the harness roots');
       return;

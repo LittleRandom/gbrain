@@ -1,4 +1,5 @@
 import type { Recipe } from '../types.ts';
+import { openaiModelSupportsPromptCache } from './openai.ts';
 
 /**
  * Private in-process marker header. `gateway.chat()` sets it when the caller
@@ -16,7 +17,12 @@ export const OPENROUTER_CACHE_HEADER = 'x-gbrain-anthropic-prompt-cache';
 
 /**
  * Family-scoped prompt-cache capability (per OpenRouter docs):
- * - OpenAI chat routes cache automatically (no request mutation needed).
+ * - OpenAI chat routes cache automatically, from the generation that shipped
+ *   automatic caching onward. The family test is the SAME predicate the native
+ *   `openai` recipe uses, so a model cannot report different capabilities
+ *   depending on which route reaches it.
+ * - DeepSeek routes cache automatically too (context caching is on by default
+ *   for every account), matching the native `deepseek` recipe.
  * - Anthropic Claude routes cache when the request carries `cache_control`
  *   on a content block (applied by the fetch shim below).
  * Everything else is not marked cacheable — deliberately narrow rather than
@@ -24,7 +30,14 @@ export const OPENROUTER_CACHE_HEADER = 'x-gbrain-anthropic-prompt-cache';
  */
 export function openrouterSupportsPromptCache(modelId: string): boolean {
   const normalized = modelId.trim().toLowerCase();
-  if (normalized.startsWith('openai/gpt-') || /^openai\/o\d/.test(normalized)) return true;
+  if (normalized.startsWith('openai/')) {
+    // OpenRouter appends routing variants (`:online`, `:nitro`, `:floor`, …)
+    // that are not part of the upstream model id. Strip before delegating, or
+    // every variant of a cache-capable model would read as cache-less.
+    const upstreamId = normalized.slice('openai/'.length).split(':', 1)[0] ?? '';
+    return openaiModelSupportsPromptCache(upstreamId);
+  }
+  if (normalized.startsWith('deepseek/')) return true;
   if (normalized.startsWith('anthropic/claude-')) return true;
   return false;
 }
@@ -32,6 +45,16 @@ export function openrouterSupportsPromptCache(modelId: string): boolean {
 /** Only Anthropic Claude routes need an explicit cache_control block. */
 export function openrouterRequiresExplicitPromptCache(modelId: string): boolean {
   return modelId.trim().toLowerCase().startsWith('anthropic/claude-');
+}
+
+/**
+ * OpenRouter Anthropic routes share Anthropic's tool-call envelope (and the
+ * gateway loop already keys replay on gbrain_tool_use_id, not the raw
+ * provider id). Other proxied families stay refused until they get their
+ * own live abort/retry evidence (TODOS.md OpenRouter follow-up).
+ */
+export function openrouterSupportsSubagentLoop(modelId: string): boolean {
+  return modelId.trim().toLowerCase().startsWith('anthropic/');
 }
 
 /**
@@ -134,12 +157,12 @@ export const openrouterCompatFetch = (async (
  * downstream agent stacks (OpenClaw deployments, etc.) get their own
  * attribution on OR's leaderboard instead of polluting gbrain's.
  *
- * Subagent loops: `supports_subagent_loop: false` is INFORMATIONAL. The real
- * gate is `isAnthropicProvider()` in `src/core/model-config.ts` which
- * hard-pins gbrain's subagent infra to Anthropic-direct (stable tool_use_id
- * across crashes/replays). OR-proxied Anthropic is rejected at submit time
- * regardless of this flag — relaxing the gate is a deeper architectural
- * change tracked in TODOS.md.
+ * Subagent loops: Anthropic routes (`anthropic/…`) declare
+ * `supports_subagent_loop` so classifyCapabilities() allows them. The
+ * handler still refuses the Anthropic-direct SDK for `openrouter:*` and
+ * auto-routes those jobs through `gateway.toolLoop()` — OR is not a native
+ * Anthropic provider. Other OR families stay refused until they get a live
+ * abort/retry pin (TODOS.md).
  */
 export const openrouter: Recipe = {
   id: 'openrouter',
@@ -225,8 +248,7 @@ export const openrouter: Recipe = {
         'deepseek/deepseek-chat',
       ],
       supports_tools: true,
-      // Informational only — real gate is isAnthropicProvider() upstream.
-      supports_subagent_loop: false,
+      supports_subagent_loop: openrouterSupportsSubagentLoop,
       // Family-scoped: OpenAI routes cache automatically; Anthropic routes
       // cache via the compat fetch shim's cache_control rewrite.
       supports_prompt_cache: openrouterSupportsPromptCache,
