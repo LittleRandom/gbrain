@@ -447,6 +447,10 @@ export interface DomainBankRow {
 }
 
 export interface SalienceOpts {
+  /** Scalar source scope. Ignored when `sourceIds` is set (array wins). */
+  sourceId?: string;
+  /** Federated source scope — the op layer passes `ctx.auth.allowedSources`. */
+  sourceIds?: string[];
   /** Window in days. Default 14. */
   days?: number;
   /** Max rows to return (clamped at 100). Default 20. */
@@ -487,10 +491,10 @@ export interface SalienceResult {
  *
  * Why a dedicated engine method instead of composing `listPages` +
  * `getBacklinkCounts` in memory:
- *   - `getBacklinkCounts` groups by bare `slug`, so the same slug in two
- *     sources collapses/contaminates the count. This query counts inbound
- *     links per page row (`to_page_id = p.id`), which is source-correct by
- *     construction.
+ *   - `getBacklinkCounts` is page-id-keyed (source-correct since #4380),
+ *     but composing it with `listPages` in memory still costs a second
+ *     round-trip. This query counts inbound links per page row
+ *     (`to_page_id = p.id`) inside the one source-scoped query.
  *   - `listPages` returns full `Page` rows (bodies). 500 stub bodies per
  *     type per source is not a memory guarantee. This projection carries
  *     only `body_len`, never the body.
@@ -547,11 +551,17 @@ export const ENRICH_ORDER_SQL: Record<EnrichCandidatesOpts['order'], string> = {
  * current count exceeds `mean + sigma * stddev`. Year cohort deferred to v0.30.
  */
 export interface AnomaliesOpts {
+  /** Scalar source scope. Ignored when `sourceIds` is set (array wins). */
+  sourceId?: string;
+  /** Federated source scope — the op layer passes `ctx.auth.allowedSources`. */
+  sourceIds?: string[];
   /** ISO date (YYYY-MM-DD). Default = today (UTC). */
   since?: string;
   /** Days of history for the baseline. Default 30. */
   lookback_days?: number;
-  /** Sigma threshold. Default 3.0. */
+  /** Sigma threshold. Default 3.0. Scope note: the source scope above is
+   *  applied to BOTH the baseline and today windows so the anomaly math
+   *  stays consistent. */
   sigma?: number;
 }
 
@@ -640,7 +650,7 @@ export interface StaleChunkRow {
   slug: string;
   chunk_index: number;
   chunk_text: string;
-  chunk_source: 'compiled_truth' | 'timeline';
+  chunk_source: 'compiled_truth' | 'timeline' | 'fenced_code';
   model: string | null;
   token_count: number | null;
   /** v0.31.12: source_id so embed --stale can thread it through getChunks/upsertChunks. */
@@ -762,6 +772,22 @@ export interface SearchResult {
    * Absent when the page is clean.
    */
   content_flag?: { reason: string; detail: string };
+  /**
+   * 2026-09 fix wave (#3617 follow-up): true when this row came from the
+   * keyword/title arm's AND→OR zero-strict-recall fallback rather than a
+   * strict websearch match. Stamped by the ENGINES inside the fallback
+   * branch (both engines, keyword + title arms — parity-pinned). hybridSearch
+   * reads it at fusion time: relaxed rows only vote in RRF when EVERY vector
+   * list is empty (the fallback's designed rescue case — keyword-only /
+   * keyless / degraded paths). When the vector arm is healthy, relaxed rows
+   * are dropped pre-fusion: OR-of-common-terms matches carry noise-shaped
+   * rank evidence, and letting them vote at full RRF weight demonstrably
+   * outvotes correct semantic results (LongMemEval receipt: hybrid
+   * recall_all@5 51.3% with them voting vs vector-only 93.8%; disabling the
+   * fallback restored gold to ranks 0-2 on probed questions). Absent on
+   * strict-match rows.
+   */
+  keyword_relaxed?: boolean;
   /**
    * Extraction quarantine lane (issue #160): true when the result's page is
    * an unverified auto-extracted entity stub (frontmatter
@@ -1780,6 +1806,19 @@ export interface EvalCaptureFailure {
  *                        it was the primary recall arm (vector unavailable)
  *   cache_prestamp     — served from a cache row written before the
  *                        degradation stamp existed; cleanliness unprovable
+ *   rerank_passthrough — the reranker was enabled and the provider answered
+ *                        SUCCESSFULLY but with an empty/malformed result set,
+ *                        so results passed through in raw RRF order with no
+ *                        rerank_score (#4648 — distinguishes "reranker off"
+ *                        from "reranker died silently")
+ *   keyword_relaxed_carried — OR-relaxed lexical rows VOTED in fusion because
+ *                        every text vector list came back empty on a
+ *                        vector-enabled run (e.g. mid embed-backfill). The
+ *                        result set leans on noise-shaped rank evidence, so
+ *                        the cache write takes the degraded (short) TTL —
+ *                        otherwise a transitional relaxed-carried row would
+ *                        shadow the recovered pipeline for the full TTL
+ *                        under the same knobs hash (2026-09 red-team).
  */
 export const DEGRADED_STAGES = [
   'embed_unavailable',
@@ -1792,6 +1831,8 @@ export const DEGRADED_STAGES = [
   'budget_truncated',
   'keyword_zero',
   'cache_prestamp',
+  'rerank_passthrough',
+  'keyword_relaxed_carried',
 ] as const;
 export type DegradedStage = (typeof DEGRADED_STAGES)[number];
 
@@ -1808,6 +1849,9 @@ export const DEGRADED_REASONS = [
   'variant_embed_failed',
   'original_embed_failed',
   'first_result_truncated',
+  // #4648 — rerank_passthrough reasons (mirror RerankPassThroughReason).
+  'empty_result_set',
+  'malformed_shape',
 ] as const;
 export type DegradedReason = (typeof DEGRADED_REASONS)[number];
 
@@ -1888,6 +1932,17 @@ export interface HybridSearchMeta {
    * existed (surfaced as `cache_prestamp` at hit time).
    */
   degraded?: DegradedStageEntry[];
+  /**
+   * 2026-09 fix wave (#3617 follow-up): count of OR-relaxed lexical rows
+   * fetched but EXCLUDED from RRF fusion because the text vector arm was
+   * healthy (the designed demotion). NOT a degraded stage — muting relaxed
+   * noise on a healthy run is normal operation and common (any query with
+   * zero strict lexical matches), so it must not shorten the cache TTL —
+   * but without this field `_meta` implies the lexical arms voted when they
+   * contributed nothing, hiding the demotion from an operator debugging a
+   * miss. Omitted when zero.
+   */
+  relaxed_dropped?: number;
   /**
    * WP2/T3 — pre-budget hit count: how many results retrieval produced for
    * this page BEFORE token-budget enforcement. Lets a consumer distinguish

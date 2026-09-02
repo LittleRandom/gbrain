@@ -167,6 +167,12 @@ await oauthProvider.registerClientManual(
 For self-service client registration (Dynamic Client Registration, RFC 7591),
 start the server with `--enable-dcr`. DCR is off by default.
 
+Native MCP clients register cleanly: `redirect_uris` may use an app custom
+scheme (RFC 8252, e.g. `myapp://callback`) or `http://` loopback alongside
+`https://`; scopes the server doesn't know are filtered rather than fatal;
+and malformed registration metadata is rejected with HTTP 400
+`invalid_client_metadata` (never a 500), so a client can correct and retry.
+
 DCR requests may include an optional `token_ttl_seconds` field (integer,
 seconds) to request a per-client access-token lifetime. The server clamps the
 request into an admin-configured window — never rejects over it — persists the
@@ -282,6 +288,17 @@ is available remotely, with no timeout limits on a self-hosted server. The
 only exceptions are the operations flagged `localOnly: true` — `sync_brain`
 and the `file_*` ops among them — which are rejected over HTTP regardless of
 scope (see [Scopes and localOnly](#4-scopes-and-localonly) above).
+
+**Several brains behind one tool catalog?** Give each server an identity so a
+connected agent can tell them apart: `gbrain config set mcp.instructions
+"<identity>"` rides the initialize response of every transport (stdio, OAuth
+HTTP, legacy bearer) under a `Deployment identity:` banner, appended below the
+canonical agent contract — no transport can weaken the contract. Restart
+`gbrain serve` after setting it (the response is built once per process);
+`GBRAIN_MCP_INSTRUCTIONS` in the serve process's environment overrides the
+configured value for that process, and a blank variable falls back to it.
+**Say to your agent:** *"Tell connected agents which brain this is"* — your
+agent runs `gbrain config set mcp.instructions "<identity>"`.
 
 **Security note on file access:** the `file_*` operations being localOnly is
 the first line of defense; as defense-in-depth, `file_upload` also confines

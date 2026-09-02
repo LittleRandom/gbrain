@@ -319,13 +319,19 @@ export async function checkLinkResolutionOpportunity(
 export async function checkAbandonedThreads(engine: BrainEngine): Promise<Check> {
   try {
     const rows = await engine.executeRaw<{ count: number }>(
+      // since_date is TEXT and may be month-precision ('YYYY-MM'); 'YYYY-MM'::date
+      // throws "invalid input syntax for type date", so normalize to the 1st
+      // before casting — same guarded cast as the detail query in serve-http.ts
+      // (`gbrain calibration` abandoned-threads), which must stay in lockstep so
+      // the doctor count matches the listing it points users at.
       `SELECT COUNT(*)::int AS count FROM takes
          WHERE active = true
            AND resolved_at IS NULL
            AND superseded_by IS NULL
            AND weight >= 0.7
            AND since_date IS NOT NULL
-           AND since_date::date < (now() - INTERVAL '12 months')`,
+           AND (since_date || CASE WHEN length(since_date) = 7 THEN '-01' ELSE '' END)::date
+               < (now() - INTERVAL '12 months')`,
     );
     const count = rows[0]?.count ?? 0;
     if (count === 0) {
@@ -628,6 +634,21 @@ export async function checkRerankerHealth(engine: BrainEngine): Promise<Check> {
         name: 'reranker_health',
         status: 'warn',
         message: `${transientFails.length} transient reranker failure(s) in last 7 days. Search fails open to RRF order; check ZE status if persistent.`,
+      };
+    }
+
+    // #4648: success-shaped pass-throughs — the provider answered 200 with an
+    // empty/malformed result set, so searches returned raw RRF order with no
+    // rerank_score. The reranker "runs" (logs grow, latency paid) but has
+    // zero effect; the response-shape mismatch is the usual culprit.
+    const passThroughFails = failures.filter(
+      (f) => f.reason === 'empty_result_set' || f.reason === 'malformed_shape',
+    );
+    if (passThroughFails.length >= 3) {
+      return {
+        name: 'reranker_health',
+        status: 'warn',
+        message: `${passThroughFails.length} reranker empty/malformed-response pass-through(s) in last 7 days — those searches returned raw RRF order unscored. Fix: verify the rerank endpoint answers {results:[{index, relevance_score}]} for a non-empty documents array (check \`search.reranker.model\` and the endpoint's response shape).`,
       };
     }
 
