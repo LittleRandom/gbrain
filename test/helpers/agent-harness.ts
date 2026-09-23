@@ -38,7 +38,7 @@ import * as path from 'node:path';
 import { PGLiteEngine } from '../../src/core/pglite-engine.ts';
 import { operations, type OperationContext, type Operation } from '../../src/core/operations.ts';
 import { saveConfig, gbrainPath, type GBrainConfig } from '../../src/core/config.ts';
-import { addSource } from '../../src/core/sources-ops.ts';
+import { addSource, SourceOpError } from '../../src/core/sources-ops.ts';
 
 // ────────────────────────────────────────────────────────────────────────────
 // 1. Hermetic child environment
@@ -1041,27 +1041,33 @@ export function hasOpencodeAuth(): boolean {
  * Hermetic env for spawning opencode itself: HOME + BOTH XDG dirs redirected
  * (config/auth/data all move — verified on macOS; belt-and-suspenders), the
  * env half of the double autoupdate kill, ANTHROPIC_API_KEY re-admitted
- * explicitly for the paid leg (default-deny stays intact for every other
+ * only with paid: true (default-deny stays intact for every other
  * child). Deletes the OTHER providers' keys (single-auth-source discipline —
  * the paid leg pins an anthropic/* model) and the OPENCODE_CONFIG* trio
  * (observed inert in 1.18.18, but a future release activating them must not
  * let ambient values shadow the hermetic config). GITHUB_* step-metadata
  * scrub via the shared factory.
  */
-export const opencodeChildEnv = makeAgentChildEnv({
+const keylessOpencodeChildEnv = makeAgentChildEnv({
   overrides: (home) => ({
     HOME: home,
     XDG_CONFIG_HOME: path.join(home, '.config'),
     XDG_DATA_HOME: path.join(home, '.local', 'share'),
     OPENCODE_DISABLE_AUTOUPDATE: '1',
-    ANTHROPIC_API_KEY: promotedEnv(process.env).ANTHROPIC_API_KEY?.trim() || undefined,
   }),
   deleteKeys: [
+    'ANTHROPIC_API_KEY', 'ANTHROPIC_BASE_URL',
     'OPENAI_API_KEY', 'XAI_API_KEY', 'OPENROUTER_API_KEY',
     'GOOGLE_GENERATIVE_AI_API_KEY', 'GEMINI_API_KEY', 'ANTHROPIC_AUTH_TOKEN',
     'OPENCODE_CONFIG', 'OPENCODE_CONFIG_DIR', 'OPENCODE_CONFIG_CONTENT',
   ],
 });
+
+export function opencodeChildEnv(home: string, opts?: { binDir?: string; paid?: boolean }): NodeJS.ProcessEnv {
+  const env = keylessOpencodeChildEnv(home, opts);
+  if (opts?.paid) env.ANTHROPIC_API_KEY = promotedEnv(process.env).ANTHROPIC_API_KEY?.trim() || undefined;
+  return env;
+}
 
 /**
  * Seed a hermetic <XDG_CONFIG_HOME>/opencode/opencode.json BEFORE any
@@ -1100,6 +1106,7 @@ export interface OpencodeTurnOpts {
   /** Staged gbrain bin dir — PATH-prepended so a PATH-resolved registration
    *  resolves when opencode spawns the server during the turn. */
   binDir?: string;
+  paid?: boolean;
 }
 
 /**
@@ -1114,12 +1121,12 @@ export async function opencodeOneShotTurn(opts: OpencodeTurnOpts): Promise<OneSh
   if (!bin) throw new Error('opencodeOneShotTurn: opencode binary not found');
   return runOneShotSpawn({
     argv: [
-      bin, 'run', opts.prompt,
+      bin, 'run', opts.prompt, '--pure',
       '--format', opts.format ?? 'default',
       ...(opts.model ? ['-m', opts.model] : []),
     ],
     cwd: opts.cwd,
-    env: opencodeChildEnv(opts.home, { binDir: opts.binDir }),
+    env: opencodeChildEnv(opts.home, { binDir: opts.binDir, paid: opts.paid }),
     timeoutMs: opts.timeoutMs ?? 240_000,
   });
 }
@@ -1374,10 +1381,14 @@ export async function seedBrainForAgent(
       if (sourceId !== 'default') {
         const srcDir = path.join(home, `source-${sourceId}`);
         fs.mkdirSync(srcDir, { recursive: true });
+        // Door tests can make HOME a Git checkout. Give this source its own
+        // worktree so .gbrain/persistence remains outside the canonical root.
+        const initialized = spawnSync('git', ['init', '-q', srcDir], { encoding: 'utf8' });
+        if (initialized.status !== 0) throw new Error(`Cannot initialize the synthetic source worktree: ${initialized.stderr}`);
         try {
           await addSource(engine, { id: sourceId, localPath: srcDir, force: true });
-        } catch {
-          /* already registered — fine */
+        } catch (error) {
+          if (!(error instanceof SourceOpError) || error.code !== 'source_id_taken') throw error;
         }
       }
 
@@ -1396,7 +1407,7 @@ export async function seedBrainForAgent(
     } finally {
       // Release the PGLite lock so the spawned `gbrain serve` can open the
       // same data dir.
-      try { await engine.disconnect(); } catch { /* best-effort */ }
+      await engine.disconnect();
     }
 
     // Persist a keyless config so the spawned `gbrain serve` reads the same

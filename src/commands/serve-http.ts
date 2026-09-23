@@ -20,6 +20,7 @@ import { randomBytes, createHash, createHmac } from 'crypto';
 import { safeHexEqual } from '../core/timing-safe.ts';
 import { isValidRepoName } from '../core/github-source.ts';
 import { createMetricsCounters, metricsTrackingMiddleware, renderPrometheusMetrics } from './serve-http-metrics.ts';
+import { ADMIN_TOKEN_SHAPE } from '../core/serve-service.ts';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
@@ -35,6 +36,7 @@ import type { OperationContext, AuthInfo } from '../core/operations.ts';
 import { disabledOpsForPublishGates } from '../mcp/publish-gates.ts';
 import { resolveMcpInstructions } from '../mcp/instructions.ts';
 import { installCapabilitiesResource } from '../mcp/capabilities.ts';
+import { createSkillResources } from '../mcp/skill-resources.ts';
 import { resolveAuthCapabilities } from '../core/harness/capabilities.ts';
 import { publicHarnessMetadata } from '../core/harness/registry.ts';
 import { GRANT_PROFILES } from '../core/grants/model.ts';
@@ -49,7 +51,7 @@ import {
   dcrRegistrationContext,
   DEFAULT_DCR_TTL_MIN_SECONDS,
 } from '../core/oauth-provider.ts';
-import { hasScope, scopesSupportedForDiscovery, normalizeScopesInput } from '../core/scope.ts';
+import { hasScope, operationScopesAllowed, scopesSupportedForDiscovery, normalizeScopesInput } from '../core/scope.ts';
 import { normalizeTokenScopes } from '../core/legacy-token-scope.ts';
 import { normalizeSourceInput, normalizeFederatedReadInput } from '../core/source-id.ts';
 import { summarizeMcpParams, dispatchToolCall, requestLogStatusForResult } from '../mcp/dispatch.ts';
@@ -66,6 +68,7 @@ import {
 import { writeSurfaceChangeAudit } from '../core/surface-audit.ts';
 import { getBrainHotMemoryMeta } from '../core/facts/meta-hook.ts';
 import { bindResolveIpcForServe } from '../mcp/resolve-ipc-binding.ts';
+import { createPersistenceIpcProvider } from '../core/persistence/provider.ts';
 import { resolveMcpStdioSourceScope } from '../mcp/server.ts';
 import { loadConfig } from '../core/config.ts';
 import { buildError, serializeError } from '../core/errors.ts';
@@ -381,7 +384,7 @@ export function resolveBootstrapToken(
     return { kind: 'ok', token: randomBytesHex(), fromEnv: false };
   }
   const trimmed = envValue.trim();
-  if (!/^[A-Za-z0-9_-]{32,}$/.test(trimmed)) {
+  if (!ADMIN_TOKEN_SHAPE.test(trimmed)) {
     return {
       kind: 'error',
       message:
@@ -2197,7 +2200,7 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
       if (req.path.startsWith('/admin/api/') || req.path === '/admin/events' || req.path === '/admin/login') {
         return next();
       }
-      res.sendFile(path.join(adminDistPath, 'index.html'));
+      res.sendFile('index.html', { root: adminDistPath }); // Exclude hidden checkout ancestors from dotfile checks.
     });
   } else {
     // Embedded path. Read assets from the generated manifest. Cache the
@@ -2369,7 +2372,13 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
     installCapabilitiesResource(server, async () => {
       return { transport: authInfo.clientId.startsWith('gbrain_cl_') ? 'oauth' : 'legacy', client_id: authInfo.clientId,
         ...await resolveAuthCapabilities(authInfo, engine, config) };
-    });
+    }, createSkillResources(engine, async () => {
+      const sourceId = authInfo.sourceId ?? 'default';
+      const { noGrantFederatedScope } = await import('../core/source-resolver.ts');
+      return { remote: true, transport: 'http', sourceId, auth: authInfo, config,
+        localFederatedSourceIds: await noGrantFederatedScope(engine, authInfo.hasSourceGrant, sourceId),
+        allowedOps: surfaceAllowedOps, surface, surfaceCeiling };
+    }));
     server.setRequestHandler(ListToolsRequestSchema, async () => {
       // WP1 honest catalog: the advertised list is exactly what THIS token
       // can call. Three per-request filters, cheapest first:
@@ -2393,8 +2402,7 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
       // (request_tools) are visible to (and callable by, below) agent scope
       // in addition to their declared scope.
       const visibleOps = mcpOperations.filter(op =>
-        (hasScope(authInfo.scopes, op.scope ?? 'read')
-          || (op.agentCallable === true && hasScope(authInfo.scopes, 'agent')))
+        operationScopesAllowed(authInfo.scopes, op)
         && opAllowedForBoundClient(authInfo, op)
         && !gateDisabled.has(op.name),
       );
@@ -2471,8 +2479,7 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
       const requiredScope = op.scope || 'read';
       // FOV-4: agentCallable carve-out mirrors the tools/list filter above —
       // an op listed for an agent-only token must not scope-deny at call time.
-      const scopeSatisfied = hasScope(authInfo.scopes, requiredScope)
-        || (op.agentCallable === true && hasScope(authInfo.scopes, 'agent'));
+      const scopeSatisfied = operationScopesAllowed(authInfo.scopes, op);
       if (!scopeSatisfied) {
         // v0.28.10: persist scope-rejected attempts. Same operator-visibility
         // motivation as the unknown-op path — and it makes the v0.26.3
@@ -3346,6 +3353,7 @@ ${bootstrapFromEnv
   const ipcBinding = await bindResolveIpcForServe(
     engine,
     (await resolveMcpStdioSourceScope(engine)).sourceId,
+    await createPersistenceIpcProvider(engine, config),
   );
   if (ipcBinding.socketPath) {
     console.error(`  Resolve IPC: ${ipcBinding.socketPath}`);

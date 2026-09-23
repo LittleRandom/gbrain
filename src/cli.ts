@@ -38,6 +38,7 @@ import { serializeMarkdown } from './core/markdown.ts';
 import { parseGlobalFlags, setCliOptions, getCliOptions } from './core/cli-options.ts';
 import { runCliPreflight } from './core/cli-preflight.ts';
 import { conceptNudge } from './core/search/query-intent.ts';
+import { redactRetrievalOutput } from './core/search/output-redaction.ts';
 import type { CliOptions } from './core/cli-options.ts';
 import { callRemoteTool, RemoteMcpError, unpackToolResult, extractResponseMeta } from './core/mcp-client.ts';
 import { maybePromptForUpgrade } from './core/thin-client-upgrade-prompt.ts';
@@ -581,6 +582,22 @@ async function main() {
     if (await printSelfHelpWithoutEngine(command, subArgs)) return;
   }
 
+  if (command === 'sources' && subArgs[0] === 'inspect') {
+    const { runCompanyBrainInspection } = await import('./commands/company-brain-inspect.ts');
+    await runCompanyBrainInspection(subArgs.slice(1));
+    return;
+  }
+  if (command === 'sources' && subArgs[0] === 'connect') {
+    const { runCompanyBrainConnect } = await import('./commands/company-brain-connect.ts');
+    await runCompanyBrainConnect(subArgs.slice(1), () => connectEngine({ probeOnly: true }));
+    return;
+  }
+  if (command === 'sources' && subArgs[0] === 'demo' && subArgs[1] === 'company-brain') {
+    const { runCompanyBrainDemoCli } = await import('./commands/company-brain-demo.ts');
+    await runCompanyBrainDemoCli(subArgs.slice(2));
+    return;
+  }
+
   // #2185: strict unknown-flag validation — pre-dispatch, pre-engine. A flag
   // no handler consults (the repro: `init --migrate-only --dry-run` applying
   // REAL migrations while the user asked for a rehearsal) fails loud here
@@ -712,7 +729,16 @@ async function main() {
     return;
   }
 
-  // Local engine path (unchanged behavior for local installs).
+  // The live PGLite owner exposes canonical operations over a dedicated
+  // local socket. Delegate before opening a competing engine connection.
+  {
+    const { runDelegatedCliOperation } = await import('./commands/persistence-delegate.ts');
+    if (await runDelegatedCliOperation(op.name, params, cfgPre, {
+      brain: cliOpts.brain, timeoutMs: cliOpts.timeoutMs ?? undefined,
+    }, formatResult)) return;
+  }
+
+  // No live serve owns the selected brain; connect through the normal lock path.
   const engine = await connectEngine();
   // #2084: the teardown contract (bounded drain of every background-work sink,
   // bounded disconnect, computed-deadline backstop) lives in finishCliTeardown
@@ -819,10 +845,8 @@ async function main() {
     // (leaves facts/cache/eval-capture writes racing teardown). The finally's
     // drain bounds teardown; the hard-deadline timer armed at teardown entry
     // bounds a hung one.
-    if (e instanceof OperationError) {
-      console.error(`Error [${e.code}]: ${e.message}`);
-      if (e.suggestion) console.error(`  Fix: ${e.suggestion}`);
-    } else {
+    const { reportPersistenceCliError } = await import('./commands/persistence-delegate.ts');
+    if (!await reportPersistenceCliError(e, params.json === true || !!(e as OperationError)?.writeRequest)) {
       console.error(e instanceof Error ? e.message : String(e));
     }
     setCliExitVerdict(1);
@@ -853,15 +877,11 @@ function printCliOnlyHelp(command: string) {
  * Timeout policy (ENG-4): user override via --timeout=Ns wins; otherwise
  * 180s for `think` (LLM calls), 30s for everything else.
  *
- * Error policy (CDX-4): callRemoteTool's hardening pass guarantees every
- * thrown value reaches us as a RemoteMcpError. The switch below is
- * exhaustively typed (TS `never` check); adding a new reason variant fails
- * compilation until this dispatcher knows what to render.
+ * Error policy: callRemoteTool normalizes every failure to RemoteMcpError;
+ * the exhaustive switch requires a renderer for every reason variant.
  *
- * Renderer policy: the MCP tool result is unpacked via unpackToolResult
- * (which JSON.parses the text content) and handed to the SAME formatResult
- * the local-engine path uses. Renderer parity is enforced by data shape,
- * not by per-command audit.
+ * Renderer policy: unpackToolResult parses MCP text and shares formatResult
+ * with the local-engine path, enforcing parity through the result shape.
  */
 async function runThinClientRouted(
   op: Operation,
@@ -903,6 +923,11 @@ async function runThinClientRouted(
     maybePrintConceptNudge(op.name, params);
   } catch (e: unknown) {
     if (e instanceof RemoteMcpError) {
+      const { reportPersistenceCliError } = await import('./commands/persistence-delegate.ts');
+      if (await reportPersistenceCliError(e, params.json === true)) {
+        process.off('SIGINT', onSigint);
+        process.exit(sigintController.signal.aborted ? 130 : 1);
+      }
       const url = cfg.remote_mcp!.mcp_url;
       switch (e.reason) {
         case 'config':
@@ -1203,6 +1228,16 @@ export function parseOpArgs(op: Operation, args: string[]): Record<string, unkno
     }
   }
 
+  for (const [key, def] of Object.entries(op.params)) {
+    if ((def.type !== 'object' && def.type !== 'array') || typeof params[key] !== 'string') continue;
+    let value: unknown;
+    try { value = JSON.parse(params[key] as string); }
+    catch { throw new OperationError('invalid_params', `--${key.replace(/_/g, '-')} requires a JSON ${def.type}.`); }
+    if (def.type === 'array' ? !Array.isArray(value) : value === null || typeof value !== 'object' || Array.isArray(value)) {
+      throw new OperationError('invalid_params', `--${key.replace(/_/g, '-')} requires a JSON ${def.type}.`);
+    }
+    params[key] = value;
+  }
   return params;
 }
 
@@ -1491,6 +1526,7 @@ export function findUnknownOpFlag(op: Operation, args: string[]): string | null 
  * disconnected engine does not pin its config for the life of the process.
  */
 const MERGED_CONFIG_BY_ENGINE = new WeakMap<BrainEngine, GBrainConfig>();
+const SELECTED_CONFIG_BY_ENGINE = new WeakMap<BrainEngine, GBrainConfig>();
 
 /**
  * Adversarial-review fixup (PR #4186): which BrainEngine instances came from
@@ -1742,8 +1778,18 @@ export function formatResult(
     }
     case 'search':
     case 'query': {
-      const results = result as any[];
-      if (params.json === true) return JSON.stringify(results, null, 2) + '\n';
+      const { results, meta } = redactRetrievalOutput(result as any[], lastRetrievalMeta);
+      const incompleteStages = Array.isArray(meta?.degraded)
+        ? [...new Set((meta.degraded as Array<{ stage?: string }>).map(d => d.stage)
+          .filter(stage => stage === 'vector_candidates_incomplete' || stage === 'projection_pending' || stage === 'projection_status_unknown'))]
+        : [];
+      const incompleteNotice = incompleteStages.length > 0
+        ? `Retrieval incomplete: ${incompleteStages.join(', ')}.\n`
+        : '';
+      if (params.json === true) {
+        if (incompleteNotice) process.stderr.write(incompleteNotice);
+        return JSON.stringify(results, null, 2) + '\n';
+      }
       // T15/FOV-1: an empty result names its cause when the pipeline told us
       // (degradation stages from _meta.retrieval / the local meta capture) —
       // a bare "No results." was indistinguishable from a degraded pipeline.
@@ -1757,9 +1803,9 @@ export function formatResult(
         const { formatResultsExplain } = require('./core/search/explain-formatter.ts');
         // v0.48.2: thread the captured retrieval meta so the header lines
         // (autocut decision, `degraded: reranker_skipped (no_key)`) render.
-        return formatResultsExplain(results, lastRetrievalMeta ?? undefined);
+        return formatResultsExplain(results, meta ?? undefined);
       }
-      return results.map(r =>
+      return incompleteNotice + results.map(r =>
         `[${r.score?.toFixed(4) || '?'}] ${r.slug} -- ${r.chunk_text?.slice(0, 100) || ''}${r.stale ? ' (stale)' : ''}`,
       ).join('\n') + '\n';
     }
@@ -2058,6 +2104,13 @@ async function handleCliOnly(command: string, args: string[]) {
       if (await routeThinClientCommand(cfg!, command, args)) return;
       refuseThinClient(command, cfg!.remote_mcp!.mcp_url);
     }
+  }
+
+  // Local deferred connections must not bypass the remote installation route.
+  if (command === 'capture' || command === 'forget' || command === 'call' || command === 'sources' && ['writer', 'reconcile', 'add', 'remove', 'archive', 'restore', 'purge', 'set-path', 'reclone'].includes(args[0]) || command === 'takes' && ['add', 'update', 'supersede', 'resolve'].includes(args[0]) && !hasHelpFlag(args)) {
+    const { runDeferredPersistenceCommand } = await import('./commands/persistence-delegate.ts');
+    await runDeferredPersistenceCommand(command, args, connectEngine);
+    return;
   }
 
   // cathedral-6: `agent register` guards run PRE-connectEngine. A thin client
@@ -2878,10 +2931,19 @@ async function handleCliOnly(command: string, args: string[]) {
   // refused (exit verdict set inside); false falls through unchanged.
   if (command === 'sync') {
     const cfgSync = loadConfig();
+    if (await (await import('./commands/sync-persistence-delegate.ts')).maybeDelegateSyncToPersistence(cfgSync, args)) return;
     if (cfgSync?.engine === 'pglite' && cfgSync.database_path && !cfgSync.database_url) {
       const { maybeDelegateSyncToServe } = await import('./commands/sync-delegate.ts');
       if (await maybeDelegateSyncToServe(cfgSync.database_path, args)) return;
     }
+  }
+
+  if (command === 'reindex-code') {
+    if (await (await import('./commands/reindex-code-delegate.ts')).maybeDelegateReindexCode(loadConfig(), args)) return;
+  }
+
+  if (command === 'embed' && args.includes('--facts')) {
+    if (await (await import('./commands/embed-facts-delegate.ts')).maybeDelegateFactEmbed(loadConfig(), args)) return;
   }
 
   // Serve-delegated sweep preflight (#677) — same shape as sync above: a live
@@ -3056,7 +3118,7 @@ async function handleCliOnly(command: string, args: string[]) {
         // result, so a run where every chunk failed to embed still exited 0
         // and cron/CI/health gates read total silence as success. Surface
         // non-zero on failures > 0. (undefined = backgrounded via --background.)
-        const embedResult = await runEmbed(engine, args);
+        const embedResult = await runEmbed(engine, args, SELECTED_CONFIG_BY_ENGINE.get(engine) ?? null);
         if (embedResult && embedResult.failures > 0) {
           setCliExitVerdict(1);
         }
@@ -3066,11 +3128,6 @@ async function handleCliOnly(command: string, args: string[]) {
         const { runServe } = await import('./commands/serve.ts');
         await runServe(engine, args);
         return; // serve doesn't disconnect
-      }
-      case 'call': {
-        const { runCall } = await import('./commands/call.ts');
-        await runCall(engine, args);
-        break;
       }
       case 'sweep': {
         // [CX2-5] Trusted local sweep entry — succeeds precisely because no
@@ -3274,11 +3331,6 @@ async function handleCliOnly(command: string, args: string[]) {
         break;
       }
       // v0.38 — Capture: single human-facing entrypoint for ingestion.
-      case 'capture': {
-        const { runCapture } = await import('./commands/capture.ts');
-        await runCapture(engine, args);
-        break;
-      }
       case 'conversation-parser': {
         // v0.41.13.0 — debug + introspection CLI for the new parser
         // cathedral. `scan <slug>` requires a connected brain; the
@@ -3381,12 +3433,6 @@ async function handleCliOnly(command: string, args: string[]) {
         // `--supersessions`, `--include-expired`, `--as-context`, `--json`.
         const { runRecall } = await import('./commands/recall.ts');
         await runRecall(engine, args);
-        break;
-      }
-      case 'forget': {
-        // v0.31: shorthand for expireFact. `gbrain forget <fact-id>`.
-        const { runForget } = await import('./commands/recall.ts');
-        await runForget(engine, args);
         break;
       }
       case 'notability-eval': {
@@ -3654,6 +3700,7 @@ async function connectMountEngine(brainId: string): Promise<BrainEngine> {
   // a mount's config into the caller's context, regardless of what other
   // engine — host or another mount — this process may also be holding.
   MOUNT_ENGINES.add(handle.engine);
+  SELECTED_CONFIG_BY_ENGINE.set(handle.engine, handle.config);
   return handle.engine;
 }
 
@@ -3692,6 +3739,7 @@ async function connectEngine(opts?: { probeOnly?: boolean }): Promise<BrainEngin
 
   const { createEngine } = await import('./core/engine-factory.ts');
   const engine = await createEngine(toEngineConfig(config));
+  SELECTED_CONFIG_BY_ENGINE.set(engine, config);
   const noRetry = process.argv.includes('--no-retry-connect') ||
                   process.env.GBRAIN_NO_RETRY_CONNECT === '1';
   const { connectWithRetry } = await import('./core/db.ts');

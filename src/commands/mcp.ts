@@ -14,8 +14,17 @@ gbrain mcp grant NAME --harness ID --profile PROFILE --source SOURCE --url URL -
 gbrain mcp grant NAME --client ID --if-version N --profile PROFILE --url URL --harness ID --dry-run
 gbrain mcp verify --client ID --harness ID --url URL --credentials-file FILE [--delegate]
 gbrain mcp adapters | profiles
+gbrain mcp expose [--port N] [--funnel] [--surface verbs|starter|full] [--enable-dcr] [--no-tailscale] [--no-service] [--no-install] [--force] [--dry-run] [--yes] [--json]
+gbrain mcp expose --status [--json]
+gbrain mcp expose --remove [--yes] [--json]
+
+expose publishes the gbrain HTTP MCP server on your Tailscale tailnet (--funnel: public, for cloud agents)
+and keeps it running as a user service. Engine-free. See: gbrain mcp expose --help
 
 --profile defaults to memory-writer for new clients; omitted profiles preserve existing grants.
+New connections follow this brain's published skills within their approved read sources.
+--skills follow|memory-only         Follow shared skills (new default) or use memory only; existing grants are unchanged when omitted
+Following never grants skill editing, script execution, additional tools, or paid calls.
 Delegation requires --bound-tools T1,T2.
 --federated-read S1,S2              Explicit read sources
 --bound-slug-prefixes P1/,P2/       Direct write fence
@@ -64,13 +73,23 @@ export function parseMcpGrant(args: string[]): ProvisionGrantInput {
   if (value('--token-ttl') !== undefined) patch.tokenTtlSeconds = Number(value('--token-ttl'));
   const expectedRevision = value('--if-version') === undefined ? undefined : Number(value('--if-version'));
   if (expectedRevision !== undefined && (!Number.isSafeInteger(expectedRevision) || expectedRevision < 0)) throw new Error('--if-version must be a nonnegative integer');
+  const sharedSkills = value('--skills');
+  if (sharedSkills !== undefined && sharedSkills !== 'follow' && sharedSkills !== 'memory-only') throw new Error('--skills must be follow or memory-only');
   return { name: args[1] ?? '', harness: value('--harness') ?? value('--agent') ?? 'generic', profile: value('--profile') as GrantProfileId | undefined,
-    sourceId: value('--source'), url: value('--url') ?? '', clientId: value('--client'), expectedRevision, dryRun: args.includes('--dry-run'), resume: args.includes('--resume'), patch };
+    sourceId: value('--source'), url: value('--url') ?? '', clientId: value('--client'), expectedRevision, dryRun: args.includes('--dry-run'), resume: args.includes('--resume'), patch, sharedSkills };
 }
 
 export async function runMcp(args: string[], engine?: BrainEngine): Promise<void> {
   const value = (flag: string) => { const i = args.indexOf(flag); return i < 0 ? undefined : args[i + 1]; };
   try {
+    if (args[0] === 'expose') {
+      // Engine-free Tailscale publication (src/commands/mcp-expose.ts) — it
+      // owns its own help, argument validation and exit-code mapping.
+      const { runMcpExpose } = await import('./mcp-expose.ts');
+      const code = await runMcpExpose(args.slice(1));
+      if (code !== 0) setCliExitVerdict(code);
+      return;
+    }
     if (!args.length || args.includes('--help') || args.includes('-h')) { console.log(HELP); return; }
     if (args[0] === 'adapters' || args[0] === 'profiles') validateHarnessArguments(args.slice(1), { flags: ['--json'] });
     if (args[0] === 'adapters') { console.log(JSON.stringify(publicHarnessMetadata(), null, 2)); return; }
@@ -90,7 +109,7 @@ export async function runMcp(args: string[], engine?: BrainEngine): Promise<void
       if (report.status !== 'passed') setCliExitVerdict(report.status === 'failed' ? 1 : 2);
       return;
     }
-    if (args[0] !== 'grant') throw new Error('Expected mcp grant, verify, adapters or profiles');
+    if (args[0] !== 'grant') throw new Error('Expected mcp grant, verify, adapters, profiles or expose');
     const input = parseMcpGrant(args);
     if ((!input.clientId || input.resume) && !input.dryRun && !value('--credentials-out')) throw new Error('--credentials-out is required before creating a client or resuming delivery');
     // Refuse an occupied handoff destination before granting anything.
