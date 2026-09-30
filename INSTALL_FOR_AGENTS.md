@@ -2,7 +2,7 @@
 
 Read this file, then follow the path appropriate to the user’s request. Default to adding keyless memory to their existing agent, preserving identity and unrelated configuration. API keys, enrichment, automatic capture, and a new personal-agent identity are separate choices.
 
-> **Choose the installation path first.** Inside **[Grok Bot](docs/guides/grok-bot.md)** or **[Muse](docs/guides/muse.md)**, use their dedicated guide: the recommended shape keeps the brain on the user's own computer, published with `gbrain mcp expose --funnel` ([remote MCP](docs/guides/remote-mcp.md)), and installs the thin CLI inside the agent; `scripts/setup-in-agent.sh` is the in-agent alternative, and its receipt tracks repair and native enablement. To make a brain on this computer reachable from the user's other devices, apps, or cloud agents over MCP, follow the **[remote MCP guide](docs/guides/remote-mcp.md)** (`gbrain mcp expose`; ask before installing Tailscale or a service; `--funnel` only for cloud agents). For an **[existing hosted brain](docs/guides/hosted-harness-access.md)**, provision on the host and install the private handoff inside the harness. This guide covers a local brain for other existing agents.
+> **Choose the installation path first.** Inside **[Grok Bot](docs/guides/grok-bot.md)** or **[Muse](docs/guides/muse.md)**, use their dedicated guide: the recommended shape keeps the brain on the user's own computer, published with `gbrain mcp expose --funnel` ([remote MCP](docs/guides/remote-mcp.md)), and installs the thin CLI inside the agent; `scripts/setup-in-agent.sh` is the in-agent alternative, and its receipt tracks repair and native enablement. To make a brain on this computer reachable from the user's other devices, apps, or cloud agents over MCP, follow the **[remote MCP guide](docs/guides/remote-mcp.md)** (`gbrain mcp expose`; confirm the plan before installing Tailscale or a service; `--funnel` only for cloud agents). For an **[existing hosted brain](docs/guides/hosted-harness-access.md)**, choose the harness's native OAuth/PKCE flow or a private machine handoff. Owner login, client management, permissions, and revocation use the separate [MCP administration](docs/mcp/ADMIN.md) path. This guide covers a local brain for other existing agents.
 >
 > **Memory-only path:** install → initialize → relay and confirm the Step 3.5 search-mode choice → connect the harness → verify memory. Skip identity replacement, private-repo bootstrap, automatic capture, cron installation, and paid enrichment unless requested. A keyword-only brain needs no API key. The required search-mode choice still applies; published API cost examples are not prices for the user’s harness subscription.
 >
@@ -70,11 +70,11 @@ GBrain is keyless. Explain these boundaries before enabling a capability; see
 
 Skip API-key setup for the initial keyless memory path. If the user enables semantic retrieval or paid enrichment, configure the selected provider explicitly. GBrain defaults to the Voyage embedding + reranker stack
 (`voyage:voyage-4` @ 1024d + `voyage:rerank-2.5` — one key covers both); OpenAI is the
-main alternative, chosen at init via `--embedding-model <provider:model>`. ZeroEntropy
-is deprecated (its hosted API shuts down 2026-09-04): init auto-pick and the picker
-exclude it, and every ZE embed/rerank prints a deprecation warning. **Existing brain
-still on ZeroEntropy (or any need to switch embedding/reranker models later)?** Follow
-the playbook at `skills/migrations/v0.46.3.0.md` — one command migrates both.
+main alternative, chosen at init via `--embedding-model <provider:model>`.
+**Need to switch an existing brain's embedding or reranker model?** Follow
+the explicit-consent playbook at `skills/migrations/v0.46.3.0.md`. Preview the
+work and cost, obtain approval, then migrate; an upgrade never converts existing
+vectors or authorizes a paid re-embed.
 
 ```bash
 export VOYAGE_API_KEY=pa-...          # default embedding + reranker (one key covers both)
@@ -504,6 +504,15 @@ See "The onboard surface" below for what the recommendations mean and the
 consent gates around unattended remediation.
 
 ## Upgrade
+
+For v0.60.5.0 and later, confirm a database backup exists before upgrading,
+upgrade every process that writes to the brain, then follow the
+[v0.60.5.0 steps](skills/migrations/v0.60.5.0.md): one full `gbrain doctor`,
+then preview `gbrain repair` and apply only after the user agrees
+([repair guide](docs/guides/repair.md)). For v0.60.6.0, also follow the
+[one-time timeline prune and slug-collision steps](skills/migrations/v0.60.6.0.md). For v0.60.11.0, preview
+`gbrain repair contextual-mode` and rebuild PGLite vector indexes after a crash
+repair ([steps](skills/migrations/v0.60.11.0.md)).
 
 For v0.53.0.0, follow the
 [mechanical shared-skills migration](skills/migrations/v0.53.0.0.md) on the host,

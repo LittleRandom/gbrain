@@ -206,6 +206,36 @@ revision, outcome, persistence status, and timestamps. Terminal receipts have
 `retry_after_ms: null`. Private queued content, credential hashes, and recovery
 bytes are never part of the receipt.
 
+Nonterminal receipts may include a validated `diagnostic` with `age_ms`,
+`assessment` (`pending`, `blocked`, or `stalled`), a closed `reason`, and
+`next_action` (`poll` or `inspect_owner`). An optional `observed_at` is the
+observation time, not the last useful progress time. Older servers may omit
+diagnostics. A fallback without fresh dependency evidence omits the observation
+timestamp; it does not claim that a cached row is current.
+
+| Observation | Recommended polling |
+| --- | ---: |
+| No known blocker, younger than 30 seconds | 1 second |
+| No known blocker, 30 seconds to under 2 minutes | 5 seconds |
+| Ordinary contention or an earlier write | 5 seconds |
+| At least 2 minutes old, or an operator-required blocker | 30 seconds; inspect the existing owner |
+
+These are advisory thresholds, not a completion SLA. `stalled` means the request
+is taking longer than expected, not that a deadlock or dead owner is proven.
+Request age starts at durable acceptance; lease renewals do not reset it.
+`cause_unknown` is an honest lack of evidence. `waiting_on_earlier_write` never
+identifies another caller's request. Recovery, owner binding, native capability
+and pool-capacity reasons can require inspection without granting repair authority.
+
+**Say to your agent:** *“Keep the original request ID. Tell me whether this write
+is committed or needs the existing owner's inspection; don't submit a duplicate.”*
+
+Acceptance is not completion. Retain the UUID and original arguments, poll the
+receipt when permitted, and verify the canonical page or fact before saying it
+was saved. If receipt helpers aren't available, repeat the same verb and original
+arguments with that UUID. When `next_action` is `inspect_owner`, ask the operator
+to inspect first instead of repeatedly submitting mutations.
+
 `write_pending` means accepted work remains outstanding. `owner_unavailable`
 and `writer_lock_unavailable` do not authorize a competing owner or a fresh
 request ID. `queue_capacity` refuses additional admission without evicting
@@ -232,8 +262,17 @@ serializes startup and remains held until the listener has actually closed.
 
 
 Admission retries confirmed database lock/serialization aborts for up to five
-seconds using the same UUID. Persistent contention returns a storage error with
-that UUID and no fabricated queued receipt. Keep the ID for the next attempt.
+seconds using the same UUID. Standalone journal admission limits each database
+lock wait to 100ms and backs off after rollback releases the connection. This
+allows admission to retain its place behind short counter transactions rather
+than repeatedly abandoning the lock queue. Confirmed
+lock-contention aborts use 5–25ms retry jitter; other retryable aborts retain
+25–100ms jitter. Waiting page writers release pool capacity between attempts
+instead of holding connections through long counter-lock waits.
+Persistent contention returns a storage error with that UUID and no fabricated
+queued receipt. Keep the ID for the next attempt. Admission inside a caller-owned
+transaction retains that transaction's lock policy; its caller is responsible for
+retrying the whole transaction after a confirmed abort.
 
 ## Frozen memory verbs
 
@@ -263,6 +302,95 @@ plain push to the configured tracking remote. It never pulls or rebases source
 files. An unconfigured remote is reported as a skipped push. Embeddings wait
 for an enabled, configured provider and install only if the page revision and
 its text projection still match.
+
+### Withdrawal recovery
+
+Withdrawal discovers exact, source- and visibility-scoped fact rows, recorded
+provenance and stale chunk evidence before changing the ledger. Unrelated page
+bytes, revisions, chunks and embedding signatures remain unchanged. Managed
+withdrawals retain a versioned target manifest for the mirror, Git and embedding
+workers; each worker checkpoints one affected page at a time.
+
+Stop older mutation workers before upgrading the owner and restarting work. Older
+binaries do not understand the target manifest and must not share the brain with
+the upgraded worker. This is a quiesced upgrade, not a mixed-version rollout.
+Take an engine-appropriate database backup first, not a Markdown export. Prefer
+forward recovery: restoring an older database can discard committed withdrawal
+intent or intervening edits and can make withdrawn content active again.
+
+Discovery is keyed on the claim, its subject and its fingerprint, so its cost
+and limits follow the pages that carry the claim, not the size of the source.
+Every fence row or chunk whose fingerprint matches contains each of the claim's
+normalized tokens in its lowercased text, because normalization only turns
+punctuation and whitespace into token boundaries. The database shortlists
+candidate pages and chunks that contain every token, and discovery streams the
+shortlist in batches of 128 and verifies each row exactly. A subject-scoped withdrawal reads
+only that entity's page plus the provenance of that entity's matching facts;
+a subjectless (`*`) withdrawal shortlists across the source. Recorded
+provenance uses the fact fingerprint index.
+
+The limits are 256 affected pages in a target manifest no larger than 1 MiB, a
+10-second checked scan budget, a 16,384-row/8 MiB input limit per matching
+batch, and a 16,384-marker parsing limit per body, enforced during a linear
+scan. These are capacity limits, not a latency guarantee or permission to spend
+on providers. `withdrawal_capacity` or `withdrawal_provenance` refuses the
+attempt before ledger, expiry, revision or chunk changes. Matching malformed
+fences need canonical repair.
+
+When the claim itself is carried by more than 256 pages, the refusal names the
+matched count and up to 20 matched pages. Reduce the matched set, then retry:
+forget the entity-scoped copies of the fact first (each withdrawal changes only
+its own entity's pages), or edit the claim out of pages that should not carry
+it. Time-budget refusals on a common claim need host-operator investigation,
+not an unchanged retry, source deletion or a forced cursor reset. There is no
+override that trades away complete discovery.
+
+Queued legacy `source_scan` effects upgrade through the same discovery, keyed
+on the request's own forgotten fact; only when that fact row is gone does the
+upgrade fall back to the source's whole withdrawal ledger (at most 256 claims).
+
+Fingerprints fold case, whitespace and punctuation (migration v174), so a
+punctuation or casing variant re-extracted from unchanged prose stays
+withdrawn. Symbols that carry meaning in names are kept: `+`, `#` and
+in-word dots, so "C++", "C#", ".NET" and "Node.js" stay distinct from
+"C", "NET" and "Nodejs"; a dot folds only when a space, another dot or the
+end of the claim follows it. Rows recorded before v174 keep their exact fingerprint and keep
+matching; v174 adds a folded row wherever a fact row still holds the claim text
+and expires active facts that became matching. A paraphrase with different
+words is a different claim.
+
+Already queued source-wide effects are converted using the same bounded exact
+discovery and retain their individual progress cursors. An over-capacity or
+unverifiable legacy effect stays pending; its previously committed withdrawal
+is not undone. A retained physical publication recovers forward before new work.
+If its recorded file bytes no longer match, preserve the file and receipt and
+resolve the conflict on the owner; do not delete recovery records.
+
+If a sync cursor was already invalidated, keep its failure visible until the
+owner has checked the canonical content. Then explicitly re-enumerate with the
+same source and processing options:
+
+```bash
+gbrain sync --source example-source --no-pull --no-embed --no-extract --retry-failed
+```
+
+Use `--no-embed` and `--no-extract` here only if they were the original sync
+options; retain the original `--no-schema-pack` choice as well. An unfinished
+cursor keeps its processing options: a run that omits these flags (including
+autopilot and `sync` jobs) adopts them, and an explicit conflicting flag refuses
+with `cursor_processing_options_conflict`, naming the stored options and the
+exact resume command. Explicit retry
+retains old terminal receipts, refuses while work is still active and creates
+fresh guarded requests. It does not ignore revision conflicts. Inspect the
+result and the original withdrawal receipt, then verify that the fact is inactive
+and the affected canonical file shows the withdrawal before reporting recovery
+complete. A queued mirror, failed embedding effect or blocked sync is not a
+completed repair. These rules apply to both PGLite and PostgreSQL; they do not
+require connecting a second process to an already-owned PGLite store.
+
+**Say to your agent:** *"Inspect the withdrawal receipt and the failed sync on
+this source. Preserve my edits and the withdrawal, and ask before explicit
+recovery if the original processing options are unknown."*
 
 Before and after managed activation, eligible `put_page` and `capture` writes
 record durable facts-extraction intent. `facts_backstop.queued` means that
@@ -422,6 +550,49 @@ adjust; usage at or above 80% includes expansion guidance. Blocked requests carr
 a concrete next action. Diagnostics contain no request content, credentials or
 private checkout paths.
 
+The read-only incident recipe is to select the correct brain, retain the original
+receipts privately, and run:
+
+```bash
+gbrain sources writer status --brain <brain> --probe --json
+```
+
+Correlate request IDs with queued/running heads, retained recovery, pool capacity
+and sanitized owner logs. Resident phase, phase-start, deadline and attempt
+observations are process-local and reset on restart; a separate CLI process
+cannot infer another process's progress from its own ingress status. Worktree
+heartbeats and renewed request timestamps do not prove useful progress or owner
+death. Do not include content, SQL text, credentials or checkout paths in an
+incident report. Diagnosis does not authorize claiming, activating, transferring,
+restarting an owner, removing locks, or discarding recovery.
+
+The synchronous write wait stays bounded at five seconds. Receipt reads and
+optional health queries are accounted until their underlying work settles;
+health enrichment has a 500ms caller budget and at most one query per engine.
+Supported scheduler SQL waits use a five-second cancellation budget. Expired
+claim sweeps skip locked rows without bypassing same-root FIFO. Ordinary
+`put_page` and `remember` preparation receive a cooperative 30-second deadline;
+settled unpublished attempts can retry the same UUID. Work that ignores abort
+remains tracked and fenced. PGLite's in-process work cannot be forcibly cancelled,
+and shutdown must wait for actual settlement before releasing its datastore.
+Queued transaction `BEGIN` and direct-route initialization can also remain in
+flight after the phase deadline; the status reports that wait without claiming
+cancellation. A stopped consumer cannot begin preparation when a delayed claim
+eventually returns.
+
+PostgreSQL cancellation keeps the affected connection isolated until both the
+query and its cancellation transport settle, so a late cancellation cannot be
+sent into a successor's work by reusing that connection early. The cancellation
+transport can outlast the phase budget; this is not a hard database execution
+deadline. See [PostgreSQL cancellation ownership](../architecture/postgres-cancellation.md)
+for driver and pooler boundaries.
+
+An authorized replacement or rollback must quiesce the designated owner and
+retain accepted IDs, recovery reservations and additive indexes. Never downgrade
+below the existing writer protocol floor. If publication cannot safely drain,
+retain the fence and escalate. Local fixture success is not evidence that a
+particular deployed incident has recovered.
+
 ## Source lifecycle
 
 After activation, source add, archive, restore, remove, purge, path rebind and
@@ -473,8 +644,8 @@ Default admission limits are enforced atomically:
 | --- | ---: | ---: |
 | Outstanding requests | 100 | 1,000 |
 | Queued intent bytes | 32 MiB | 256 MiB |
-| Lifetime request IDs | 100,000 | 1,000,000 |
-| Terminal receipt reservation | 128 MiB | 1 GiB |
+| Lifetime request IDs | 250,000 | 1,000,000 |
+| Terminal receipt reservation | 1.5 GiB | 8 GiB |
 | Recovery bytes | — | 1 GiB, also 256 MiB per worktree |
 
 Completion space is reserved at admission. Beforeimage/recovery bytes are
@@ -482,4 +653,30 @@ reserved before filesystem publication. Reaching a limit refuses additional
 work; it does not discard an accepted request to make room. Terminal diagnostic
 compaction has a default eligibility threshold of 30 days and preserves replay IDs, digests, terminal
 outcomes, and frozen memory-verb result fields. Pending/recovering requests are
-not evicted. Lifetime IDs and replay protection are not silently reset.
+not evicted, and receipts with unfinished effects stay retained without
+blocking compaction of later receipts. Lifetime IDs and replay protection are
+not silently reset.
+
+Each admission reserves at least 16 KiB of receipt bytes until compaction; a
+compacted receipt keeps about 4 KiB. The cumulative defaults cover one
+principal admitting about 600 writes a day for at least a year. Every limit and
+the retention window are brain-wide database settings:
+
+```bash
+gbrain config set persistence.limits.principal_lifetime_ids 500000
+gbrain config set persistence.limits.principal_terminal_bytes 3221225472
+gbrain config set persistence.receipt_retention_days 7
+```
+
+**Say to your agent:** *"Doctor says my brain is near its write capacity. Raise the limit it names."*
+
+Keys are `persistence.limits.<limit>` for `principal_outstanding`,
+`brain_outstanding`, `principal_intent_bytes`, `brain_intent_bytes`,
+`principal_lifetime_ids`, `brain_lifetime_ids`, `principal_terminal_bytes`,
+`brain_terminal_bytes`, `brain_recovery_bytes` and `worktree_recovery_bytes`,
+each a nonnegative integer. `gbrain doctor` warns (`persistence_capacity`) once
+a principal or the brain uses 80% of its lifetime IDs or receipt bytes and
+prints the `gbrain config set` command with a value that covers about one more
+year at the current admission rate; a `queue_capacity` refusal carries the same
+command. Raising a cap is a mitigation: lifetime IDs remain permanent replay
+protection.

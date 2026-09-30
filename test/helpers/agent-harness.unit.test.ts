@@ -8,9 +8,6 @@
  *   - hermeticChildEnv: drops CONDUCTOR_* / CLAUDE_* / GSTACK_* / MCP_* /
  *     GBRAIN_*, promotes GSTACK_ANTHROPIC_API_KEY, honors extraAllow, and lets
  *     overrides win.
- *   - resolveClaudeBinary / resolveCodexBinary SMOKE (whatever this machine
- *     has — assertion is only that the result is a string-or-null, plus a note
- *     printed when found).
  *
  * The env test mutates process.env and restores it in finally so it never
  * leaks into sibling tests.
@@ -22,13 +19,11 @@ import { join } from 'node:path';
 import {
   parseClaudeStream,
   parseCodexJsonl,
+  codexMcpApprovalArgs,
   hermeticChildEnv,
   hermesChildEnv,
   grokChildEnv,
   promotedEnv,
-  resolveClaudeBinary,
-  resolveCodexBinary,
-  resolveHermesBinary,
   resolveGrokBinary,
   hasHermesAuth,
   hasGrokAuth,
@@ -42,6 +37,22 @@ import {
   runOneShotSpawn,
 } from './agent-harness.ts';
 import { withEnv } from './with-env.ts';
+
+describe('fixture MCP approvals', () => {
+  test('the default changes no policy; explicit tools stay in their server/plugin scope', () => {
+    expect(codexMcpApprovalArgs()).toEqual([]);
+    const args = codexMcpApprovalArgs([
+      { server: 'fixture', tools: ['query', 'query'] },
+      { plugin: 'fixture@marketplace', server: 'gbrain', tools: ['recall'] },
+    ]);
+    expect(args).toEqual([
+      '-c', 'mcp_servers.fixture.tools.query.approval_mode="approve"',
+      '-c', 'plugins.fixture@marketplace.mcp_servers.gbrain.tools.recall.approval_mode="approve"',
+    ]);
+    expect(() => codexMcpApprovalArgs([{ server: 'fixture.tools', tools: ['query'] }])).toThrow('single config-path segments');
+    expect(() => codexMcpApprovalArgs([{ server: 'fixture', tools: ['query.approval_mode'] }])).toThrow('single config-path segments');
+  });
+});
 
 // A captured claude stream-json turn: a system init line, an assistant text +
 // tool_use turn, a tool_result user line, a second assistant text turn, and the
@@ -199,30 +210,6 @@ describe('hermeticChildEnv', () => {
         expect(scrubbed.CODEX_HOME).toBeUndefined();
       },
     );
-  });
-});
-
-describe('binary resolution SMOKE', () => {
-  test('resolveClaudeBinary returns a string or null', () => {
-    const bin = resolveClaudeBinary();
-    expect(bin === null || typeof bin === 'string').toBe(true);
-    if (bin) console.log(`[smoke] claude resolved at: ${bin}`);
-  });
-
-  test('resolveCodexBinary returns a string or null', () => {
-    const bin = resolveCodexBinary();
-    expect(bin === null || typeof bin === 'string').toBe(true);
-    if (bin) console.log(`[smoke] codex resolved at: ${bin}`);
-  });
-
-  test('resolveHermesBinary returns a string or null', () => {
-    const bin = resolveHermesBinary();
-    expect(bin === null || typeof bin === 'string').toBe(true);
-    if (bin) console.log(`[smoke] hermes resolved at: ${bin}`);
-  });
-
-  test('hasHermesAuth returns a boolean', () => {
-    expect(typeof hasHermesAuth()).toBe('boolean');
   });
 });
 

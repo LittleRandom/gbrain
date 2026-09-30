@@ -1,4 +1,3 @@
-import { isZeroEntropyModel } from '../core/ai/defaults.ts';
 import { execSync, execFileSync } from 'child_process';
 import { existsSync, readFileSync, writeFileSync, mkdirSync, appendFileSync, realpathSync } from 'fs';
 import { basename, join, dirname, resolve } from 'path';
@@ -575,123 +574,6 @@ export async function runPostUpgrade(args: string[] = []): Promise<void> {
           // Banner is cosmetic; never block the upgrade.
         }
 
-        // #3390: ZeroEntropy sunset notice. ZE announced (2026-07-24) that
-        // its hosted endpoints — including /models/embed and /models/rerank —
-        // shut down on 2026-09-04. Any brain resolving to a zeroentropyai:*
-        // embedding model (including default-config brains that never set
-        // one) loses SEMANTIC RETRIEVAL ENTIRELY on that date: the query
-        // embedding uses the same endpoint, so existing vectors become
-        // unqueryable. One-shot per install, gated by
-        // `ze_sunset_notice_shown` (same pattern as the search-mode banner).
-        try {
-          const shown = await engine.getConfig('ze_sunset_notice_shown');
-          const { DEFAULT_EMBEDDING_MODEL, ZEROENTROPY_SUNSET_DATE } = await import('../core/ai/defaults.ts');
-          const effectiveModel = cfgSchema.embedding_model ?? DEFAULT_EMBEDDING_MODEL;
-          // Effective reranker via the plane search actually reranks with
-          // (mode bundle + search.reranker.* overrides) — the bare config
-          // key is unset by default while balanced/tokenmax rerank with the
-          // bundle's zeroentropyai model. Same resolution as the
-          // provider_sunset doctor check.
-          let rerankerModel: string | undefined;
-          try {
-            const { loadSearchModeConfig, resolveSearchMode } = await import('../core/search/mode.ts');
-            const knobs = resolveSearchMode(await loadSearchModeConfig(engine));
-            if (knobs.reranker_enabled) rerankerModel = knobs.reranker_model;
-          } catch { /* no reranker-exposure claim */ }
-          const onZeEmbedding = isZeroEntropyModel(effectiveModel);
-          const onZeReranker = isZeroEntropyModel(rerankerModel);
-          if (shown !== 'true' && (onZeEmbedding || onZeReranker)) {
-            // Paste-ready --dim from the ACTUAL column width (config can
-            // drift): keeping the current width avoids a needless dimension
-            // transition + index rebuild when the target supports it.
-            let colDims: number | null = null;
-            try {
-              const { readContentChunksEmbeddingDim } = await import('../core/embedding-dim-check.ts');
-              colDims = (await readContentChunksEmbeddingDim(engine)).dims;
-            } catch { /* fresh brain — canonical command carries its own --dim */ }
-            const { renderCanonicalMigrationCommands } = await import('../core/ai/defaults.ts');
-            const cmds = renderCanonicalMigrationCommands({ colDims });
-            console.log('');
-            console.log('═══════════════════════════════════════════════════════════════');
-            console.log(`[gbrain] ACTION REQUIRED: ZeroEntropy hosted API sunsets ${ZEROENTROPY_SUNSET_DATE}.`);
-            if (onZeEmbedding) {
-              console.log(`[gbrain] This brain embeds with ${effectiveModel}. After the sunset,`);
-              console.log('[gbrain] semantic retrieval STOPS WORKING entirely — your EXISTING');
-              console.log('[gbrain] vectors become unqueryable (queries embed through the same');
-              console.log('[gbrain] endpoint), not just new content.');
-            }
-            if (onZeReranker) {
-              console.log(`[gbrain] The reranker (${rerankerModel}) also sunsets; search falls`);
-              console.log('[gbrain] back to unreranked ordering.');
-            }
-            console.log('═══════════════════════════════════════════════════════════════');
-            console.log('');
-            console.log('Two fixes, either works:');
-            console.log('');
-            console.log('[1] Self-host the same model — zembed-1 weights are Apache-2.0. Keep the');
-            console.log('    zeroentropyai:zembed-1 id and point provider_base_urls.zeroentropyai');
-            console.log('    at a ZE-wire-compatible endpoint (NOT a generic OpenAI-compatible');
-            console.log('    server — the id speaks ZE\'s /models/embed dialect). Keeps every');
-            console.log('    vector; NO re-embed. See docs/guides/embedding-migration.md.');
-            console.log('');
-            console.log('[2] Migrate to another provider (resumable; preview cost first):');
-            console.log(`      ${cmds.recommendedDryRun}`);
-            console.log(`      ${cmds.recommended}`);
-            if (cmds.note) console.log(`    ${cmds.note}`);
-            if (cmds.openaiAlternative) {
-              console.log(`    Keep-width alternative: ${cmds.openaiAlternative}`);
-            }
-            if (onZeReranker) {
-              console.log('');
-              console.log('Reranker: gbrain config set search.reranker.enabled false (or pick another).');
-            }
-            console.log('');
-            console.log(`\`gbrain doctor\` will keep flagging this until the brain is off the`);
-            console.log('provider (check name: provider_sunset).');
-            console.log('');
-            await engine.setConfig('ze_sunset_notice_shown', 'true');
-          }
-        } catch {
-          // Banner is cosmetic; never block the upgrade.
-        }
-
-        // v0.46.3: stage-2 sunset notice, gated by `ze_sunset_notice_v2_shown`.
-        // Fires even for brains that saw stage 1 — this release ships the
-        // migration playbook + the Voyage default, and the exposure story
-        // widened (custom columns, env overrides, reranker-without-key).
-        // The gate opens on `exposed` and on `unknown` (fail-safe: nag rather
-        // than stay silent). Reranker-only exposure is COVERED by `exposed`:
-        // detectZeExposure sets status='exposed' whenever the resolved
-        // reranker is ZE (including the legacy bundle default), so an
-        // OpenAI/Voyage-embedding brain whose reranking rides the ZE bundle
-        // still opens the gate, and renderZeActionRequired includes the
-        // reranker paragraph.
-        try {
-          const shownV2 = await engine.getConfig('ze_sunset_notice_v2_shown');
-          if (shownV2 !== 'true') {
-            const { detectZeExposure, renderZeActionRequired } =
-              await import('../core/ze-exposure.ts');
-            const exposure = await detectZeExposure(engine);
-            if (exposure.status === 'exposed' || exposure.status === 'unknown') {
-              console.log('');
-              console.log('═══════════════════════════════════════════════════════════════');
-              console.log('[gbrain] ACTION REQUIRED — ZeroEntropy shutdown (v0.46.3 notice)');
-              console.log('═══════════════════════════════════════════════════════════════');
-              for (const line of renderZeActionRequired(exposure).split('\n')) {
-                console.log(`[gbrain] ${line}`);
-              }
-              console.log('[AGENT] Relay this to your operator: this brain needs an embedding/');
-              console.log('[AGENT] reranker migration before the shutdown date. Playbook:');
-              console.log('[AGENT] skills/migrations/v0.46.3.0.md');
-              console.log('═══════════════════════════════════════════════════════════════');
-              console.log('');
-              await engine.setConfig('ze_sunset_notice_v2_shown', 'true');
-            }
-          }
-        } catch {
-          // Banner is cosmetic; never block the upgrade.
-        }
-
         // PR1: skill-catalog publish consent. New installs default ON at
         // `gbrain init`; EXISTING installs stay OFF (default-OFF runtime = no
         // silent capability grant on upgrade) until the owner opts in HERE.
@@ -759,20 +641,35 @@ export async function runPostUpgrade(args: string[] = []): Promise<void> {
 
         // v0.32.7 CJK wave: chunker-version bump → re-embed sweep.
         // Idempotent — `runReindex` short-circuits when no pages are pending.
+        // A managed brain refuses the markdown reindex; name its drain instead.
         try {
-          const { runPostUpgradeReembedPrompt } = await import('../core/post-upgrade-reembed.ts');
-          const { getEmbeddingModel } = await import('../core/ai/gateway.ts');
-          let modelString = 'openai:text-embedding-3-large';
-          try { modelString = getEmbeddingModel(); } catch { /* gateway not configured — keep default */ }
-          const promptResult = await runPostUpgradeReembedPrompt(engine, modelString);
-          if (promptResult.proceeded) {
-            const { runReindex } = await import('./reindex.ts');
-            await runReindex(engine, ['--markdown']);
+          const { managedPersistenceEnabled } = await import('../core/persistence/ownership.ts');
+          const managed = await managedPersistenceEnabled(engine);
+          if (!managed) {
+            const { runPostUpgradeReembedPrompt } = await import('../core/post-upgrade-reembed.ts');
+            const { getEmbeddingModel } = await import('../core/ai/gateway.ts');
+            let modelString = 'openai:text-embedding-3-large';
+            try { modelString = getEmbeddingModel(); } catch { /* gateway not configured — keep default */ }
+            const promptResult = await runPostUpgradeReembedPrompt(engine, modelString);
+            if (promptResult.proceeded) {
+              const { runReindex } = await import('./reindex.ts');
+              await runReindex(engine, ['--markdown']);
+            }
           }
         } catch (re) {
           const msg = re instanceof Error ? re.message : String(re);
           console.warn(`\nChunker-bump reindex skipped: ${msg}`);
           console.warn('Run `gbrain reindex --markdown` manually when ready.');
+        }
+
+        // Fix wave 3: run the wave checks once (full, not --fast) and relay a
+        // preview-only recovery banner; applying stays the user's decision.
+        try {
+          const { postUpgradeRecoveryBanner } = await import('./doctor/upgrade-banner.ts');
+          const [brain] = await engine.executeRaw<{ brain_id: string }>('SELECT brain_id FROM persistence_brain WHERE singleton=1').catch(() => []);
+          for (const line of await postUpgradeRecoveryBanner(engine, `host (${engine.kind}${brain ? `, id ${brain.brain_id}` : ''})`)) console.log(line);
+        } catch (be) {
+          console.warn(`\nRecovery checks skipped: ${be instanceof Error ? be.message : String(be)}. Run \`gbrain doctor --remediation-plan\` to preview.`);
         }
       } finally {
         try { await engine.disconnect(); } catch { /* best-effort */ }

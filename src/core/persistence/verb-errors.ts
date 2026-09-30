@@ -1,5 +1,7 @@
 import { verbError, OperationError } from '../ops/contract.ts';
 import { isTerminalWriteState, isWriteErrorCode, type WriteErrorCode, type WriteReceipt } from './types.ts';
+import { pendingWriteHint } from './health.ts';
+import { UNBOUND_COLLISION_MESSAGE, UNBOUND_PUBLICATION_MESSAGE } from './unbound-source.ts';
 
 export function writeFailureDiagnostic(code: string, message?: string | null): { reason: string; message: string; suggestion: string } {
   if (code === 'source_changed') {
@@ -34,9 +36,15 @@ export function writeFailureDiagnostic(code: string, message?: string | null): {
       reason: 'source_binding_changed', message: 'The source binding changed after this sync was accepted.',
       suggestion: 'Inspect the current source binding on its existing owner. Do not claim, transfer, or activate a source as a data-repair shortcut.',
     };
+    if (message === UNBOUND_COLLISION_MESSAGE) return {
+      reason: 'unbound_source', message: 'A canonical file now occupies the path of a page written while its source was unbound. Neither copy was overwritten.',
+      suggestion: 'The database page stays served. Rename or remove the canonical file, commit, and sync again, or copy what you need from the file into the page first.',
+    };
     return { reason: 'source_changed', message: 'A canonical source input or binding changed; the write was refused.',
       suggestion: 'Inspect the source on its existing owner. For file/database drift, preview gbrain sources reconcile <source> <slug> --brain <brain> --preview. Do not change ownership or permissions to bypass this guard.' };
   }
+  if (code === 'owner_unavailable' && message === UNBOUND_PUBLICATION_MESSAGE) return { reason: 'unbound_source', message,
+    suggestion: 'Read the page again and submit the write with a new request_id; a bound source publishes it to its canonical file.' };
   if (code === 'owner_unavailable') return { reason: code, message: 'The accepted source owner is unavailable or changed.',
     suggestion: 'Check the existing owner and its availability. Do not claim, transfer, or activate a source to repair content.' };
   if (code === 'permission_denied' || code === 'scope_denied') return { reason: code, message: 'The caller is not authorized for this write.',
@@ -75,7 +83,7 @@ export function frozenVerbWriteError(receipt: WriteReceipt, reason?: WriteErrorC
       ? 'invalid_params' : 'unavailable';
   const diagnostic = writeFailureDiagnostic(writeError, message);
   const suggestion = pending
-    ? `Retry the same verb with the same arguments and request_id ${receipt.request_id}${receipt.retry_after_ms === null ? ' after checking writer availability' : ` after ${receipt.retry_after_ms} ms`}. Do not submit a new request_id for this write.`
+    ? pendingWriteHint(receipt)
     : receipt.state === 'cancelled'
         ? 'This request was cancelled. Submit a new request_id only if you want to make a new write.'
         : `${diagnostic.suggestion} Submit any corrected write with a new request_id. Reusing this request_id returns the same ${receipt.state === 'conflict' ? 'conflict' : 'outcome'}.`;
