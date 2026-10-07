@@ -33,6 +33,10 @@ import { estimateMaxCostUsd, ANTHROPIC_PRICING } from '../anthropic-pricing.ts';
 import { canonicalLookup, type ModelPricing } from '../model-pricing.ts';
 import type { BrainEngine } from '../engine.ts';
 import { splitProviderModelId } from '../model-id.ts';
+import { overrideFor, type PricingOverrides } from '../budget/reservation-cost.ts';
+import { pricingSetCommand } from '../budget/no-pricing.ts';
+// Re-exported beside loadAllowUnpriced so meter call sites read both knobs from one module.
+export { loadPricingOverrides } from '../budget/budget-tracker.ts';
 
 /** Local model servers bill nothing; their models are priced at $0, never at the fallback. */
 const LOCAL_MODEL_PROVIDERS = new Set(['ollama', 'lmstudio', 'llama-server']);
@@ -66,6 +70,14 @@ export interface BudgetMeterOpts {
   allowUnpriced?: boolean;
   /** Phase label for telemetry: 'auto_think' | 'drift'. */
   phase: string;
+  /**
+   * #4312 operator price overrides (`pricing.overrides`, parsed by
+   * parsePricingOverrides). Consulted before the shipped tables, the same
+   * lookup BudgetTracker uses, so a rate the operator declared (a proxy
+   * route, or $0 for a flat-rate subscription lane) prices dream-cycle gates
+   * the same way it prices every other cost cap.
+   */
+  pricingOverrides?: PricingOverrides;
   /** Optional override for the audit file path (tests). */
   auditPath?: string;
 }
@@ -132,6 +144,13 @@ export class BudgetMeter {
    * caller keeps the existing warn-and-allow behaviour for those.
    */
   private estimateCost(estimate: SubmitEstimate): number | null {
+    // #4312: an operator override wins over every table, as in BudgetTracker.
+    const override = overrideFor(estimate.modelId, this.opts.pricingOverrides);
+    if (override) {
+      const cost = (estimate.estimatedInputTokens / 1_000_000) * override.input +
+        (estimate.maxOutputTokens / 1_000_000) * override.output;
+      return Number.isFinite(cost) ? cost : null;
+    }
     if (LOCAL_MODEL_PROVIDERS.has(splitProviderModelId(estimate.modelId).provider ?? '')) return 0;
     const p = canonicalLookup(estimate.modelId);
     const raw = p
@@ -171,8 +190,9 @@ export class BudgetMeter {
         process.stderr.write(
           `[budget] BUDGET_METER_NO_PRICING: model "${estimate.modelId}" has no canonical pricing. ` +
           (this.opts.allowUnpriced
-            ? `Budget gate disabled for this model (dream.budget.allow_unpriced=true).\n`
-            : `Metering it at the Sonnet-tier fallback rate; set dream.budget.allow_unpriced=true to bypass.\n`),
+            ? `Budget gate disabled for this model (dream.budget.allow_unpriced=true). `
+            : `Metering it at the Sonnet-tier fallback rate; set dream.budget.allow_unpriced=true to bypass. `) +
+          `To meter its real price, look it up and register it: ${pricingSetCommand(estimate.modelId, 'chat')}\n`,
         );
       }
     }

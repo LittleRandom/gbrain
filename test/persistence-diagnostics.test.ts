@@ -97,14 +97,13 @@ test('fresh and upgraded engines agree on the database-only pending index', asyn
       } finally { abort.abort(); release.resolve(); await holding; await interrupted; }
     }
     await engine.setConfig('version', '164');
-    expect(LATEST_VERSION).toBe(178);
-    expect(await runMigrations(engine)).toEqual({ applied: 14, current: 178 });
+    expect(await runMigrations(engine)).toEqual({ applied: LATEST_VERSION - 164, current: LATEST_VERSION });
     const [upgraded] = await engine.executeRaw<{ indexdef: string }>(
       "SELECT indexdef FROM pg_indexes WHERE indexname='persistence_requests_database_pending'");
     expect(upgraded.indexdef).toBe(fresh.indexdef);
     const [parked] = await engine.executeRaw<{ indexdef: string }>("SELECT indexdef FROM pg_indexes WHERE indexname='persistence_effects_parked'");
     expect(parked.indexdef).toContain('parked');
-    expect(await engine.getConfig('version')).toBe('178');
+    expect(await engine.getConfig('version')).toBe(String(LATEST_VERSION));
   }
 }, 15000);
 
@@ -130,5 +129,15 @@ test('admin diagnostics account for queued work and configured limits without ex
     expect(status.blockers[0].next_action).toContain('designated owner');
     expect(JSON.stringify(status)).not.toContain('PRIVATE_DIAGNOSTIC_INTENT_CANARY');
     expect(JSON.stringify(status)).not.toContain('execution_token');
+  }
+});
+
+test('writer status labels the answering process consumer instead of reporting it as brain ingress (C-NEW-4)', async () => {
+  for (const engine of engines) {
+    await disposePersistenceConsumer(engine);
+    const diagnostics = await readWriterDiagnostics(engine) as Record<string, unknown> & { local_process_ingress: { state: string; scope: string } };
+    expect(diagnostics.ingress).toBeUndefined();
+    expect(diagnostics.local_process_ingress.state).toBe('not_running');
+    expect(diagnostics.local_process_ingress.scope).toContain('another process may own');
   }
 });

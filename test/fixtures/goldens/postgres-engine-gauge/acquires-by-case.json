@@ -35,6 +35,8 @@
     "countStaleChunks#signature+sourceId": {
       "raw": 1
     },
+    "countStalePagesForExtraction#attendance-blocked+sourceId": {},
+    "countStalePagesForExtraction#attendance-exclude": {},
     "countStalePagesForExtraction#default": {},
     "countStalePagesForExtraction#versionTs+sourceId": {},
     "countStaleTakes#default": {},
@@ -152,6 +154,8 @@
     "getTimelineForDate#week+sourceId": {},
     "getVersions#default": {},
     "getVersions#excludePrivate": {},
+    "getVersions#limit": {},
+    "getVersions#metadataOnly": {},
     "getVersions#sourceId": {},
     "getVersions#sourceIds": {},
     "insertFact#default": {},
@@ -192,6 +196,9 @@
     "listFactsByEntity#default": {},
     "listFactsBySession#allFilters": {},
     "listFactsBySession#default": {},
+    "listFactsKeyset#default": {},
+    "listFactsKeyset#keyset": {},
+    "listFactsKeyset#strictTime": {},
     "listFactsSince#allFilters": {},
     "listFactsSince#default": {},
     "listFilesForPage#default": {},
@@ -244,6 +251,7 @@
       "raw": 4,
       "tx": 1
     },
+    "markPagesAttendanceBlocked#default": {},
     "markPagesExtractedBatch#default": {},
     "mergeOntologyFact#corroborate": {},
     "mergeOntologyFact#insert": {},
@@ -279,7 +287,7 @@
       "tx": 1
     },
     "replaceDerivedLinks#default": {
-      "raw": 11,
+      "raw": 12,
       "tx": 1
     },
     "resolveSlugWithAlias#default": {},

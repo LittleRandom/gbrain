@@ -1,5 +1,5 @@
 /** Post-sync human reporting and best-effort nudges for the sync CLI. */
-import { formatManagedSyncFailure } from '../../core/persistence/sync-failures.ts';
+import { formatManagedSyncFailure, managedSyncRetryCommand } from '../../core/persistence/sync-failures.ts';
 import type { BrainEngine } from '../../core/engine.ts';
 import { isEmbeddingInfraCode } from '../../core/sync.ts';
 import { serr } from '../../core/console-prefix.ts';
@@ -17,6 +17,17 @@ import type { SyncResult } from '../sync.ts';
  */
 export function shouldNudgeAfterSync(status: SyncResult['status']): boolean {
   return status === 'synced' || status === 'first_sync' || status === 'up_to_date';
+}
+
+/**
+ * #3068 / #5012: partials that do not converge on a plain retry exit
+ * non-zero so cron and monitoring see them: a failed pull, connector items
+ * that failed to import, and a connector that stopped early without a cause.
+ * Timeout-class partials keep exit 0 (the next run continues).
+ */
+export function isFailedPartial(result: Pick<SyncResult, 'status' | 'reason'>): boolean {
+  return result.status === 'partial'
+    && (result.reason === 'pull_failed' || result.reason === 'connector_item_failures' || result.reason === 'connector_partial');
 }
 
 /**
@@ -99,7 +110,8 @@ export function printSyncResult(result: SyncResult, sink: NodeJS.WriteStream = p
       if (result.uncommitted) writeUncommittedNote(result.uncommitted);
       break;
     case 'synced':
-      write(`Synced ${result.fromCommit?.slice(0, 8)}..${result.toCommit.slice(0, 8)}:`);
+      // Connector sources have no commit range.
+      write(result.toCommit ? `Synced ${result.fromCommit?.slice(0, 8) ?? '<initial>'}..${result.toCommit.slice(0, 8)}:` : 'Synced:');
       write(`  +${result.added} added, ~${result.modified} modified, -${result.deleted} soft-deleted (recoverable 72h), R${result.renamed} renamed`);
       write(`  ${result.chunksCreated} chunks created${result.embedded > 0 ? `, ${result.embedded} pages embedded` : ''}`);
       if (result.uncommitted) writeUncommittedNote(result.uncommitted);
@@ -114,7 +126,10 @@ export function printSyncResult(result: SyncResult, sink: NodeJS.WriteStream = p
       if (result.runId) {
         write(`Sync BLOCKED at ${result.toCommit}: committed counts are cumulative for run ${result.runId}.`);
         for (const failure of result.failures ?? []) write(`  ${formatManagedSyncFailure(failure)}`);
-        write('  Fix the cause, then run gbrain sync --no-pull --retry-failed with the same source and options; this admits a fresh run after active work drains.');
+        const retries = [...new Set((result.failures ?? []).map(failure => managedSyncRetryCommand(failure)))];
+        write(retries.length
+          ? `  Fix the cause, then run: ${retries.join(' ; ')} (this admits a fresh run after active work drains).`
+          : '  Fix the cause, then run gbrain sync --no-pull --retry-failed with the same source and options; this admits a fresh run after active work drains.');
         break;
       }
       write(`Sync BLOCKED at ${result.toCommit.slice(0, 8)}: ${result.failedFiles ?? 0} file(s) failed.`);
@@ -145,6 +160,27 @@ export function printSyncResult(result: SyncResult, sink: NodeJS.WriteStream = p
         write(`  Fix the pull (see the warning above), then re-run 'gbrain sync' (last_commit unchanged; safe to retry).`);
         break;
       }
+      if (result.reason === 'connector_item_failures') {
+        write(
+          `Sync PARTIAL [connector_item_failures]: ${result.failedFiles ?? 0} connector item(s) failed to import; ` +
+          `${result.filesImported ?? result.added + result.modified} page(s) written.`,
+        );
+        write(`  The failure reasons are in the warnings above. Fix the cause, then re-run 'gbrain sync --source <id>' (the cursor did not advance past failed items; see 'gbrain sources status <id>'). Docs: docs/guides/google-connect.md#held-items`);
+        break;
+      }
+      if (result.reason === 'connector_partial') {
+        write(
+          `Sync PARTIAL [connector_partial]: the connector stopped before finishing and reported no cause; ` +
+          `${result.filesImported ?? result.added + result.modified} page(s) written.`,
+        );
+        write(`  Check the warnings above (expired or revoked credentials print there), fix the cause, then re-run 'gbrain sync --source <id>'.`);
+        break;
+      }
+      // #5984: a managed cursor knows its manifest size; the drain summary prints the next step.
+      if (result.managedCursor) {
+        write(`Sync PARTIAL at ${result.fromCommit?.slice(0, 8) ?? '<initial>'}: ${result.managedCursor.index} of ${result.managedCursor.total} manifest entries processed, reason=${result.reason ?? 'timeout'} (last_commit unchanged; safe to retry).`);
+        break;
+      }
       // v0.41.13.0 (T7 / D-V3-5): --timeout fired before the bookmark write
       // so last_commit is UNCHANGED. The next sync re-walks the same diff
       // and content_hash short-circuits already-imported files at ~10ms each.
@@ -158,5 +194,7 @@ export function printSyncResult(result: SyncResult, sink: NodeJS.WriteStream = p
       write(`  Re-run 'gbrain sync' to continue (last_commit unchanged; safe to retry).`);
       break;
   }
+  const holds = result.connectorHolds;
+  if (holds) write(`  ${holds.held} connector item(s) held after repeated failures${holds.newly_held ? ` (${holds.newly_held} new)` : ''}; they do not block freshness. See them with '${holds.status_command}', re-attempt with '${holds.retry_command}'.`);
   printManagedSyncNotes(result, write);
 }

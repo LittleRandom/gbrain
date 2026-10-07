@@ -33,7 +33,8 @@ import {
   existsSync, readFileSync, writeFileSync, mkdirSync, chmodSync, rmSync, statSync, renameSync,
 } from 'fs';
 import { join, dirname, relative, isAbsolute } from 'path';
-import { execFile, execFileSync, execSync, type ExecFileException } from 'child_process';
+import { execFileSync, execSync } from 'child_process';
+import { execFileBounded } from './bounded-child-exec.ts';
 import {
   GIT_ENV, GIT_ENV_AUTH, divergenceSafePull, detectDefaultBranch, pushProbe,
   type PullOutcome, type PushProbeResult,
@@ -46,6 +47,8 @@ import { loadFilingRules, type FilingRulesDoc } from './filing-audit.ts';
 // Bundled into the --compile binary as the fallback taxonomy for repos that
 // don't ship their own — see resolveFilingRules().
 import filingRulesDoc from '../../skills/_brain-filing-rules.json';
+
+export { execFileBounded, type BoundedExecOptions } from './bounded-child-exec.ts';
 
 // ── Types ───────────────────────────────────────────────────────────────────
 
@@ -393,6 +396,11 @@ function gitDirPath(repoPath: string, rel: string): string {
   return join(repoPath, '.git', rel);
 }
 
+function pathContains(parent: string, child: string): boolean {
+  const rel = relative(parent, child);
+  return rel === '' || (!rel.startsWith('..') && !isAbsolute(rel));
+}
+
 function resolveHooksDir(repoPath: string): { dir: string; tracked: boolean } {
   let hooksPath = '';
   try {
@@ -402,8 +410,10 @@ function resolveHooksDir(repoPath: string): { dir: string; tracked: boolean } {
   } catch { /* unset — normal */ }
   if (hooksPath) {
     const dir = isAbsolute(hooksPath) ? hooksPath : join(repoPath, hooksPath);
-    // A hooksPath outside .git/ (e.g. .githooks) is a TRACKED location.
-    const tracked = !dir.includes(`${join('.git', '')}`) && !dir.endsWith('.git/hooks');
+    // A hooksPath in the working tree but outside the git dir (e.g. .githooks)
+    // is a TRACKED location. Classify by path containment, never by a '.git'
+    // substring, which matches '.githooks' and checkouts like 'site.github.io'.
+    const tracked = pathContains(repoPath, dir) && !pathContains(gitDirPath(repoPath, ''), dir);
     return { dir, tracked };
   }
   return { dir: gitDirPath(repoPath, 'hooks'), tracked: false };
@@ -431,6 +441,7 @@ function installLocalHook(repoPath: string, dryRun: boolean): { status: StepStat
   if (existsSync(hookPath)) {
     const cur = readFileSync(hookPath, 'utf-8');
     if (cur.includes(HOOK_BANNER)) {
+      if (tracked && !dryRun) ensureExcluded(repoPath, relative(repoPath, hookPath));
       if (cur === script) return { status: 'ok', detail: `${relative(repoPath, hookPath)} already current` };
       if (dryRun) return { status: 'fixed', detail: `would refresh ${relative(repoPath, hookPath)} (dry-run)` };
       writeFileSync(hookPath, script); chmodSync(hookPath, 0o755);
@@ -472,44 +483,6 @@ export function isDurabilityHardened(repoPath: string): boolean {
   } catch {
     return false;
   }
-}
-
-export interface BoundedExecOptions {
-  timeout: number;
-  env?: NodeJS.ProcessEnv;
-  maxBuffer?: number;
-  signal?: AbortSignal;
-}
-
-/**
- * `execFile` that settles within `timeout` or on abort even when the runtime
- * never delivers the child's exit or pipe close. Bun through 1.3.x drops
- * one-shot pidfd and pipe events when a callback re-enters the event loop
- * (bun:test `expect().resolves/.rejects`, oven-sh/bun#30301): execFile's
- * callback and its own `timeout` then never fire and the child stays a zombie,
- * so the deadline and abort are enforced with our own timer.
- */
-export function execFileBounded(file: string, args: string[], options: BoundedExecOptions): Promise<{ error: ExecFileException | null; stdout: string }> {
-  const { timeout, signal, ...rest } = options;
-  return new Promise(resolve => {
-    let settled = false;
-    const finish = (error: ExecFileException | null, stdout: string) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      signal?.removeEventListener('abort', onAbort);
-      resolve({ error, stdout });
-    };
-    const child = execFile(file, args, { ...rest, encoding: 'utf8' }, (error, stdout) => finish(error, stdout));
-    const stop = (message: string, code: string) => {
-      child.kill('SIGKILL');
-      finish(Object.assign(new Error(message), { code, killed: true, signal: 'SIGKILL' as const }), '');
-    };
-    const timer = setTimeout(() => stop(`${file} did not finish within ${timeout}ms`, 'ETIMEDOUT'), timeout);
-    const onAbort = () => stop(`${file} was aborted`, 'ABORT_ERR');
-    if (signal?.aborted) onAbort();
-    else signal?.addEventListener('abort', onAbort, { once: true });
-  });
 }
 
 /** A git probe that does not block the event loop; a failed probe reads as ''. */

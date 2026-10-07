@@ -37,7 +37,24 @@ export interface WaveCheckSpec {
   hostOnly?: string;
   /** Items behind a finding, read from the check's details (host-side banners only). */
   count(details: Record<string, any>): number;
+  /**
+   * The banner's parenthetical when the finding's details change it: `how` is the
+   * default from the resolution, `source` the one source the finding names.
+   */
+  bannerHow?(details: Record<string, any>, how: string, source?: string): string;
   run(engine: BrainEngine, scope: WaveScope): Promise<Check>;
+}
+
+/**
+ * #6188 (D7): what clears malformed fences, from a check's `auto_repair` detail: the next maintenance run while
+ * one is active and `fences.repair.enabled` is on, otherwise `gbrain repair fences` (whose preview prints the apply command).
+ */
+function fenceRepairHow(details: Record<string, any>, source?: string): string {
+  const preview = `preview with: gbrain repair fences${source ? ` --source ${source}` : ''}`;
+  const auto = details.auto_repair as { active?: boolean; enabled?: boolean } | undefined;
+  if (auto && auto.active === false) return `not repaired automatically (${auto.enabled === false ? 'fences.repair.enabled is false' : 'no maintenance run is active'}); ${preview}`;
+  const manual = Array.isArray(details.sources) ? details.sources.reduce((sum: number, c: { by_tier?: { manual?: number } }) => sum + Number(c.by_tier?.manual ?? 0), 0) : 0;
+  return `repaired automatically by the next maintenance run${manual ? `, except ${manual} that need a manual edit` : ''}; ${preview}`;
 }
 
 /** Checks that take one optional source id: run once brain-wide, or once per scoped source and merged. */
@@ -68,10 +85,74 @@ export const WAVE_CHECKS: readonly WaveCheckSpec[] = [
     run: async (engine, scope) => (await import('./checks/safe-index.ts')).safeIndexPendingCheck(engine, scope.sourceIds),
   },
   {
+    id: 'credential_projection_pending', resolution: 'operator', registration: 'wave',
+    count: d => Number(d.pages_pending ?? 0) + Number(d.kept_pages ?? 0),
+    impact: 'Some pages holding a private key are withheld from search until their credential-safe re-chunk completes',
+    instruction: 'Run `gbrain apply-migrations --yes --no-autopilot-install` on the brain host (no provider calls), then `gbrain embed --stale` when ready; re-import code pages without a recorded source path.',
+    run: async (engine, scope) => (await import('./checks/credential-projection.ts')).credentialProjectionPendingCheck(engine, scope.sourceIds),
+  },
+  {
     id: 'connector_checkpoints', resolution: 'repair', registration: 'wave',
     count: d => Number(d.count ?? 0),
     impact: 'Some connector checkpoint rows can no longer be loaded by any connector source',
     run: async engine => (await import('./checks/connector-checkpoints.ts')).checkConnectorCheckpoints(engine),
+  },
+  {
+    id: 'persistence_request_indexes', resolution: 'repair', registration: 'wave',
+    count: d => Number(d.count ?? 0),
+    impact: 'A managed sync request index is missing or INVALID, so sync checkpoints can time out on a large request table',
+    run: async engine => (await import('./checks/persistence-requests.ts')).requestIndexesCheck(engine),
+  },
+  {
+    id: 'persistence_request_growth', resolution: 'operator', registration: 'wave',
+    count: d => (d.scopes ?? []).filter((scope: { days_to_exhaustion?: number | null }) => scope.days_to_exhaustion != null && scope.days_to_exhaustion < 90).length,
+    impact: 'At its current admission rate a writer exhausts its lifetime request IDs within 90 days',
+    instruction: 'Raise the named limit with the `gbrain config set persistence.limits.<limit> <value>` command doctor prints, on the brain host (docs/guides/repair.md#request-growth).',
+    run: async engine => (await import('./checks/persistence-requests.ts')).requestGrowthCheck(engine),
+  },
+  {
+    id: 'connector_held_items', resolution: 'operator', registration: 'wave',
+    count: d => Number(d.held ?? 0),
+    impact: 'Some connector items are held after repeated failures and are not imported',
+    instruction: 'Inspect them with `gbrain sources status <source>`, fix the cause, then run `gbrain sources retry-held <source>` and `gbrain sync --source <source>` (docs/guides/repair.md#connector-held-items).',
+    run: async (engine, scope) => (await import('./checks/connector-holds.ts')).connectorHeldItemsCheck(engine, scope.sourceIds),
+  },
+  {
+    id: 'git_held_files', resolution: 'repair', registration: 'wave',
+    hostOnly: 'Held file paths are host-local; remote callers see held counts on sync results, get_page and search.',
+    count: d => Number(d.held ?? 0),
+    impact: 'Some Git source files are held instead of imported, so their pages are missing or keep an older revision',
+    bannerHow: (d, how, source) => !d.fences ? how : d.fences >= Number(d.held ?? 0) ? `fence holds: ${fenceRepairHow(d, source)}` : `${how}; fence holds: ${fenceRepairHow(d, source)}`,
+    run: async (engine, scope) => (await import('./checks/git-holds.ts')).gitHeldFilesCheck(engine, scope.sourceIds),
+  },
+  {
+    id: 'fence_integrity', resolution: 'repair', registration: 'doctor.ts',
+    count: d => Number(d.total ?? 0),
+    impact: 'Some facts or takes fences are malformed and wait for repair; none of them blocks a sync',
+    bannerHow: (d, _how, source) => fenceRepairHow(d, source),
+    run: async (engine, scope) => (await import('./checks/fence-integrity.ts')).fenceIntegrityCheck(engine, scope.sourceIds),
+  },
+  {
+    id: 'frontmatter_repairable', resolution: 'repair', registration: 'doctor.ts',
+    hostOnly: 'The scan reads source checkouts on the brain host, and the frontmatter repair rewrites files there (explicit-only).',
+    count: d => Number(d.repairable ?? 0),
+    impact: 'Some source files have frontmatter gbrain reads only by quoting or interpreting it',
+    run: async (engine, scope) => { const { frontmatterRepairableCheck } = await import('./checks/frontmatter-repairable.ts'); return perSource(scope, id => frontmatterRepairableCheck(engine, id)); },
+  },
+  {
+    id: 'frontmatter_hook', resolution: 'operator', registration: 'wave',
+    hostOnly: 'Pre-commit hooks live in the source checkouts on the brain host.',
+    count: d => Number(d.count ?? 0),
+    impact: 'An installed frontmatter pre-commit hook predates this release and checks working-tree files instead of staged content',
+    instruction: 'Refresh it on the brain host with `gbrain frontmatter install-hook --force` (add `--source <id>` for one source); only the gbrain hook script is rewritten.',
+    run: async (engine, scope) => (await import('./checks/frontmatter-hook.ts')).frontmatterHookCheck(engine, scope.sourceIds),
+  },
+  {
+    id: 'orphan_persistence_bindings', resolution: 'repair', registration: 'wave',
+    hostOnly: 'Bindings of removed sources are brain-wide persistence bookkeeping outside any source scope.',
+    count: d => Number(d.count ?? 0),
+    impact: 'Some persistence source bindings belong to a removed source or an earlier source incarnation',
+    run: async engine => (await import('./checks/orphan-bindings.ts')).checkOrphanBindings(engine),
   },
   {
     id: 'unbound_source', resolution: 'operator', registration: 'wave',
@@ -116,11 +197,59 @@ export const WAVE_CHECKS: readonly WaveCheckSpec[] = [
     run: async engine => (await import('./checks/self-capture.ts')).selfCaptureCheck(engine),
   },
   {
-    id: 'stale_embedding_effects', resolution: 'unsupported', registration: 'wave',
+    id: 'vector_plan', resolution: 'operator', registration: 'wave',
+    count: d => (d.outcome === 'index_unused' || d.outcome === 'legacy_guard' ? 1 : 0),
+    impact: 'Vector search on the active embedding column does not use its HNSW index, so vector candidates can time out and hybrid search falls back to keyword hits',
+    instruction: 'Upgrade gbrain on the brain host and rerun `gbrain doctor`; check the HNSW index state doctor reports; remove `search.vector_legacy_guard` / GBRAIN_VECTOR_LEGACY_GUARD unless it rolled back a regression, then restart the owning service (docs/guides/troubleshooting.md#hybrid-search-returns-only-keyword-hits).',
+    run: async engine => (await import('./checks/vector-plan.ts')).vectorPlanCheck(engine),
+  },
+  {
+    id: 'stale_embedding_effects', resolution: 'repair', registration: 'wave',
     count: d => Number(d.stale_effects ?? 0),
-    impact: 'A committed write still has a queued embedding effect that no command can clear yet',
-    instruction: 'Inspect it with `gbrain sources writer status <source> --json`; inspection cannot clear it (see docs/guides/repair.md#stale-queued-embedding-effects).',
+    impact: 'A committed write still has a stale queued or failed embedding effect that blocks compaction and activation',
     run: async (engine, scope) => (await import('./checks/stale-embedding-effects.ts')).staleEmbeddingEffectsCheck(engine, scope.sourceIds),
+  },
+  {
+    id: 'google_file_modes', resolution: 'repair', registration: 'wave',
+    hostOnly: 'File permissions and directory paths on the brain host are host-local filesystem state.',
+    count: d => Number(d.count ?? 0),
+    impact: 'Some files gbrain wrote under a Google source directory outside ~/.gbrain are readable by other local users',
+    run: async (engine, scope) => (await import('./checks/google-file-modes.ts')).checkGoogleFileModes(engine, scope.sourceIds),
+  },
+  {
+    id: 'atom_provenance_drift', resolution: 'repair', registration: 'doctor.ts',
+    hostOnly: 'Retiring stale atoms is a host-side, explicit-only repair.',
+    count: d => Number(d.drifted ?? 0),
+    impact: 'Some atoms reference a source page that is gone or was edited, and still surface in search with a quote no current page contains',
+    run: async engine => (await import('./checks/extraction-sync.ts')).computeAtomProvenanceDriftCheck(engine),
+  },
+  {
+    id: 'extractor_facts_expired', resolution: 'repair', registration: 'wave',
+    hostOnly: 'Restoring expired extractor facts is a host-side, explicit-only repair.',
+    count: d => Number(d.evidenced ?? 0) + Number(d.ambiguous ?? 0),
+    impact: 'Some conversation-extractor facts were expired by the pre-v0.60.11.0 canonical projection and recall no longer returns them',
+    run: async (engine, scope) => (await import('./checks/extractor-facts.ts')).extractorFactsCheck(engine, scope.sourceIds),
+  },
+  {
+    id: 'captured_facts_active', resolution: 'repair', registration: 'wave',
+    hostOnly: 'Classifying captured facts reads harness transcripts and the session corpus on the brain host; the repair is explicit-only.',
+    count: d => Number(d.evidenced ?? 0) + Number(d.ambiguous ?? 0),
+    impact: 'Some active facts were captured from gbrain\'s own model sessions or from pasted text before v0.60.30.0',
+    run: async (engine, scope) => (await import('./checks/captured-facts.ts')).capturedFactsCheck(engine, scope.sourceIds),
+  },
+  {
+    id: 'loop_facts_drift', resolution: 'repair', registration: 'wave',
+    hostOnly: 'Retiring closed-loop commitment facts is a host-side, explicit-only repair.',
+    count: d => Number(d.drifted ?? 0),
+    impact: 'Some closed commitment loops still have an active commitment fact, so recall keeps the finished promise',
+    run: async (engine, scope) => (await import('./checks/loop-facts.ts')).loopFactsDriftCheck(engine, scope.sourceIds),
+  },
+  {
+    id: 'ontology_facts_fenced', resolution: 'repair', registration: 'wave',
+    hostOnly: 'Restoring fenced ontology observations is a host-side, explicit-only repair.',
+    count: d => Number(d.fenced ?? 0) + Number(d.retired ?? 0),
+    impact: 'Some ontology observations were moved onto an entity page\'s Facts table, and ontology_get no longer returns the ones a later page write retired',
+    run: async (engine, scope) => (await import('./checks/ontology-facts.ts')).ontologyFactsCheck(engine, scope.sourceIds),
   },
 ];
 
@@ -146,6 +275,12 @@ export async function runWaveChecks(engine: BrainEngine, opts: WaveScope & { onl
     findings.push({ spec, check, state: checkHealthUnknown(check) ? 'unknown' : check.status === 'ok' ? 'ok' : 'finding' });
   }
   return findings;
+}
+
+/** The one source a finding names (`details.source_ids` of length 1), so its repair command can say `--source <id>`. */
+export function findingSource(finding: Pick<WaveFinding, 'check'>): string | undefined {
+  const ids = finding.check.details?.source_ids;
+  return Array.isArray(ids) && ids.length === 1 && typeof ids[0] === 'string' ? ids[0] : undefined;
 }
 
 /** The repair kind that clears a wave finding, when its resolution is `repair`. */

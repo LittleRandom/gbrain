@@ -9,6 +9,7 @@ import { expect } from 'bun:test';
 import type { BrainEngine } from '../../src/core/engine.ts';
 import { doctorReportRemote } from '../../src/commands/doctor.ts';
 import { remediationExitStatus, runRemediate, runRemediationPlan } from '../../src/commands/doctor/remediate.ts';
+import { approvedRemediateArgs } from './remediate-approval.ts';
 import { REMOTE_HOST_ACTION, remoteWaveHandoff } from '../../src/commands/doctor/wave-checks.ts';
 import { currentExitCode, setCliExitVerdict } from '../../src/core/cli-force-exit.ts';
 import { configureGateway, resetGateway } from '../../src/core/ai/gateway.ts';
@@ -31,7 +32,8 @@ export async function capture(run: () => Promise<void>): Promise<{ out: string; 
 }
 
 const json = async (engine: BrainEngine, args: string[], fn = runRemediate) => {
-  const result = await capture(() => fn(engine, args));
+  const approved = fn === runRemediate ? await approvedRemediateArgs(engine, args) : args;
+  const result = await capture(() => fn(engine, approved));
   return { ...result, body: JSON.parse(result.out) };
 };
 
@@ -123,8 +125,9 @@ export async function scriptedRecoveryRun(databaseUrl?: string): Promise<{ wall_
     expect(byId.writer_version).toMatchObject({ class: 'operator_required' });
     expect(byId.writer_version.instruction).toContain('gbrain upgrade');
     expect(byId.writer_version.message).toContain('0.60.4.0');
-    expect(byId.stale_embedding_effects).toMatchObject({ class: 'unsupported' });
-    expect(byId.stale_embedding_effects.message).toContain('inspection cannot clear it');
+    // #5629: repairable now; with no embedding model configured the repair can only report it blocked, so the operator acts first.
+    expect(byId.stale_embedding_effects).toMatchObject({ class: 'operator_required', repair_kind: 'embedding-effects' });
+    expect(byId.stale_embedding_effects.instruction).toContain('gbrain repair embedding-effects');
     expect(run.body.repairs_completed).toBe(3);
     expect(run.body.healthy).toBe(false);
     expect(run.body.exit_status).toBe(0);

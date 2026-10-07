@@ -12,6 +12,7 @@ import { submitPageMutation } from '../src/core/persistence/page-mutations.ts';
 import { grandfatherCanonicalPage } from '../src/core/persistence/grandfather.ts';
 import { disposePersistenceConsumer } from '../src/core/persistence/service.ts';
 import { withCoordinatedWrite } from '../src/core/persistence/context.ts';
+import { TEST_WRITE_ATTRIBUTION } from './helpers/write-attribution.ts';
 import { runPersistenceEffects } from '../src/core/persistence/effects.ts';
 import { declarePersistenceProtocol } from '../src/core/persistence/protocol.ts';
 import { serializePageToMarkdown } from '../src/core/markdown.ts';
@@ -20,6 +21,8 @@ import { isolatedSharedSkillsEngine } from './helpers/shared-skills-engine.ts';
 import { withEnv } from './helpers/with-env.ts';
 import { durableGitRepo, git } from './helpers/git-publication.ts';
 import { localHostId } from '../src/core/persistence/identity.ts';
+import { resolveRepairScope, runRepair } from '../src/core/repair/core.ts';
+import { visibilityRepair } from '../src/core/repair/visibility.ts';
 
 type FixtureOptions = { databaseUrl?: string; setup?: (f: { engine: BrainEngine; root: string }) => Promise<void> };
 async function fixture(run: (f: { engine: BrainEngine; ctx: OperationContext; home: string; root: string; slug: string }) => Promise<void>,
@@ -53,7 +56,7 @@ async function preservesManagedPage(databaseUrl?: string) {
       await tx.executeRaw("UPDATE content_chunks SET embedding=('['||array_to_string(array_fill(0.1::real,ARRAY[$1::int]),',')||']')::vector WHERE page_id=$2", [column.width, before.page.id]);
       await tx.executeRaw('INSERT INTO extract_atoms_page_state(source_incarnation,page_id,content_hash,fail_count,tombstoned) VALUES($1::uuid,$2,$3,2,true)',
         [before.sourceIncarnation, before.page.id, before.page.content_hash]);
-    }));
+    }, TEST_WRITE_ATTRIBUTION));
     const chunks = await engine.executeRaw('SELECT id,chunk_text,embedding::text FROM content_chunks WHERE page_id=$1 ORDER BY id', [before.page.id]);
     expect(chunks.length).toBeGreaterThan(0);
     const result = await phaseCGrandfather(engine, { yes: true, dryRun: false, noAutopilotInstall: true });
@@ -138,7 +141,7 @@ test('archived sources and non-Markdown artifacts are not rewritten by managed g
   await engine.transaction(async tx => {
     await tx.executeRaw("SELECT set_config('gbrain.topology_change','on',true)");
     await tx.executeRaw("UPDATE sources SET archived=false WHERE id='default'");
-    await withCoordinatedWrite(tx, ['default'], () => tx.executeRaw("UPDATE pages SET source_path='source/example.ts' WHERE slug=$1", [slug]));
+    await withCoordinatedWrite(tx, ['default'], () => tx.executeRaw("UPDATE pages SET source_path='source/example.ts' WHERE slug=$1", [slug]), TEST_WRITE_ATTRIBUTION);
   });
   expect((await phaseCGrandfather(engine, { yes: true, dryRun: false, noAutopilotInstall: true })).detail).toMatchObject({ touched: 0, skipped: 1, failed: 0 });
   expect(readFileSync(path, 'utf8')).toBe(bytes);
@@ -228,6 +231,37 @@ test('the missing-file guard still refuses outside declared db_only dirs', () =>
   await expect(replacePage(ctx, slug, 'Replacement body.')).rejects.toMatchObject({ code: 'source_changed' });
 }, { setup: dbOnlySource(declaring('conversations/')) }), 120_000);
 
+// Derive-phase output (atoms/, concepts/, ...) is database-only by design and never
+// declared in gbrain.yml; extraction writes it before persistence activation.
+const ATOM_SLUG = 'atoms/2026-09-02/probe-atom';
+const derivedSource = async ({ engine, root }: { engine: BrainEngine; root: string }) => {
+  writeFileSync(join(root, 'gbrain.yml'), 'storage:\n  db_tracked:\n    - notes/\n');
+  durableGitRepo(root, ['gbrain.yml']);
+  await importFromContent(engine, ATOM_SLUG, '---\ntype: atom\ntitle: Probe atom\nsource_slug: notes/example\n---\n\nAn atom derived from a public note.\n', { sourceId: 'default', noEmbed: true });
+};
+
+test('managed writes publish a never-filed derive-phase page database-only without declaring its dir', () => fixture(async ({ engine, ctx, root }) => {
+  expect((await engine.readPageSnapshot(ATOM_SLUG, { sourceId: 'default' }))?.page.source_path).toBeNull();
+  expect(await replacePage(ctx, ATOM_SLUG, 'A revised atom.')).toMatchObject({ write_through: { written: false, skipped: 'db_only' } });
+  expect((await engine.getPage(ATOM_SLUG, { sourceId: 'default' }))?.compiled_truth).toContain('A revised atom.');
+  expect(existsSync(join(root, 'atoms'))).toBe(false);
+  expect((await settledGitEffects(engine, ctx)).filter(effect => effect.slug === ATOM_SLUG)).toEqual([]);
+}, { setup: derivedSource }), 120_000);
+
+test('the visibility repair stamps an undeclared database-only atom on a managed brain', () => fixture(async ({ engine, ctx }) => {
+  expect((await engine.getPage(ATOM_SLUG, { sourceId: 'default' }))?.frontmatter.visibility).toBeUndefined();
+  await runRepair(ctx, visibilityRepair, await resolveRepairScope(engine), { apply: true });
+  expect((await engine.getPage(ATOM_SLUG, { sourceId: 'default' }))?.frontmatter.visibility).toBe('world');
+}, { setup: derivedSource }), 120_000);
+
+test('a derive-phase page whose recorded file went missing still refuses', () => fixture(async ({ ctx, root }) => {
+  const slug = 'atoms/filed-atom';
+  expect(await submitPageMutation(ctx, { operation: 'put_page', params: { slug, request_id: randomUUID(),
+    content: '---\ntype: atom\ntitle: Filed atom\n---\n\nFiled body.\n' } })).toMatchObject({ state: 'committed', write_through: { written: true } });
+  rmSync(join(root, `${slug}.md`));
+  await expect(replacePage(ctx, slug, 'Replacement body.')).rejects.toMatchObject({ code: 'source_changed' });
+}, { setup: derivedSource }), 120_000);
+
 const invalidStorage: Array<[string, string]> = [
   ['overlapping tiers', 'storage:\n  db_tracked:\n    - conversations/\n  db_only:\n    - conversations/\n'],
   ['flow-style db_only', 'storage:\n  db_only: [conversations/]\n'],
@@ -269,6 +303,6 @@ test('verify reports a managed page rewritten after grandfathering without faili
   const { detail } = await phaseCGrandfather(engine, { yes: true, dryRun: false, noAutopilotInstall: true });
   expect(await phaseDVerify(engine, detail.grandfathered)).toMatchObject({ status: 'complete', detail: 'verified=1 rewritten_concurrently=0' });
   await engine.transaction(tx => withCoordinatedWrite(tx, ['default'], () =>
-    tx.executeRaw("UPDATE pages SET frontmatter=frontmatter-'validate' WHERE source_id='default' AND slug=$1", [slug])));
+    tx.executeRaw("UPDATE pages SET frontmatter=frontmatter-'validate' WHERE source_id='default' AND slug=$1", [slug]), TEST_WRITE_ATTRIBUTION));
   expect(await phaseDVerify(engine, detail.grandfathered)).toMatchObject({ status: 'complete', detail: 'verified=0 rewritten_concurrently=1' });
 }), 120_000);

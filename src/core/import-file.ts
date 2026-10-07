@@ -1,5 +1,7 @@
 import { assertUnmanagedCanonicalWriter } from './persistence/maintenance.ts';
-import { assertImportBase, sameCanonicalImport } from './page-state/import-guard.ts';
+import { suffixedFrontmatterSlugHold } from './persistence/suffixed-slug.ts';
+import { maintenanceTransaction } from './persistence/attribution.ts';
+import { assertImportBase, sameCanonicalImport, sameContentAnyKeyOrder } from './page-state/import-guard.ts';
 import { stabilizeSafetyAssessments } from './persistence/reconcile-safety.ts';
 import { decideImportIdentity, collidingSlugOwner, fileOriginUri } from './import-identity.ts';
 import { readSourceFileSync } from './minions/source-filesystem.ts';
@@ -7,7 +9,11 @@ import { readFileSync, statSync, lstatSync } from 'fs';
 import { basename, extname, resolve } from 'path';
 import { createHash } from 'crypto';
 import type { BrainEngine, FileSpec } from './engine.ts';
-import { parseMarkdown } from './markdown.ts';
+import { classifyImportHold, parseMarkdown, resolveParsedSubtype, type ParseOpts, type ParsedMarkdown } from './markdown.ts';
+import { assessImportSanity, loadImportSanityConfig, MAX_FILE_SIZE, screenImportContent, type ContentRefusal, type FenceScreen } from './import-screen.ts';
+import { applyImportFences } from './fence-repair/import-step.ts';
+import type { FenceIssueWire } from './fence-repair/tier1.ts';
+import type { FenceFix } from './fence-repair/types.ts';
 import { classifyStoredType } from './schema-pack/type-usage.ts';
 import { prepareMarkdownChunks } from './markdown-chunks.ts';
 import { prepareCodeChunks, installCodeChunkEdges } from './code-chunks.ts';
@@ -15,11 +21,10 @@ import { detectCodeLanguage, CHUNKER_VERSION } from './chunkers/code.ts';
 import { sanitizeRemoteBody } from './remote-body.ts';
 import { installPageEmbeddings, installPageProjection, preparePageProjection, projectionBelowSafeFence, queuePageProjection, readProjectionSnapshot, resealSafeChunks,
   sealPageTextProjection, stampEmbeddingInputs, embeddingWriteTarget, embeddingInputContext, type ProjectionSnapshot } from './page-state/projections.ts';
-import { embeddingInputHash } from './embedding-input-hash.ts';
 import { sanitizeText } from './batch-rows.ts';
 import { hasProtectedBody, safeChunksFilter } from './search/safe-chunks.ts';
 import { findChunkForOffset } from './chunkers/edge-extractor.ts';
-import { planEmbeddingReuse } from './embed-reuse.ts';
+import { canReuseMarkdownVector, planEmbeddingReuse } from './embed-reuse.ts';
 import { extractCodeRefs, imageOfCandidates } from './link-extraction.ts';
 import { embedMultimodal, currentEmbeddingSignature } from './embedding.ts';
 // #3374 — import-path embeds ride the shared retry loop (429 retry-after +
@@ -30,27 +35,27 @@ import { embedBatchKeepingUsable, embedBatchWithBackoff } from './embed-retry.ts
 import { isEmbeddingZeroNormError, type EmbeddingZeroNormError } from './ai/embedding-guard.ts';
 import { slugifyPath, slugifyCodePath, isCodeFilePath, hasMalformedPathSegment } from './sync.ts';
 import type { ChunkInput, Page, PageInput, PageType } from './types.ts';
+import type { PageSnapshot } from './page-state/types.ts';
 import { computeEffectiveDate, fallbackCreatedAt, isValidTimeZone } from './effective-date.ts';
 import { MARKDOWN_CHUNKER_VERSION } from './chunkers/recursive.ts';
 import { logSlugFallback } from './audit-slug-fallback.ts';
-import { assessContentSanity, ContentSanityBlockError } from './content-sanity.ts';
-import { loadOperatorLiterals } from './content-sanity-literals.ts';
+import { ContentSanityBlockError } from './content-sanity.ts';
 import { logContentSanityAssessment } from './audit/content-sanity-audit.ts';
-import { buildEmbedSkipMarker, EMBED_SKIP_KEY } from './embed-skip.ts';
+import { buildEmbedSkipMarker, EMBED_SKIP_KEY, isEmbedSkipped } from './embed-skip.ts';
 import {
   QUARANTINE_KEY,
   CONTENT_FLAG_KEY,
   buildQuarantineMarker,
   buildContentFlagMarker,
 } from './quarantine.ts';
-import { loadConfig, loadConfigWithEngine } from './config.ts';
 import {
   buildContextualPrefix,
   modeRequiresSynopsis,
   modeRequiresWrapper,
   wrapChunkForEmbedding,
 } from './embedding-context.ts';
-import { normalizeAliasList } from './search/alias-normalize.ts';
+import { writePageAliases } from './mentions/pass.ts';
+import { readMentionPolicy } from './mentions/policy.ts';
 import { warnOncePerProcess, validateSlug, contentHash, contentHashLegacy, ATOMS_SCAN_HASH_KEY } from './utils.ts';
 import { decorateEmbeddingDimError } from './embedding-dim-check.ts';
 import { resolveImportContextualMode } from './import-contextual-mode.ts';
@@ -147,9 +152,10 @@ export interface ImportResult {
    * in its malformed summary and keeps them OUT of failedFiles / the failure
    * ledger so they can never gate bookmark advancement. 'slug_collision' =
    * another live file already owns this slug (see importFromContent); the
-   * skip repeats until one file is renamed.
+   * skip repeats until one file is renamed. #5988: a content refusal carries
+   * its hold code (with `refusal`); sync holds it, other callers fail it.
    */
-  skip_reason?: 'malformed_path' | 'slug_collision';
+  skip_reason?: 'malformed_path' | 'slug_collision' | ContentRefusal['code'];
   /**
    * Advisory (schema.type_warnings): the page's explicit frontmatter `type:`
    * is an alias of a canonical pack type or undeclared in the pack. The type
@@ -160,16 +166,20 @@ export interface ImportResult {
   /** True when the text committed but the embedding provider failed; the
    *  chunks carry NULL vectors until the stale sweep embeds them. */
   embedding_deferred?: boolean;
+  /** #5988: the typed content refusal behind `error`, for callers that refuse with its code. */
+  refusal?: ContentRefusal;
+  /** #5988: the file imported only after quoting unreadable frontmatter values, or carries a `#`-comment value. */
+  frontmatter_recovery?: { quoted: boolean; comment_value: boolean };
+  /** #6188: Tier 1 rewrote a fence (the stored body and hash are normalized); `fence_issues`: a lenient import stored a residual fence as written. */
+  fences_normalized?: FenceFix[];
+  fence_issues?: FenceIssueWire[];
 }
 
-export const MAX_FILE_SIZE = 5_000_000; // 5MB
+export { MAX_FILE_SIZE };
 
-function invalidYamlFrontmatterError(parsed: ReturnType<typeof parseMarkdown>): string | null {
-  const yamlError = parsed.errors?.find((error) => error.code === 'YAML_PARSE');
-  if (!yamlError) return null;
-  const detail = yamlError.message.replace(/^YAML parse failed:\s*/, '').trim();
-  return `Invalid YAML frontmatter: ${detail}. Quote scalar values that contain ": " or fix the frontmatter block.`;
-}
+/** #5988: the slug-conflict hold text: the path and its derived slug, never the declared frontmatter value. */
+export const slugConflictHoldMessage = (relativePath: string, expectedSlug: string): string =>
+  `The frontmatter slug of ${relativePath} does not match its path-derived slug "${expectedSlug}". Remove the frontmatter "slug:" line or move the file.`;
 
 /**
  * #4588: refresh `pages.source_path` on the import SKIP path. A row whose slug
@@ -201,6 +211,14 @@ async function refreshSourcePath(engine: BrainEngine, slug: string, sourceId: st
   } catch { /* bookkeeping only — never fail the import over it */ }
 }
 
+/** #6188 (E8): `importFromContent`'s fence options. */
+interface ImportFenceOptions {
+  /** A residual fence refuses typed (`coordinated`) or is stored with a warning (`lenient`, default); a fixable one is normalized. */
+  fences?: 'coordinated' | 'lenient';
+  /** The caller's fence verdict for these exact bytes, `fences.normalize` settled (null: the fences compile); skips a second scan. */
+  fenceScreen?: FenceScreen | null;
+}
+
 /**
  * Import content from a string. Core pipeline:
  * parse -> hash -> transaction(version + putPage + tags + chunks + beforeCommit).
@@ -222,6 +240,8 @@ export async function importFromContent(
   opts: {
     /** Coordinator seam: prepare without publishing, then commit under its guarded transaction. */
     prepare?: (prepared: import('./persistence/prepared-import.ts').PreparedContentImport) => Promise<ImportResult>;
+    /** #5984, with `prepare`: the coordinator proves the base revision under its page guard, and the caller seals the text projection and checks the read-back (`contentHash`) from its own read after apply; apply skips all three. */
+    coordinated?: boolean;
     /** Internal canonical metadata, after protected-body overlays and before hashing. */
     prepareFrontmatter?: (page: ParsedPage) => void;
     noEmbed?: boolean;
@@ -264,7 +284,7 @@ export async function importFromContent(
      * Callers thread this from `loadActivePack(ctx)` once per command —
      * NEVER per file inside sync (codex perf finding #7).
      */
-    activePack?: { page_types: ReadonlyArray<{ name: string; path_prefixes: ReadonlyArray<string>; aliases?: ReadonlyArray<string> }> };
+    activePack?: ParseOpts['activePack'];
     /**
      * v0.39.3.0 provenance write-through (WARN-8). When set, threaded to
      * `tx.putPage` so the page's `source_kind`, `source_uri`,
@@ -303,7 +323,7 @@ export async function importFromContent(
     allowEmptyOverwrite?: boolean;
     beforeCommit?: (tx: BrainEngine, slug: string) => Promise<void>;
     onPostCommitEmbedding?: (complete: () => Promise<ImportEmbeddingResult>) => void;
-  } = {},
+  } & ImportFenceOptions = {},
 ): Promise<ImportResult> {
   // Normalize BEFORE any tx write: putPage lowercases via validateSlug but
   // upsertChunks used to query by the caller's raw slug, so a mixed-case slug
@@ -320,23 +340,11 @@ export async function importFromContent(
   // Reject oversized payloads before any parsing, chunking, or embedding happens.
   // Uses Buffer.byteLength to count UTF-8 bytes the same way disk size would,
   // so the network path behaves identically to the file path.
-  const byteLength = Buffer.byteLength(content, 'utf-8');
-  if (byteLength > MAX_FILE_SIZE) {
-    return {
-      slug,
-      status: 'skipped',
-      chunks: 0,
-      error: `Content too large (${byteLength} bytes, max ${MAX_FILE_SIZE}). Split the content into smaller files or remove large embedded assets.`,
-    };
+  const screen = screenImportContent({ content, path: slug + '.md', ...(opts.activePack ? { activePack: opts.activePack } : {}), ...(opts.fenceScreen === undefined ? { fences: opts.fences ?? 'lenient' } : {}) });
+  if (screen.status === 'refused') {
+    return { slug, status: screen.refusal.code === 'file_too_large' ? 'skipped' : 'error', chunks: 0, error: screen.refusal.message, refusal: screen.refusal, skip_reason: screen.refusal.code };
   }
-  const parsed = parseMarkdown(content, slug + '.md', {
-    validate: true,
-    ...(opts.activePack ? { activePack: opts.activePack } : {}),
-  });
-  const frontmatterError = invalidYamlFrontmatterError(parsed);
-  if (frontmatterError) {
-    return { slug, status: 'error', chunks: 0, error: frontmatterError };
-  }
+  const parsed = (screen as { parsed: ParsedMarkdown }).parsed;
   if (!opts.prepare) await assertUnmanagedCanonicalWriter(engine, 'direct content import');
   // Canonicalize only free-prose fields before protected-fence parsing, hidden
   // row merging, hashing and indexing. Frontmatter identities stay untouched.
@@ -417,52 +425,16 @@ export async function importFromContent(
   let pageFlagged = false;
   let pageFlagReason: 'markup_heavy' | 'oversized' | undefined;
   {
-    const baseCfg = loadConfig();
-    let effectiveCfg = baseCfg;
-    try {
-      // loadConfigWithEngine merges DB-plane content_sanity.* on top
-      // of file/env. Wrapped in try/catch so a transient engine error
-      // doesn't kill the import — the gate falls back to file/env
-      // values (which include defaults via the assessor itself).
-      effectiveCfg = await loadConfigWithEngine(engine, baseCfg);
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      process.stderr.write(`[gbrain] content-sanity: DB config lift failed (${msg}); falling back to file/env\n`);
-    }
-    const cs = effectiveCfg?.content_sanity ?? {};
-    // GBRAIN_NO_SANITY=1 fast-path: loadConfig() returns null when
-    // there's no `~/.gbrain/config.json` AND no DATABASE_URL env var
-    // (e.g., fresh PGLite-only setups, hermetic tests). The merged
-    // content_sanity block never carries `disabled` in that case. Read
-    // the kill-switch env directly so it works regardless of whether
-    // any other config plumbing fired. Same direct-env-check pattern
-    // applies to the patterns_enabled flip below.
-    const sanityDisabled =
-      cs.disabled === true || process.env.GBRAIN_NO_SANITY === '1';
-    const extra_literals =
-      cs.junk_patterns_enabled !== false && !sanityDisabled ? loadOperatorLiterals() : [];
+    const sanityCfg = await loadImportSanityConfig(engine);
+    const sanityDisabled = sanityCfg.disabled;
     // Disposition for the high-confidence junk path: quarantine (hide) by
     // default, or reject (throw → sync-failure) when the operator opts in.
-    const junkDisposition: 'quarantine' | 'reject' =
-      cs.junk_disposition === 'reject' ? 'reject' : 'quarantine';
-    const sanityResult = assessContentSanity({
-      compiled_truth: parsed.compiled_truth,
-      timeline: parsed.timeline ?? '',
-      title: parsed.title,
-      bytes_warn: cs.bytes_warn,
-      bytes_block: cs.bytes_block,
-      max_markup_ratio: cs.max_markup_ratio,
-      prose_check_enabled: cs.prose_check_enabled,
-      page_kind: parsed.type,
-      extra_literals,
-      // #4702 `content_sanity.disabled_patterns`: turn off individual
-      // built-in junk patterns without junk_patterns_enabled (all patterns)
-      // or the kill-switch (which also drops the size gates). Defensive
-      // Array.isArray: the file plane is hand-edited JSON.
-      disabled_patterns: Array.isArray(cs.disabled_patterns)
-        ? cs.disabled_patterns
-        : undefined,
-    });
+    const junkDisposition = sanityCfg.junkDisposition;
+    const sanityResult = assessImportSanity(parsed, sanityCfg);
+    if (!sanityDisabled && !sanityResult.shouldQuarantine && sanityResult.flag_reason !== 'oversized' && (parsed.frontmatter[EMBED_SKIP_KEY] as { reason?: unknown } | undefined)?.reason === 'oversized') {
+      delete parsed.frontmatter[EMBED_SKIP_KEY];
+      if ((parsed.frontmatter[CONTENT_FLAG_KEY] as { reason?: unknown } | undefined)?.reason === 'oversized') delete parsed.frontmatter[CONTENT_FLAG_KEY];
+    }
 
     if (sanityDisabled) {
       // Kill-switch active: loud stderr per offending ingest. Operator
@@ -615,6 +587,9 @@ export async function importFromContent(
   // write-back arrives missing those rows as well. Each column merges
   // against its own existing counterpart (fences don't migrate between
   // columns here; splitBody keeps them where the caller wrote them).
+  // #6188 (E7): Tier 1 in place before the hidden-row merge and withdrawal preservation; the hash covers the normalized body.
+  const fences = await applyImportFences({ engine, sourceId: sourceId ?? 'default', slug, mode: opts.fences ?? 'lenient', screened: opts.fenceScreen, screen, parsed, activePack: opts.activePack, remote: opts.remote === true, existing });
+  if (fences.refused) return fences.refused;
   if (opts.remote === true && existing) {
     parsed.compiled_truth = mergeHiddenFactRowsIntoBody(slug, parsed.compiled_truth, existing.compiled_truth);
     parsed.timeline = mergeHiddenFactRowsIntoBody(slug, parsed.timeline, existing.timeline);
@@ -631,7 +606,7 @@ export async function importFromContent(
   if (parsed.typeExplicit !== true && existing) {
     parsed.type = existing.type;
   }
-
+  resolveParsedSubtype(parsed, existing);
   // Alias-footgun visibility: an explicit frontmatter `type:` that is an
   // ALIAS of a canonical pack type (or entirely undeclared) is stored
   // literally and never re-normalized — different agents can silently file
@@ -679,50 +654,53 @@ export async function importFromContent(
 
   const originUri = fileOriginUri(existing?.source_uri, opts.sourceRoot, opts.sourcePath);
   const persistUnchanged = async (refreshBody = false) => {
-    await engine.transaction(async tx => {
+    await maintenanceTransaction(engine, async tx => {
       await assertImportBase(tx, slug, sourceId ?? 'default', existing);
       if (refreshBody) await tx.refreshPageBody(slug, sourceId ?? 'default', parsed.compiled_truth, parsed.timeline || '', hash);
       await refreshSourcePath(tx, slug, sourceId, opts.sourcePath, existing, originUri);
-      if (opts.beforeCommit) await verifyPageReadable(tx, slug, hash, sourceId, 'importFromContent');
+      if (opts.beforeCommit) await verifyPageReadable(tx, slug, refreshBody ? hash : existing?.content_hash ?? hash, sourceId, 'importFromContent');
       await opts.beforeCommit?.(tx, slug);
     });
   };
 
   // Rebuild stale projections without granting --force-rechunk's external-ID dedup override.
   const needsProjectionRebuild = !opts.prepare && existing && existing.text_projection_revision !== existing.knowledge_revision;
-  if (existing?.content_hash === hash && !existing.deleted_at && !opts.forceRechunk && !needsProjectionRebuild && (!opts.prepare || sameCanonicalImport(existingSnapshot, parsedPage))) {
-    // #5050: unchanged content chunked before the safe-chunk fence is re-sealed
-    // projection-only; the canonical write stays a no-op.
-    const reseal = await projectionBelowSafeFence(engine, existing.id);
-    if (opts.prepare) {
-      const result: ImportResult = { slug, status: 'skipped', chunks: 0, parsedPage, ...(typeWarning ? { type_warning: typeWarning } : {}) };
-      return opts.prepare({ slug, parsedPage, observedRevision: (existing as typeof existing & { knowledge_revision?: string }).knowledge_revision ?? null,
-        noop: true, result, validate: async () => {},
-        apply: async tx => { if (reseal) await queuePageProjection(tx, sourceId ?? 'default', slug, 'safe_chunk_reseal'); } });
-    }
-    await persistUnchanged();
-    const resealed = reseal ? await resealSafeChunks(engine, slug, sourceId ?? 'default') : null;
-    return { slug, status: 'skipped', chunks: 0, parsedPage, ...(typeWarning ? { type_warning: typeWarning } : {}), ...(resealed ? { resealed } : {}) };
-  }
-
+  const embedSkipChanged = !!existing && isEmbedSkipped(existing.frontmatter) !== isEmbedSkipped(parsed.frontmatter);
   // #3694 one-time reconcile: a row written by the PRE-fix putPage formula
   // carries the legacy hash. When the parsed file matches that legacy hash,
   // the content is unchanged — stamp the canonical hash via the narrow
   // refreshPageBody UPDATE (no chunk churn, no re-embed, no version snapshot)
-  // and skip. The next import then hits the fast path above.
-  if (existing && !existing.deleted_at && !opts.prepare && !opts.forceRechunk && !needsProjectionRebuild && typeof engine.refreshPageBody === 'function') {
-    const legacyHash = contentHashLegacy({
+  // and skip. The next import then hits the fast path below.
+  const legacyHashMatch = !!existing && !existing.deleted_at && !opts.prepare && !opts.forceRechunk && !needsProjectionRebuild && !embedSkipChanged
+    && typeof engine.refreshPageBody === 'function' && existing.content_hash === contentHashLegacy({
       title: parsed.title,
       type: parsed.type,
       compiled_truth: parsed.compiled_truth,
       timeline: parsed.timeline,
       frontmatter: parsed.frontmatter,
     });
-    if (existing.content_hash === legacyHash) {
-      await persistUnchanged(true);
-      const resealed = await projectionBelowSafeFence(engine, existing.id) ? await resealSafeChunks(engine, slug, sourceId ?? 'default') : null;
-      return { slug, status: 'skipped', chunks: 0, parsedPage, ...(typeWarning ? { type_warning: typeWarning } : {}), ...(resealed ? { resealed } : {}) };
+  const unchanged = !!existing && !existing.deleted_at && !opts.forceRechunk && !needsProjectionRebuild && !embedSkipChanged && (existing.content_hash === hash
+    ? !opts.prepare || sameCanonicalImport(existingSnapshot, parsedPage)
+    : !legacyHashMatch && await sameContentAnyKeyOrder(engine, existing, existingSnapshot?.tags ?? null, parsedPage, sourceId ?? 'default'));
+  if (existing && unchanged) {
+    // #5050: unchanged content chunked before the safe-chunk fence is re-sealed
+    // projection-only; the canonical write stays a no-op.
+    const reseal = await projectionBelowSafeFence(engine, existing.id);
+    if (opts.prepare) {
+      const result: ImportResult = { slug, status: 'skipped', chunks: 0, parsedPage, ...(typeWarning ? { type_warning: typeWarning } : {}), ...fences.fields };
+      return opts.prepare({ slug, parsedPage, observedRevision: (existing as typeof existing & { knowledge_revision?: string }).knowledge_revision ?? null,
+        noop: true, result, validate: async () => {},
+        apply: async tx => { if (reseal) await queuePageProjection(tx, sourceId ?? 'default', slug, 'safe_chunk_reseal'); } });
     }
+    await persistUnchanged();
+    const resealed = reseal ? await resealSafeChunks(engine, slug, sourceId ?? 'default') : null;
+    return { slug, status: 'skipped', chunks: 0, parsedPage, ...(typeWarning ? { type_warning: typeWarning } : {}), ...(resealed ? { resealed } : {}), ...fences.fields };
+  }
+
+  if (existing && legacyHashMatch) {
+    await persistUnchanged(true);
+    const resealed = await projectionBelowSafeFence(engine, existing.id) ? await resealSafeChunks(engine, slug, sourceId ?? 'default') : null;
+    return { slug, status: 'skipped', chunks: 0, parsedPage, ...(typeWarning ? { type_warning: typeWarning } : {}), ...(resealed ? { resealed } : {}), ...fences.fields };
   }
 
   // Identity dedup (#1309): move, skip a true duplicate, or index both.
@@ -734,7 +712,7 @@ export async function importFromContent(
     body: { title: parsed.title, compiled_truth: parsed.compiled_truth, timeline: parsed.timeline || '' },
   });
   if (identity.kind === 'move' && !existing && !opts.prepare
-    && await engine.updateSlug(identity.dupSlug, slug, { sourceId: sourceId ?? 'default' }) > 0) {
+    && await maintenanceTransaction(engine, tx => tx.updateSlug(identity.dupSlug, slug, { sourceId: sourceId ?? 'default' })) > 0) {
     process.stderr.write(
       `[import] ${opts.sourcePath} carries frontmatter.id=${fmIdStr} from moved file ${identity.dupSourcePath}; ` +
       `renamed ${identity.dupSlug} -> ${slug} in source ${sourceId ?? 'default'}.\n`
@@ -743,7 +721,7 @@ export async function importFromContent(
   }
   if (identity.kind === 'duplicate') {
     if (opts.prepare) {
-      const result: ImportResult = { slug: identity.dupSlug, status: 'skipped', chunks: 0, parsedPage };
+      const result: ImportResult = { slug: identity.dupSlug, status: 'skipped', chunks: 0, parsedPage, ...fences.fields };
       return opts.prepare({ slug: identity.dupSlug, parsedPage, observedRevision: (existing as (typeof existing & { knowledge_revision?: string }) | null)?.knowledge_revision ?? null,
         noop: true, result, validate: async () => {}, apply: async () => {} });
     }
@@ -752,7 +730,7 @@ export async function importFromContent(
       `(frontmatter.id=${fmIdStr}) in source ${sourceId ?? 'default'}. ` +
       `Pass --force-rechunk to override.\n`
     );
-    return { slug: identity.dupSlug, status: 'skipped', chunks: 0, parsedPage };
+    return { slug: identity.dupSlug, status: 'skipped', chunks: 0, parsedPage, ...fences.fields };
   }
   if (identity.kind === 'shared_id') {
     process.stderr.write(
@@ -809,10 +787,7 @@ export async function importFromContent(
     // Reuse is keyed on chunk source + text, so a stored chunk's current-input
     // hash is the hash its matching new chunk would record.
     const stored = (await engine.getChunks(slug, { sourceId: sourceId ?? 'default', includeEmbedding: true, requireSafeChunks: true }))
-      .filter(chunk => {
-        const hash = recorded.get(chunk.chunk_index);
-        return hash == null ? tier === 'none' && chunk.model === target.provenanceModel : hash === embeddingInputHash(provenance, tier, chunk);
-      });
+      .filter(chunk => canReuseMarkdownVector(recorded.get(chunk.chunk_index), existing.contextual_retrieval_mode, tier, provenance, chunk));
     for (const [i, matched] of planEmbeddingReuse(stored, chunks, c => `${c.chunk_source}\0${c.chunk_text}`).reuse) {
       chunks[i].embedding = matched.embedding as Float32Array;
       chunks[i].token_count = matched.token_count ?? undefined;
@@ -869,11 +844,11 @@ export async function importFromContent(
   // for single-source callers.
   const txOpts = { sourceId: sourceId ?? 'default' };
   let persistedProjection: ProjectionSnapshot | null = null;
-  const timeZone = await loadBrainTimeZone(engine);
-  const applyPrepared = async (tx: BrainEngine) => {
-    await assertImportBase(tx, slug, txOpts.sourceId, existing);
+  const [timeZone, mentionPolicy] = await Promise.all([loadBrainTimeZone(engine), readMentionPolicy(engine).catch(() => null)]);
+  const applyPrepared = async (tx: BrainEngine, preimage?: PageSnapshot | null) => {
+    if (!opts.coordinated) await assertImportBase(tx, slug, txOpts.sourceId, existing, reused.size > 0);
     await assertPreparedFactWithdrawals(tx, txOpts.sourceId, parsed.compiled_truth, parsed.timeline || '', slug);
-    if (existing) await tx.createVersion(slug, txOpts);
+    if (existing) await tx.createVersion(slug, preimage ? { ...txOpts, preimage } : txOpts);
 
     // v0.29.1 — compute effective_date from frontmatter precedence chain.
     // Filename comes from importFromFile path (basename) or the slug tail
@@ -893,7 +868,7 @@ export async function importFromContent(
       createdAt: fallbackCreatedAt({ existing, fileTimes: opts.fileTimes, now: nowDate }),
     });
 
-    await tx.putPage(slug, {
+    const written = await tx.putPage(slug, {
       type: parsed.type,
       title: parsed.title,
       compiled_truth: parsed.compiled_truth,
@@ -952,7 +927,7 @@ export async function importFromContent(
     if (chunks.length > 0) {
       const embeddingColumn = await stampEmbeddingInputs(tx, chunks, null,
         { title: parsed.title, tier: effectiveCRMode === 'title' ? 'title' : 'none', corpusGeneration });
-      await tx.upsertChunks(slug, chunks, embeddingColumn ? { ...txOpts, embeddingColumn } : txOpts);
+      await tx.upsertChunks(slug, chunks, { ...txOpts, ...(embeddingColumn ? { embeddingColumn } : {}), sealChunkerVersion: MARKDOWN_CHUNKER_VERSION });
       // v0.41.31: stamp embedding provenance when this import actually
       // embedded (not --no-embed), so a later model/dims swap is detectable
       // as stale via embed --stale. The deferred/backfill + per-slug embed
@@ -966,14 +941,11 @@ export async function importFromContent(
         }
       }
     } else {
-      // Content is empty — delete stale chunks so they don't ghost in search results
-      await tx.deleteChunks(slug, txOpts);
+      // Seal only the completed, full-body sanitized replacement (the upsert above seals its own); a
+      // body-only write or a failed transaction must never certify old stored fragments.
+      await tx.executeRaw('UPDATE pages SET chunker_version = $1 WHERE source_id = $2 AND slug = $3', [MARKDOWN_CHUNKER_VERSION, txOpts.sourceId, slug]);
     }
-    // Seal only the completed, full-body sanitized replacement. A body-only
-    // write or a failed transaction must never certify old stored fragments.
-    await tx.executeRaw('UPDATE pages SET chunker_version = $1 WHERE source_id = $2 AND slug = $3',
-      [MARKDOWN_CHUNKER_VERSION, txOpts.sourceId, slug]);
-    await sealPageTextProjection(tx, slug, txOpts.sourceId);
+    if (!opts.coordinated) await sealPageTextProjection(tx, slug, txOpts.sourceId);
 
     // v0.19.0 E1 — doc↔impl linking: if this markdown page cites code paths
     // (e.g. 'src/core/sync.ts:42'), create bidirectional edges to the code
@@ -1013,23 +985,24 @@ export async function importFromContent(
     }
     // Alias projection and readback share the page commit. A later writer can
     // no longer turn a successful import into a postcommit verification error.
-    await tx.setPageAliases(slug, sourceId ?? 'default', normalizeAliasList(parsed.frontmatter.aliases));
-    await verifyPageReadable(tx, slug, hash, sourceId, 'importFromContent');
+    await writePageAliases(tx, slug, sourceId ?? 'default', parsed, opts.activePack, mentionPolicy);
+    if (!opts.coordinated) await verifyPageReadable(tx, slug, hash, sourceId, 'importFromContent');
     await opts.beforeCommit?.(tx, slug);
     if (opts.onPostCommitEmbedding && !opts.noEmbed && chunks.length > 0) {
       // Capture the complete installed projection before releasing the page
       // guard. Deferred provider results cannot replace newer text or chunks.
       persistedProjection = await readProjectionSnapshot(tx, slug, txOpts.sourceId);
     }
+    return { pageId: written && written.deleted_at == null ? written.id : undefined, sealed: !opts.coordinated && !opts.beforeCommit };
   };
   if (opts.prepare) return opts.prepare({
     slug, parsedPage, observedRevision: (existing as (typeof existing & { knowledge_revision?: string }) | null)?.knowledge_revision ?? null,
-    noop: false, result: { slug, status: 'imported', chunks: chunks.length, parsedPage,
-      ...(pageQuarantined ? { quarantined: true } : {}), ...(pageFlagged ? { flagged: true, flag_reason: pageFlagReason } : {}) },
+    noop: false, contentHash: hash, result: { slug, status: 'imported', chunks: chunks.length, parsedPage,
+      ...(pageQuarantined ? { quarantined: true } : {}), ...(pageFlagged ? { flagged: true, flag_reason: pageFlagReason } : {}), ...fences.fields },
     validate: tx => assertPreparedFactWithdrawals(tx, txOpts.sourceId, parsed.compiled_truth, parsed.timeline || '', slug),
     apply: applyPrepared,
   });
-  await engine.transaction(applyPrepared).catch(async (err: unknown) => {
+  await maintenanceTransaction(engine, applyPrepared).catch(async (err: unknown) => {
     // #4287: name the dimension-mismatch rollback instead of letting the bare
     // pgvector message ("expected N dimensions, not M") surface with no code,
     // no consequence and no fix. S2: name the registry-ACTIVE column the
@@ -1069,7 +1042,7 @@ export async function importFromContent(
     ...(pageQuarantined ? { quarantined: true } : {}),
     ...(pageFlagged ? { flagged: true, flag_reason: pageFlagReason } : {}),
     ...(typeWarning ? { type_warning: typeWarning } : {}),
-    ...(embeddingDeferred ? { embedding_deferred: true } : {}),
+    ...(embeddingDeferred ? { embedding_deferred: true } : {}), ...fences.fields,
   };
 }
 
@@ -1084,14 +1057,16 @@ export async function importFromContent(
  * This is the write-then-verify guard on the sync/write path: a write is not
  * "done" until it is readable back.
  */
-async function verifyPageReadable(
+export async function verifyPageReadable(
   engine: BrainEngine,
   slug: string,
   expectedHash: string,
   sourceId: string | undefined,
   caller: string,
+  /** The caller's own read of the live page after the write (null: not found); read here when omitted. */
+  read?: Pick<Page, 'content_hash'> | null,
 ): Promise<void> {
-  const readBack = await engine.getPage(slug, { sourceId: sourceId ?? 'default' });
+  const readBack = read !== undefined ? read : await engine.getPage(slug, { sourceId: sourceId ?? 'default' });
   if (!readBack) {
     // Log to ingest_log before throwing so the failure is durable and
     // agent-inspectable, not just a transient stderr message.
@@ -1170,7 +1145,8 @@ export async function importFromFile(
 
   const stat = statSync(filePath);
   if (stat.size > MAX_FILE_SIZE) {
-    return { slug: relativePath, status: 'skipped', chunks: 0, error: `File too large (${stat.size} bytes)` };
+    return { slug: relativePath, status: 'skipped', chunks: 0, error: `File too large (${stat.size} bytes)`,
+      refusal: { code: 'file_too_large', message: `File too large (${stat.size} bytes, max ${MAX_FILE_SIZE}).` }, skip_reason: 'file_too_large' };
   }
 
   let content = readSourceFileSync(filePath, 'utf-8').replace(/^\uFEFF/, ''); // #4798: a BOM is encoding noise, not content
@@ -1205,15 +1181,12 @@ export async function importFromFile(
   }
 
   const preInferenceParsed = parseMarkdown(content, relativePath, { validate: true });
-  const preInferenceFrontmatterError = invalidYamlFrontmatterError(preInferenceParsed);
-  if (preInferenceFrontmatterError) {
-    return {
-      slug: slugifyPath(relativePath),
-      status: 'skipped',
-      chunks: 0,
-      error: preInferenceFrontmatterError,
-    };
+  const preInferenceHold = classifyImportHold(preInferenceParsed);
+  if (preInferenceHold) {
+    return { slug: slugifyPath(relativePath), status: 'skipped', chunks: 0, error: preInferenceHold.message, refusal: preInferenceHold, skip_reason: 'invalid_frontmatter' };
   }
+  const recovery = { quoted: !!preInferenceParsed.errors?.some(e => e.code === 'YAML_PARSE' && e.recoverable),
+    comment_value: !!preInferenceParsed.warnings?.some(w => w.code === 'FRONTMATTER_COMMENT_VALUE') };
 
   // v0.22.8 — Frontmatter inference: if the file has no frontmatter and
   // inference is enabled, synthesize it from the filesystem path + content.
@@ -1233,7 +1206,7 @@ export async function importFromFile(
     validate: true,
     ...(opts.activePack ? { activePack: opts.activePack } : {}),
   });
-  const frontmatterError = invalidYamlFrontmatterError(parsed);
+  const frontmatterHold = classifyImportHold(parsed);
 
   // Enforce path-authoritative slug. parseMarkdown prefers frontmatter.slug over
   // the path-derived slug, so a mismatch here means the frontmatter is trying
@@ -1252,14 +1225,7 @@ export async function importFromFile(
   let fallbackReason: 'path slugified empty' | 'normalization-equivalent identity restore' =
     'path slugified empty';
 
-  if (frontmatterError) {
-    return {
-      slug: expectedSlug,
-      status: 'skipped',
-      chunks: 0,
-      error: frontmatterError,
-    };
-  }
+  if (frontmatterHold) return { slug: expectedSlug, status: 'skipped', chunks: 0, error: frontmatterHold.message, refusal: frontmatterHold, skip_reason: 'invalid_frontmatter' };
 
   if (expectedSlug === '') {
     if (parsed.slug && parsed.slug.length > 0) {
@@ -1304,10 +1270,13 @@ export async function importFromFile(
         error:
           `Frontmatter slug "${parsed.slug}" does not match path-derived slug "${expectedSlug}" ` +
           `(from ${relativePath}). Remove the frontmatter "slug:" line or move the file.`,
+        refusal: { code: 'frontmatter_slug_conflict', key: 'slug', message: slugConflictHoldMessage(relativePath, expectedSlug) }, skip_reason: 'frontmatter_slug_conflict',
       };
     }
   }
 
+  const suffixHold = usedFrontmatterFallback ? await suffixedFrontmatterSlugHold(engine, opts.sourceId, relativePath, resolvedSlug) : null;
+  if (suffixHold) return { slug: expectedSlug, status: 'skipped', chunks: 0, error: suffixHold.message, refusal: suffixHold, skip_reason: suffixHold.code };
   // Emit the dual-channel audit entry AFTER we know we're not going to
   // short-circuit, so we don't log noise for failed imports.
   if (usedFrontmatterFallback) {
@@ -1320,7 +1289,7 @@ export async function importFromFile(
   // precedence in computeEffectiveDate. e.g. `daily/2024-03-15.md` →
   // filename `2024-03-15`.
   const fileBasename = basename(relativePath, '.md');
-  return importFromContent(engine, resolvedSlug, content, {
+  const imported = await importFromContent(engine, resolvedSlug, content, {
     ...opts,
     filename: fileBasename,
     sourcePath: relativePath,
@@ -1331,6 +1300,7 @@ export async function importFromFile(
     // deliberate clear, so it passes putPage's empty-overwrite guard.
     allowEmptyOverwrite: true,
   });
+  return imported.status === 'imported' && (recovery.quoted || recovery.comment_value) ? { ...imported, frontmatter_recovery: recovery } : imported;
 }
 
 /**
@@ -1376,7 +1346,7 @@ export async function importCodeFile(
 
   const byteLength = Buffer.byteLength(content, 'utf-8');
   if (byteLength > MAX_FILE_SIZE) {
-    return { slug, status: 'skipped', chunks: 0, error: `Code file too large (${byteLength} bytes)` };
+    return { slug, status: 'skipped', chunks: 0, error: `Code file too large (${byteLength} bytes)`, refusal: { code: 'file_too_large', message: `Code file too large (${byteLength} bytes)` }, skip_reason: 'file_too_large' };
   }
 
   // Vendor-neutral guardrail seam (observe-only, fail-open). Runs AFTER the
@@ -1544,7 +1514,7 @@ export async function importCodeFile(
     const result: ImportResult = { slug, status: 'imported', chunks: chunks.length };
     return opts.prepare({ slug, parsedPage, observedRevision: existing?.knowledge_revision ?? null, noop: false, result, validate: async () => {}, apply });
   }
-  await engine.transaction(apply);
+  await maintenanceTransaction(engine, apply);
 
   // Post-write read-back verification.
   // Same guard as the markdown path: a code page write is not "done" until
@@ -1603,7 +1573,7 @@ export async function importCodeFile(
           to_chunk_id: null,
           from_symbol_qualified: from.symbol_name_qualified,
           to_symbol_qualified: e.toSymbol,
-          edge_type: e.edgeType,
+          edge_type: e.edgeType, ...(e.memberCall ? { edge_metadata: { member_call: true } } : {}),
           // Stamp the source: getCallersOf/getCalleesOf add
           // `AND source_id = <scoped>` whenever a worktree pin / --source is
           // in play, and a NULL here never matches that filter — so every
@@ -1694,7 +1664,7 @@ export async function withImportTransaction(
   engine: BrainEngine,
   spec: ImportTransactionSpec,
 ): Promise<void> {
-  await engine.transaction(tx => applyImportTransaction(tx, spec));
+  await maintenanceTransaction(engine, tx => applyImportTransaction(tx, spec));
 }
 
 async function applyImportTransaction(tx: BrainEngine, spec: ImportTransactionSpec): Promise<void> {

@@ -18,6 +18,8 @@ export interface WriteAuthority {
   slugPrefixes: string[] | null;
   delegatedPrefixes?: string[] | null;
   delegated?: boolean;
+  /** Minions job that accepted an OAuth-delegated write; a live `job` grant re-derives only that job's namespace from it. */
+  delegatedJobId?: number;
   takesHolders?: string[] | null;
   /** Actual holders touched by a published take mutation; retained after intent compaction. */
   takeHoldersUsed?: string[];
@@ -82,6 +84,8 @@ export interface WriteRequest {
   outcome: Record<string, unknown> | null;
   error_code: string | null;
   error_message: string | null;
+  /** #5974 structured failure (publication-failure.ts); receipts expose only its public view. */
+  error_detail?: Record<string, unknown> | null;
   blocked_reason: string | null;
   compacted: boolean;
   publication_started: boolean;

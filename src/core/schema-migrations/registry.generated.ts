@@ -179,6 +179,43 @@ import { v175 } from './v175-tags-tag-source.ts';
 import { v176 } from './v176-connector-checkpoint-stable-identity.ts';
 import { v177 } from './v177-pages-database-only-reason.ts';
 import { v178 } from './v178-persistence-writer-version-stamps.ts';
+import { v179 } from './v179-persistence-request-sync-run-indexes.ts';
+import { v180 } from './v180-pages-links-attendance-blocked.ts';
+import { v181 } from './v181-connector-dispatch-attempts.ts';
+import { v182 } from './v182-page-versions-source-path.ts';
+import { v183 } from './v183-persistence-mode-epoch.ts';
+import { v184 } from './v184-decision-receipts.ts';
+import { v185 } from './v185-decide-calibrations.ts';
+import { v186 } from './v186-decide-proposals.ts';
+import { v187 } from './v187-fact-relink-attempts.ts';
+import { v188 } from './v188-facts-ontology-stint-dedup.ts';
+import { v189 } from './v189-pages-credential-projection-pending.ts';
+import { v190 } from './v190-sources-upstream-observation.ts';
+import { v191 } from './v191-alias-source-cascade.ts';
+import { v192 } from './v192-take-embedding-identity.ts';
+import { v193 } from './v193-f1-write-attribution.ts';
+import { v194 } from './v194-f0-worktree-refreshes.ts';
+import { v195 } from './v195-f3-access-token-grants.ts';
+import { v196 } from './v196-f4-planner-stats.ts';
+import { v197 } from './v197-managed-guard-null-source-fallback.ts';
+import { v198 } from './v198-publication-failure-detail.ts';
+import { v199 } from './v199-chronicle-page-state.ts';
+import { v200 } from './v200-sync-hold-page-index.ts';
+import { v201 } from './v201-persistence-graduation.ts';
+import { v202 } from './v202-legacy-token-grant-conversion.ts';
+import { v203 } from './v203-oauth-client-grant-axes.ts';
+import { v204 } from './v204-links-temporal-state.ts';
+import { v205 } from './v205-minion-spend-authorization.ts';
+import { v206 } from './v206-entity-mention-index.ts';
+import { v207 } from './v207-retrieval-feedback.ts';
+import { v208 } from './v208-delta-per-arm-cursor.ts';
+import { v209 } from './v209-page-facts-reconcile.ts';
+import { v210 } from './v210-clamp-oauth-token-ttl.ts';
+import { v211 } from './v211-function-search-path.ts';
+import { v212 } from './v212-decide-review-proposals.ts';
+import { v213 } from './v213-core-edit-notices.ts';
+import { v214 } from './v214-wanted-links.ts';
+import { v215 } from './v215-facts-attributed-to.ts';
 
 // Array order is historical (see HISTORICAL_ARRAY_ORDER in the generator); the
 // runner sorts by version before applying.
@@ -356,4 +393,41 @@ export const MIGRATIONS: Migration[] = [
   v176,
   v177,
   v178,
+  v179,
+  v180,
+  v181,
+  v182,
+  v183,
+  v184,
+  v185,
+  v186,
+  v187,
+  v188,
+  v189,
+  v190,
+  v191,
+  v192,
+  v193,
+  v194,
+  v195,
+  v196,
+  v197,
+  v198,
+  v199,
+  v200,
+  v201,
+  v202,
+  v203,
+  v204,
+  v205,
+  v206,
+  v207,
+  v208,
+  v209,
+  v210,
+  v211,
+  v212,
+  v213,
+  v214,
+  v215,
 ];

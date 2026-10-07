@@ -668,6 +668,36 @@ describe('GmailClient', () => {
     expect(third.labelIds).toEqual(['SENT']);
   });
 
+  test('#5586: getThread stamps RFC 3834 Auto-Submitted: any keyword but "no", case-insensitive, parameters and comments ignored', async () => {
+    const cases: Array<[string | null, boolean]> = [
+      ['auto-generated', true], ['Auto-Replied', true], [' AUTO-NOTIFIED ; owner-email="x@example.com"', true],
+      ['auto-generated (tracker)', true], ['x-custom-robot', true],
+      ['no', false], ['No', false], [' no ; reason=human', false], ['no (sent by a person)', false], ['', false], [null, false],
+    ];
+    const rawThread = {
+      id: '17aa9999ffff0000',
+      messages: cases.map(([value], i) => ({
+        id: `18c2f4a9b3d21f${String(i).padStart(2, '0')}`,
+        threadId: '17aa9999ffff0000',
+        labelIds: [],
+        internalDate: String(Date.parse('2026-08-10T09:00:00Z') + i * 60_000),
+        payload: {
+          mimeType: 'text/plain',
+          headers: [
+            { name: 'From', value: 'Tracker <tracker@example.com>' },
+            { name: 'To', value: 'a@example.com' },
+            { name: 'Subject', value: `Issue #${i}` },
+            ...(value === null ? [] : [{ name: i % 2 ? 'auto-submitted' : 'Auto-Submitted', value }]),
+          ],
+          body: { data: b64url('Status changed.') },
+        },
+      })),
+    };
+    const h = makeHarness(() => json(rawThread));
+    const thread = await new GmailClient(h.tokens, h.fetchImpl, () => {}, CLIENT_ID).getThread('17aa9999ffff0000', 'a@example.com');
+    expect(thread.messages.map((m) => m.autoSubmitted)).toEqual(cases.map(([, expected]) => expected));
+  });
+
   test('getThread stamps calendarMethod from a real-shape text/calendar part; plain messages get null', async () => {
     const rawThread = {
       id: '17aa7777eeee8888',
@@ -755,6 +785,31 @@ describe('GmailClient', () => {
     const body = thread.messages[0].bodyText;
     expect(body.endsWith('[truncated]')).toBe(true);
     expect(body.length).toBe(8_000 + '\n[truncated]'.length);
+  });
+
+  // #5752: a cap that cuts a UTF-16 code unit leaves a lone surrogate, which
+  // Postgres rejects inside the managed request intent's jsonb.
+  const emojiThread = (mimeType: string, text: string) => ({
+    id: '17aa5555dddd7777',
+    messages: [{
+      id: '18c2f4a9b3d21e05', threadId: '17aa5555dddd7777', labelIds: [], internalDate: String(Date.parse('2026-08-10T09:00:00Z')),
+      payload: { mimeType, headers: [{ name: 'From', value: 'Charlie Example <charlie@example.com>' }, { name: 'Subject', value: 'Emoji' }],
+        body: { data: b64url(text) } },
+    }],
+  });
+  test('the 8KB body cap never splits a surrogate pair (#5752)', async () => {
+    const h = makeHarness(() => json(emojiThread('text/plain', 'x'.repeat(7_999) + '\u{1F600}' + 'y'.repeat(50))));
+    const body = (await new GmailClient(h.tokens, h.fetchImpl, () => {}, CLIENT_ID).getThread('17aa5555dddd7777', 'a@example.com')).messages[0].bodyText;
+    expect(body.endsWith('[truncated]')).toBe(true);
+    expect(body.isWellFormed()).toBe(true);
+    expect(body.startsWith('x'.repeat(7_999))).toBe(true);
+  });
+  test('the HTML pre-truncation never splits a surrogate pair (#5752)', async () => {
+    const markup = '<b></b>'.repeat(Math.floor(127_999 / 7));
+    const html = markup + 'z'.repeat(127_999 - markup.length) + '\u{1F600}' + 'tail';
+    const h = makeHarness(() => json(emojiThread('text/html', html)));
+    const body = (await new GmailClient(h.tokens, h.fetchImpl, () => {}, CLIENT_ID).getThread('17aa5555dddd7777', 'a@example.com')).messages[0].bodyText;
+    expect(body.isWellFormed()).toBe(true);
   });
 });
 

@@ -9,9 +9,9 @@ afterAll(() => rmSync(dir, { recursive: true, force: true }));
 
 /**
  * Starts short-lived children whose first exit callback re-enters the event
- * loop the way bun:test `expect().resolves/.rejects` does. On Bun 1.3.x that
- * drops the other exit and pipe events of the same poll batch
- * (oven-sh/bun#30301), which is how managed-maintenance, persistence-reconcile
+ * loop the way bun:test `expect().resolves/.rejects` does. Bun drops the other
+ * pipe events of the same poll batch (still on 1.4.2) and, before 1.3.14, the
+ * exit events too (oven-sh/bun#30301), which is how managed-maintenance, persistence-reconcile
  * and google-attachments hung behind a persistence consumer's git probe.
  */
 function nestedTickDuring<T>(work: () => Promise<T>[]): Promise<T[]> {
@@ -45,11 +45,12 @@ test('the persistence durability probe settles when the runtime drops child even
 }, 30_000);
 
 test('bounded execution keeps execFile exit codes and stdout', async () => {
-  const { error, stdout } = await execFileBounded('sh', ['-c', 'printf example; exit 3'], { timeout: 10_000 });
+  const { error, stdout, stderr } = await execFileBounded('sh', ['-c', 'printf example; printf refusal >&2; exit 3'], { timeout: 10_000 });
   expect(stdout).toBe('example');
+  expect(stderr).toBe('refusal');
   expect(error?.code).toBe(3);
   expect(error?.killed).toBeFalsy();
-  expect(await execFileBounded('sh', ['-c', 'printf ok'], { timeout: 10_000 })).toEqual({ error: null, stdout: 'ok' });
+  expect(await execFileBounded('sh', ['-c', 'printf ok'], { timeout: 10_000 })).toEqual({ error: null, stdout: 'ok', stderr: '' });
 });
 
 test('bounded execution stops a running child on abort and at its deadline', async () => {
@@ -63,4 +64,20 @@ test('bounded execution stops a running child on abort and at its deadline', asy
   const preAborted = new AbortController();
   preAborted.abort();
   expect((await execFileBounded('sleep', ['30'], { timeout: 60_000, signal: preAborted.signal })).error).toMatchObject({ code: 'ABORT_ERR' });
+});
+
+test('a stopped child gets SIGTERM first so it can remove its lockfile, then SIGKILL after the grace period', async () => {
+  const lock = join(dir, 'index.lock');
+  const script = `touch '${lock}'; trap "rm -f '${lock}'; exit 143" TERM; while :; do sleep 0.05; done`;
+  const abort = new AbortController();
+  const running = execFileBounded('sh', ['-c', script], { timeout: 60_000, signal: abort.signal });
+  await Bun.sleep(200);
+  expect(await Bun.file(lock).exists()).toBe(true);
+  abort.abort();
+  expect((await running).error).toMatchObject({ code: 'ABORT_ERR', killed: true });
+  expect(await Bun.file(lock).exists()).toBe(false);
+  const started = performance.now();
+  const stubborn = await execFileBounded('sh', ['-c', 'trap "" TERM; while :; do sleep 0.05; done'], { timeout: 100 });
+  expect(stubborn.error).toMatchObject({ code: 'ETIMEDOUT', killed: true });
+  expect(performance.now() - started).toBeLessThan(5000);
 });

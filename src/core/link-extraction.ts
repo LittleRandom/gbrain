@@ -15,6 +15,8 @@ import type { BrainEngine, LinkBatchInput } from './engine.ts';
 import type { PageType, EffectiveDateSource } from './types.ts';
 import { ensureWellFormed } from './text-safe.ts';
 import { stripCodeBlocks } from './markdown-code.ts';
+import { inSuppressedRange, rolePriorSuppressedRanges } from './machine-sections.ts';
+import { statedRelationTypes } from './line-grammar.ts';
 import { isValidSourceId } from './source-id.ts';
 import { parseInlineCitationTimelineEntries } from './timeline-citations.ts';
 import { isMaterializedMarkerLine } from './timeline-marker.ts';
@@ -25,7 +27,7 @@ import { isIdentityEntity, sameEntityName } from './entities/resolve.ts';
 // #3190: pack-aware link typing. link-inference imports only manifest-v1
 // (zod) + redos-guard (node:vm) — no cycle back into this module.
 import type { SchemaPackManifest } from './schema-pack/manifest-v1.ts';
-import { inferLinkTypeFromPack, frontmatterLinkTypeFromPack } from './schema-pack/link-inference.ts';
+import { inferLinkTypeFromPack, frontmatterLinkTypeFromPack, ownsAttendanceInference } from './schema-pack/link-inference.ts';
 import { PageRegexBudget } from './schema-pack/redos-guard.ts';
 
 /**
@@ -52,6 +54,22 @@ export { parseInlineCitationTimelineEntries, type InlineCitationTimelineCandidat
  * OR updated_at > links_extracted_at`. It is an ISO-8601 string (NOT a number) —
  * the column is TIMESTAMPTZ and the predicate binds it as `::timestamptz`.
  */
+// 2026-10-02: eval wave N12-6 — a `Participants:` line (plain or bold) or a
+// `## Participants` section is attendance evidence like its `Attendees`
+// twin, so meeting pages written with it re-extract and gain attended edges.
+// 2026-10-01: eval wave N9-2/N9-3/N12-7 — schema-pack frontmatter mappings
+// keep FRONTMATTER_LINK_MAP's declared direction (company `investors:` is
+// investor -> company, meeting `attendees:` is person -> meeting), and a
+// pack's `attended` verb on a meeting page follows canonical evidence-gated
+// attendance, so edges the legacy gbrain-base pack stored backwards (or typed
+// attended from a notes mention) re-derive on `extract --stale`.
+// 2026-09-30: #5749 — with link_resolution.global_basename on, a unique
+// basename match resolves a frontmatter wikilink before the fuzzy and live
+// keyword steps, so edges the managed stale sweep re-pointed at a transcript
+// re-extract back to the named page on the next `extract --stale`.
+// 2026-09-30: #5765 — a bold `**Attendees:**` label before a bare link list is
+// attendance evidence (the meeting-ingestion template wrote it), so meeting
+// pages filed with it re-extract and gain their attended edges.
 // 2026-09-09: #4985 — normalizeBasename strips Unicode variation selectors (twin
 // of slugifySegment), so emoji+VS16 wikilinks re-resolve to the clean slug.
 // 2026-09-09 (same wave): #4977 — the page-role prior no longer applies to
@@ -75,7 +93,11 @@ export { parseInlineCitationTimelineEntries, type InlineCitationTimelineCandidat
 // PRE-wave code after this date reads as fresh and won't re-extract until
 // the page is next edited; no fixed watermark can cover code that keeps
 // running past it.
-export const LINK_EXTRACTOR_VERSION_TS = '2026-09-21T00:00:00Z';
+// 2026-10-02: hyphen-run basenames resolve (#5623); 2026-10-05: temporal edges derive dated evidence on extraction.
+// 2026-10-05T03: typed relation lines (core/line-grammar.ts) state their link's type; a per-edge verb that
+// belongs to another link in the window no longer types this one; "joined [X] as <role>" reads as works_at.
+// Re-extract so existing pages pick these up.
+export const LINK_EXTRACTOR_VERSION_TS = '2026-10-05T03:00:00Z';
 
 // ─── Entity references ──────────────────────────────────────────
 
@@ -591,6 +613,36 @@ export interface LinkCandidate {
   originSlug?: string;
   /** Frontmatter field name (e.g. 'key_people'), for debug + unresolved report. */
   originField?: string;
+  /**
+   * The authored reference this candidate came from (a markdown link or a
+   * wikilink in the body). Candidates sharing a `key` are alternative
+   * resolutions of one reference; the reference is wanted when none of them
+   * resolves (src/core/wanted-links.ts). Bare prose paths carry none.
+   */
+  authoredRef?: AuthoredRef;
+}
+
+export interface ExtractPageLinksOptions {
+  globalBasename?: boolean; skipFrontmatter?: boolean; pack?: LinkExtractionPack | null;
+  /** Typed relation lines (core/line-grammar.ts); on unless `enabled: false`. */
+  lineGrammar?: { enabled?: boolean; allowUndeclaredTypes?: boolean };
+  targetType?: (slug: string, sourceId?: string) => string | undefined;
+  onResolvedFrontmatterTarget?: (slug: string) => void;
+}
+
+/** The authored reference of a wikilink at `idx`: a slug path, or a bare name keyed by its basename. */
+function wikilinkAuthoredRef(target: string, idx: number): AuthoredRef | undefined {
+  if (target.includes('/')) return { key: `ref:${idx}`, kind: 'slug', target };
+  const name = normalizeBasename(target);
+  return name ? { key: `ref:${idx}`, kind: 'name', target: name } : undefined;
+}
+
+/** One authored body reference, as recorded in `wanted_links` when it does not resolve. */
+export interface AuthoredRef {
+  key: string;
+  kind: 'slug' | 'name';
+  target: string;
+  targetSourceId?: string;
 }
 
 /**
@@ -629,9 +681,7 @@ export async function extractPageLinks(
   frontmatter: Record<string, unknown>,
   pageType: PageType,
   resolver: SlugResolver,
-  opts: { globalBasename?: boolean; skipFrontmatter?: boolean; pack?: LinkExtractionPack | null;
-    targetType?: (slug: string, sourceId?: string) => string | undefined;
-    onResolvedFrontmatterTarget?: (slug: string) => void } = {},
+  opts: ExtractPageLinksOptions = {},
 ): Promise<PageLinksResult> {
   const candidates: LinkCandidate[] = [];
 
@@ -644,6 +694,7 @@ export async function extractPageLinks(
   // here and every such edge landed as 'mentions'.
   const pack = opts.pack ?? null;
   const packBudget = pack ? new PageRegexBudget() : undefined;
+  const packOwnsAttendance = ownsAttendanceInference(pack);
   // Timeline / See-also links never receive the page-role prior — see
   // rolePriorSuppressedRanges (matched on the code-stripped content, so a
   // fenced `## Timeline` never opens a range). idx is the link's position in
@@ -654,11 +705,14 @@ export async function extractPageLinks(
   const attendancePending = new Set<number>();
   const attendanceResolved = new Set<number>();
   const attendanceAmbiguous = new Set<number>();
+  const statedType = statedRelationTypes(content, { ...opts.lineGrammar, declaredVerbs: pack?.link_types.map(lt => lt.name) });
   const typeFor = (ctx: string, targetSlug: string, idx?: number, sourceId?: string, bodyReference = true): Pick<LinkCandidate, 'linkType' | 'canonicalAttendance'> => {
+    const stated = bodyReference ? statedType(idx) : undefined; // a typed relation line wins (core/line-grammar.ts)
+    if (stated && !(stated === 'attended' && pageType === 'meeting')) return { linkType: stated };
     const targetType = opts.targetType?.(targetSlug, sourceId);
     if (pack) {
       const packVerb = inferLinkTypeFromPack(pack, pageType as string, ctx, packBudget, targetType);
-      if (packVerb) {
+      if (packVerb && (packOwnsAttendance || packVerb !== 'attended' || pageType !== 'meeting')) {
         if (packVerb === 'attended' && pageType === 'meeting'
           && (opts.targetType ? targetType !== 'person' : !targetSlug.startsWith('people/'))) return { linkType: 'mentions' };
         return { linkType: packVerb };
@@ -666,7 +720,7 @@ export async function extractPageLinks(
     }
     if (pageType === 'meeting') {
       if (!bodyReference) return { linkType: 'mentions' };
-      if (pack?.link_types.some(lt => lt.name === 'attended' && (lt.inference?.page_type || lt.inference?.target_type))) return { linkType: 'mentions' };
+      if (packOwnsAttendance && pack?.link_types.some(lt => lt.name === 'attended' && (lt.inference?.page_type || lt.inference?.target_type))) return { linkType: 'mentions' };
       if (idx !== undefined && hasAttendanceEvidence(attendanceRanges, idx)) {
         attendancePending.add(idx);
         if (!opts.targetType || targetType !== undefined) attendanceResolved.add(idx);
@@ -679,7 +733,7 @@ export async function extractPageLinks(
     }
     const suppressPrior = idx !== undefined && idx >= 0 && inSuppressedRange(suppressedRanges, idx);
     const legacy = inferLinkType(pageType, ctx, suppressPrior ? undefined : content, targetSlug,
-      opts.targetType ? targetType ?? null : undefined);
+      opts.targetType ? targetType ?? null : undefined, bodyReference && idx !== undefined && idx >= 0 ? excerptAnchor(content, idx, 240) : undefined);
     if (pack?.link_types.some(lt => lt.name === legacy && (lt.inference?.page_type || lt.inference?.target_type))) return { linkType: 'mentions' };
     return { linkType: legacy };
   };
@@ -712,6 +766,7 @@ export async function extractPageLinks(
           ...typeFor(context, target, idx),
           context,
           linkSource: 'markdown',
+          authoredRef: { key: `ref:${idx}`, kind: 'slug', target },
         });
       }
       continue;
@@ -742,6 +797,7 @@ export async function extractPageLinks(
           ...typeFor(litContext, ref.slug, litIdx),
           context: litContext,
           linkSource: 'markdown',
+          authoredRef: { key: `ref:${litIdx}`, kind: 'slug', target: ref.slug },
         });
       }
       // #4062: a bare `[[name]]` (no slash) gets a direct verb-typed
@@ -800,11 +856,12 @@ export async function extractPageLinks(
       const uniquePerson = personTargets.length === 1;
       if (pageType === 'meeting' && opts.targetType && !uniquePerson
         && targets.filter(target => opts.targetType!(target) !== undefined).length > 1) attendanceAmbiguous.add(idx);
+      const authoredRef = wikilinkAuthoredRef(ref.slug, idx);
       for (const target of bareDirect) {
         const inferred = typeFor(context, target, idx);
         candidates.push({ targetSlug: target,
           ...(inferred.canonicalAttendance && !uniquePerson ? { linkType: 'mentions' } : inferred),
-          context, linkSource: 'markdown' });
+          context, linkSource: 'markdown', ...(authoredRef ? { authoredRef } : {}) });
       }
       for (const matched of matches) {
         const inferred = typeFor(context, matched, idx);
@@ -813,6 +870,7 @@ export async function extractPageLinks(
           ...(inferred.canonicalAttendance && uniquePerson ? inferred : { linkType: WIKILINK_BASENAME_LINK_TYPE }),
           context,
           linkSource: 'wikilink-resolved',
+          ...(authoredRef ? { authoredRef } : {}),
         });
       }
       continue;
@@ -839,6 +897,7 @@ export async function extractPageLinks(
       ...typeFor(context, targetSlug, idx, ref.sourceId ?? undefined),
       context,
       linkSource: 'markdown',
+      authoredRef: { key: `ref:${idx}`, kind: 'slug', target: targetSlug, ...(ref.sourceId ? { targetSourceId: ref.sourceId } : {}) },
     });
   }
 
@@ -895,6 +954,13 @@ export async function extractPageLinks(
     frontmatterAttendanceComplete = fm.attendanceComplete;
   }
 
+  const result = dedupeCandidates(candidates);
+  return { candidates: result, unresolved: fmUnresolved,
+    attendanceComplete: [...attendancePending].every(index => attendanceResolved.has(index) && !attendanceAmbiguous.has(index))
+      && frontmatterAttendanceComplete };
+}
+
+function dedupeCandidates(candidates: LinkCandidate[]): LinkCandidate[] {
   // Within-page dedup: same (fromSlug, targetSlug, linkType, linkSource)
   // collapses to one entry. First occurrence wins.
   // Issue #972 (codex P2d, decided): a qualified `[[companies/acme]]` (typed
@@ -911,9 +977,7 @@ export async function extractPageLinks(
     seen.add(key);
     result.push(c);
   }
-  return { candidates: result, unresolved: fmUnresolved,
-    attendanceComplete: [...attendancePending].every(index => attendanceResolved.has(index) && !attendanceAmbiguous.has(index))
-      && frontmatterAttendanceComplete };
+  return result;
 }
 
 export function resolvedLinkCandidate(candidate: LinkCandidate, originSlug: string, originSourceId: string,
@@ -1016,7 +1080,7 @@ export function attendanceEvidenceRanges(content: string): Array<[number, number
       continue;
     }
     if (/^#{1,2}[ \t]/.test(line.text)) finishSection();
-    if (/^##[ \t]+Attendees[ \t]*\r?$/i.test(line.text)) {
+    if (/^##[ \t]+(?:Attendees|Participants)[ \t]*\r?$/i.test(line.text)) {
       section = { valid: true, entries: [] };
       continue;
     }
@@ -1027,7 +1091,7 @@ export function attendanceEvidenceRanges(content: string): Array<[number, number
       section.entries.push([line.start, line.end]);
       continue;
     }
-    const inline = /^Attendees:[ \t]*(.*)$/i.exec(line.text);
+    const inline = /^(?:(?:Attendees|Participants):|\*\*(?:Attendees|Participants):\*\*|\*\*(?:Attendees|Participants)\*\*:)[ \t]*(.*)$/i.exec(line.text);
     if (inline && list(inline[1])) ranges.push([line.start, line.end]);
   }
   finishSection();
@@ -1069,6 +1133,11 @@ export function hasAttendanceEvidence(ranges: ReadonlyArray<readonly [number, nu
  * entire `extract --stale` run (#2011). `ensureWellFormed` replaces any orphaned
  * half with U+FFFD before the slice escapes this function.
  */
+/** Where `idx` lands inside `excerpt(s, idx, width)`: the link's own position, not the first mention of its target. */
+function excerptAnchor(s: string, idx: number, width: number): number {
+  return s.slice(Math.max(0, idx - Math.floor(width / 2)), idx).replace(/\s+/g, ' ').trimStart().length;
+}
+
 function excerpt(s: string, idx: number, width: number): string {
   const half = Math.floor(width / 2);
   const start = Math.max(0, idx - half);
@@ -1106,7 +1175,7 @@ function excerpt(s: string, idx: number, width: number): string {
 //   - Possessive time: "his time at", "her time at", "their time at", "my time at".
 //   - Role noun forms: "role at", "tenure as", "stint as", "position at".
 //   - Promoted/staff-engineer forms: "promoted to (staff|senior|principal) engineer at".
-const WORKS_AT_RE = /\b(?:CEO of|CTO of|COO of|CFO of|CMO of|CRO of|VP at|VP of|VPs? Engineering|VPs? Product|works at|worked at|working at|employed by|employed at|joined as|joined the team|engineer at|engineer for|director at|director of|head of|heads up .{0,20} at|leads engineering|leads product|leads the .{0,20} (?:team|org) at|manages engineering at|manages product at|running (?:engineering|product|design) at|currently at|previously at|previously worked at|spent .* (?:years|months) at|stint at|stint as|tenure at|tenure as|role at|position at|(?:senior|staff|principal|lead|backend|frontend|full-?stack|ML|data|security) engineer at|promoted to (?:senior|staff|principal|lead) .{0,20} at|(?:his|her|their|my) time at)\b/i;
+const WORKS_AT_RE = /\b(?:joined\b[^.\n]{0,80}?\bas (?:an? |the )?(?:senior |staff |principal |lead |founding |chief )?(?:engineer|developer|designer|product manager|engineering manager|manager|director|head of [a-z]+|scientist|researcher|analyst|employee|operator|cto|ceo|coo|cfo|cmo|vp)|CEO of|CTO of|COO of|CFO of|CMO of|CRO of|VP at|VP of|VPs? Engineering|VPs? Product|works at|worked at|working at|employed by|employed at|joined as|joined the team|engineer at|engineer for|director at|director of|head of|heads up .{0,20} at|leads engineering|leads product|leads the .{0,20} (?:team|org) at|manages engineering at|manages product at|running (?:engineering|product|design) at|currently at|previously at|previously worked at|spent .* (?:years|months) at|stint at|stint as|tenure at|tenure as|role at|position at|(?:senior|staff|principal|lead|backend|frontend|full-?stack|ML|data|security) engineer at|promoted to (?:senior|staff|principal|lead) .{0,20} at|(?:his|her|their|my) time at)\b/i;
 
 // Investment context. Order patterns from most-specific to least to keep
 // regex efficient. Includes funding-round verbs ("led the seed", "led X's
@@ -1168,47 +1237,47 @@ const ADVISOR_ROLE_RE = /\b(?:full-time advisor|professional advisor|advises (?:
 // pages mentioning their employees use the page-role layer differently.
 const EMPLOYEE_ROLE_RE = /\b(?:is an? (?:senior|staff|principal|lead|backend|frontend|full-?stack|ML|data|security|DevOps|platform)? ?engineer at|is an? (?:senior|staff|principal|lead)? ?(?:developer|designer|product manager|engineering manager|director|VP) (?:at|of)|holds? the (?:CTO|CEO|CFO|COO|CMO|CRO|VP) (?:role|position|seat|title) at|is the (?:CTO|CEO|CFO|COO|CMO|CRO) of|employee at|on the team at|works on .{0,30} at)\b/i;
 
-/**
- * Content index ranges where the page-role prior must NOT apply: the
- * machine-written list sections — Timeline, See also, Related, Facts,
- * Sources, Links, Email mention links, Backlinks, Significant moments
- * (headingRe below is the one source of truth). Links there are list-shaped, per-event references
- * ("2026-05-12 — met with [[companies/x]]", Iron-Law back-links) — the
- * role prior is a statement about the AUTHOR's standing relationships, not
- * about every entity that passes through their timeline, so applying it
- * there mints unevidenced works_at/advises edges on every re-import (on
- * one 12k-page brain: ~7.4k such edges re-minted in a month, right after
- * a ~19.5k cleanup; same class as #3466). Per-edge verbs inside these
- * sections still type normally — only the globalContext fallback is
- * suppressed, so absent explicit evidence the edge stays 'mentions'.
- *
- * A range runs from its heading to the next heading of the same or higher
- * level (or EOF). Case-insensitive; matches "See also" / "See-also". Both
- * grammars require the ATX space after the `#`s, so a column-0 tag line
- * (`#links`) is neither an opener nor a closer.
- */
-function rolePriorSuppressedRanges(content: string): Array<[number, number]> {
-  const ranges: Array<[number, number]> = [];
-  const headingRe = /^(#{1,6})[ \t]+(?:timeline|see[ -]also|related|facts|sources|links|email mention links|backlinks|significant moments)\b[^\n]*$/gim;
-  const anyHeadingRe = /^(#{1,6})[ \t]/gm;
-  let m: RegExpExecArray | null;
-  while ((m = headingRe.exec(content)) !== null) {
-    const level = m[1].length;
-    anyHeadingRe.lastIndex = m.index + m[0].length;
-    // Deeper headings (`###` under `## Timeline`) stay inside the range; the
-    // first same-or-higher one closes it.
-    let next: RegExpExecArray | null;
-    while ((next = anyHeadingRe.exec(content)) !== null && next[1].length > level) { /* nested subsection */ }
-    ranges.push([m.index, next ? next.index : content.length]);
-  }
-  return ranges;
-}
 
-function inSuppressedRange(ranges: Array<[number, number]>, idx: number): boolean {
-  for (const [start, end] of ranges) {
-    if (idx >= start && idx < end) return true;
+const VERB_RULES: ReadonlyArray<readonly [RegExp, string]> = [
+  [FOUNDED_RE, 'founded'], [INVESTED_RE, 'invested_in'], [ADVISES_RE, 'advises'], [WORKS_AT_RE, 'works_at'],
+  [ZH_FOUNDED_RE, 'founded'], [ZH_INVESTED_RE, 'invested_in'], [ZH_ADVISES_RE, 'advises'], [ZH_WORKS_AT_RE, 'works_at'], [ZH_CITED_RE, 'cited'],
+];
+
+/**
+ * The per-edge verb for one link when its context window holds several links.
+ * A verb match belongs to another link when another link sits between it and
+ * this one, or when it is written immediately before another link ("... and
+ * also advises [Widget]"). Among the matches that are not another link's,
+ * precedence decides as before. Returns undefined when the link cannot be
+ * located in the window (callers fall back to plain precedence).
+ */
+const LINK_MARK_RE = /\]\(|\]\]|\[\[/;
+// "works at [A] and at [B]": links joined only by commas and conjunctions share the verb before the first.
+const INLINE_LINK_RE = /\[\[[^\]\n]*\]\]|\[[^\]\n]*\]\([^)\n]*\)/g;
+const CONNECTOR_RE = /^\s*(?:,\s*(?:(?:and|or)\s+)?|(?:and|or|&|as well as)\s+)(?:(?:at|in|with|for|of|to)\s+)?$/i;
+const coordinated = (between: string) => {
+  const [lead, ...gaps] = between.split(INLINE_LINK_RE);
+  return !lead.trim() && gaps.length > 0 && gaps.every(gap => CONNECTOR_RE.test(gap));
+};
+const GLOBAL_VERB_RULES = VERB_RULES.map(([re, verb]) => [new RegExp(re.source, `${re.flags.replace('g', '')}g`), verb] as const);
+function attachedVerb(context: string, targetSlug?: string, anchor?: number): string | null | undefined {
+  const fromAnchor = targetSlug && anchor !== undefined ? context.indexOf(targetSlug, anchor) : -1;
+  const at = fromAnchor >= 0 ? fromAnchor : targetSlug ? context.indexOf(targetSlug) : -1;
+  if (at < 0) return undefined;
+  const open = context.lastIndexOf('[', at);
+  const linkStart = open >= 0 && at - open <= 120 ? (context[open - 1] === '[' ? open - 1 : open) : at;
+  const close = context.slice(at).search(/\)|\]\]/);
+  const linkEnd = close >= 0 ? at + close + (context[at + close] === ')' ? 1 : 2) : at + targetSlug!.length;
+  for (const [re, verb] of GLOBAL_VERB_RULES) {
+    for (const m of context.matchAll(re)) {
+      const start = m.index ?? 0; const end = start + m[0].length;
+      if (end <= linkStart && LINK_MARK_RE.test(context.slice(end, linkStart))
+        && !coordinated(context.slice(end, linkStart))) continue;
+      if (start >= linkEnd && (LINK_MARK_RE.test(context.slice(linkEnd, start)) || /^\s*(?:(?:with|at|to|for|of|in|on)\s+)?\[/i.test(context.slice(end)))) continue;
+      return verb;
+    }
   }
-  return false;
+  return null;
 }
 
 /**
@@ -1227,7 +1296,7 @@ function inSuppressedRange(ranges: Array<[number, number]>, idx: number): boolea
  * lists portfolio companies without repeating the investment verb each time
  * ("Her current board seats reflect her portfolio: [Co A], [Co B], [Co C]").
  */
-export function inferLinkType(pageType: PageType, context: string, globalContext?: string, targetSlug?: string, targetType?: string | null): string {
+export function inferLinkType(pageType: PageType, context: string, globalContext?: string, targetSlug?: string, targetType?: string | null, anchor?: number): string {
   if (pageType === 'media') {
     return 'mentions';
   }
@@ -1240,17 +1309,12 @@ export function inferLinkType(pageType: PageType, context: string, globalContext
     return targetType !== undefined ? (targetType === 'person' ? 'attended' : 'mentions')
       : (!targetSlug || targetSlug.startsWith('people/') ? 'attended' : 'mentions');
   }
-  // Per-edge verb rules.
-  if (FOUNDED_RE.test(context)) return 'founded';
-  if (INVESTED_RE.test(context)) return 'invested_in';
-  if (ADVISES_RE.test(context)) return 'advises';
-  if (WORKS_AT_RE.test(context)) return 'works_at';
-  // Chinese link type patterns
-  if (ZH_FOUNDED_RE.test(context)) return 'founded';
-  if (ZH_INVESTED_RE.test(context)) return 'invested_in';
-  if (ZH_ADVISES_RE.test(context)) return 'advises';
-  if (ZH_WORKS_AT_RE.test(context)) return 'works_at';
-  if (ZH_CITED_RE.test(context)) return 'cited';
+  // Per-edge verb rules, precedence founded > invested_in > advises > works_at
+  // (then the Chinese rules), over the verbs that belong to this link: in
+  // "works at [A] and also advises [B]", A is works_at and B advises.
+  const attached = attachedVerb(context, targetSlug, anchor);
+  if (attached) return attached;
+  if (attached === undefined) for (const [re, verb] of VERB_RULES) if (re.test(context)) return verb;
   // Page-role prior: only fires for person -> company links. Concept pages
   // about VC topics naturally contain "venture capital" in their text, but
   // their company refs are mentions, not investments. Partner pages mentioning
@@ -1343,6 +1407,11 @@ export const FRONTMATTER_LINK_MAP: FrontmatterFieldMapping[] = [
 
 // ─── Slug resolver ──────────────────────────────────────────────
 
+export interface ResolveOptions {
+  globalBasename?: boolean;
+  selfSlug?: string;
+}
+
 export interface SlugResolver {
   resolveAttendance?(name: string, dirHint?: string | string[]): Promise<string | null>;
   /**
@@ -1350,8 +1419,13 @@ export interface SlugResolver {
    * Returns null when no match meets confidence threshold — callers should
    * skip (not write a dead link) and the unresolved name goes into the
    * extract/put_page summary so the user can see the gap.
+   *
+   * `globalBasename` (#5749): the caller runs with
+   * `link_resolution.global_basename` on, so a unique page whose slug
+   * basename is `name` (other than `selfSlug`) resolves before any fuzzy or
+   * keyword-search candidate.
    */
-  resolve(name: string, dirHint?: string | string[]): Promise<string | null>;
+  resolve(name: string, dirHint?: string | string[], opts?: ResolveOptions): Promise<string | null>;
   /**
    * Issue #972: return every slug whose basename (final `/`-segment, or
    * the whole slug if it has no `/`) matches `name`. Multi-match by
@@ -1391,7 +1465,7 @@ export function normalizeBasename(s: string): string {
     s.normalize('NFD').replace(/[\u0300-\u036f]/g, '').normalize('NFC')
       .replace(SLUG_VARIATION_SELECTORS_RE, '').toLowerCase(), // twin of slugifySegment's strip (#4985)
   );
-  return folded.replace(BASENAME_KEEP_RE, '').trim().replace(/\s+/g, '-');
+  return folded.replace(BASENAME_KEEP_RE, '').trim().replace(/\s+/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '');
 }
 
 /** Stable order: shorter slug first (likely closer to brain root), then lexical. */
@@ -1513,12 +1587,13 @@ export function makeResolver(
       return queryBasenameIndex(await ensureBasenameIndex(), name);
     },
 
-    async resolve(name: string, dirHint?: string | string[]): Promise<string | null> {
+    async resolve(name: string, dirHint?: string | string[], resolveOpts?: ResolveOptions): Promise<string | null> {
       if (!name || typeof name !== 'string') return null;
       const trimmed = name.trim();
       if (!trimmed) return null;
 
-      const cacheKey = `${trimmed}\u0000${Array.isArray(dirHint) ? dirHint.join(',') : (dirHint || '')}`;
+      const basenameKey = resolveOpts?.globalBasename ? `\u0000basename:${resolveOpts.selfSlug ?? ''}` : '';
+      const cacheKey = `${trimmed}\u0000${Array.isArray(dirHint) ? dirHint.join(',') : (dirHint || '')}${basenameKey}`;
       if (cache.has(cacheKey)) return cache.get(cacheKey)!;
 
       const hints = Array.isArray(dirHint) ? dirHint : (dirHint ? [dirHint] : []);
@@ -1567,6 +1642,20 @@ export function makeResolver(
             cache.set(cacheKey, candidate);
             return candidate;
           }
+        }
+      }
+
+      // Step 2.5 (#5749): with link_resolution.global_basename on, a unique
+      // page whose slug basename IS the name wins before fuzzy or keyword
+      // evidence about some other page — the exact-name-first precedence of
+      // resolveEntitySlug (#5769). Without it the live keyword step let a
+      // transcript that repeats the term take over a correct frontmatter edge.
+      if (resolveOpts?.globalBasename) {
+        const matches = queryBasenameIndex(await ensureBasenameIndex(), trimmed)
+          .filter(s => s !== resolveOpts.selfSlug);
+        if (matches.length === 1) {
+          cache.set(cacheKey, matches[0]);
+          return matches[0];
         }
       }
 
@@ -1689,7 +1778,10 @@ export async function extractFrontmatterLinks(
         const prefixes = pack.page_types?.find(pt => pt.name === expectedType)?.path_prefixes.map(p => p.replace(/^\/+|\/+$/g, ''));
         const legacy = FRONTMATTER_LINK_MAP.find(mapping => mapping.fields.includes(field)
           && (!mapping.pageType || mapping.pageType === pageType));
-        packMappings.push({ fields: [field], type, direction: 'outgoing', dirHint: prefixes?.length ? prefixes : legacy?.dirHint ?? '' });
+        const declared = FRONTMATTER_LINK_MAP.find(mapping => mapping.type === type
+          && (!mapping.pageType || mapping.pageType === pageType));
+        packMappings.push({ fields: [field], type, direction: declared?.direction ?? 'outgoing',
+          dirHint: prefixes?.length ? prefixes : legacy?.dirHint ?? '' });
       }
     }
   }
@@ -1733,7 +1825,8 @@ export async function extractFrontmatterLinks(
         const linkTarget = unwrapWikilink(name);
         const canonicalAttendance = mapping.type === 'attended' && mapping.direction === 'incoming';
         let resolved = await (canonicalAttendance && resolver.resolveAttendance
-          ? resolver.resolveAttendance(linkTarget, mapping.dirHint) : resolver.resolve(linkTarget, mapping.dirHint));
+          ? resolver.resolveAttendance(linkTarget, mapping.dirHint)
+          : resolver.resolve(linkTarget, mapping.dirHint, globalBasename ? { globalBasename, selfSlug: slug } : undefined));
         if (!resolved && globalBasename && !(canonicalAttendance && resolver.resolveAttendance)
           && typeof resolver.resolveBasenameMatches === 'function') {
           // Issue #972 follow-up: extend global_basename resolution to
@@ -1756,10 +1849,10 @@ export async function extractFrontmatterLinks(
           continue;
         }
         onResolvedTarget?.(resolved);
-        const expectedType = packMappings.includes(mapping)
-          ? pack?.link_types.find(lt => lt.name === mapping.type)?.inference?.target_type
-          : mapping.type === 'attended' && mapping.direction === 'incoming' ? 'person' : undefined;
-        if (expectedType && (targetType || packMappings.includes(mapping)) && targetType?.(resolved) !== expectedType) {
+        const packTargetType = packMappings.includes(mapping)
+          ? pack?.link_types.find(lt => lt.name === mapping.type)?.inference?.target_type : undefined;
+        const expectedType = canonicalAttendance ? 'person' : packTargetType;
+        if (expectedType && (targetType || packTargetType) && targetType?.(resolved) !== expectedType) {
           if (targetType?.(resolved) === undefined && mapping.type === 'attended') attendanceComplete = false;
           unresolved.push({ field, name, reason: 'target_type_mismatch' });
           continue;
@@ -1851,6 +1944,9 @@ const TIMELINE_LINE_RE = /^\s*(?:-\s*)?\*\*(\d{4}-\d{2}-\d{2})\*\*\s*([|\-–—
 // ASCII dates were never timeline entries and must stay that way.
 const TIMELINE_LINE_RE_CN = /^\s*(?:-\s*)?(?:\*\*)?(\d{4})年(\d{1,2})月(\d{1,2})日?(?:\*\*)?\s*([|\-–—]+)\s*(.+?)\s*$/;
 
+// `### YYYY-MM-DD — summary` headings, as the FS extractor (timeline-extract.ts Format 2) accepts.
+const TIMELINE_HEADING_RE = /^\s*###\s+(\d{4}-\d{2}-\d{2})\s*[\-–—]+\s*(.+?)\s*$/;
+
 /**
  * Parse timeline entries from content. Looks at:
  *   - The full content (most pages have a top-level "## Timeline" heading).
@@ -1866,23 +1962,32 @@ export function parseTimelineEntries(content: string): TimelineCandidate[] {
 
   let i = 0;
   while (i < lines.length) {
-    // Try English format first, then Chinese
-    const m = TIMELINE_LINE_RE.exec(lines[i]);
+    const headingMatch = TIMELINE_HEADING_RE.exec(lines[i]);
+    const isHeadingEntry = headingMatch !== null;
     let date: string;
     let summary: string;
-    let separator: string;
-    if (m) {
-      date = m[1];
-      separator = m[2];
-      summary = m[3].trim();
+    let separator = '';
+
+    if (headingMatch) {
+      date = headingMatch[1];
+      summary = headingMatch[2].trim();
     } else {
-      const cm = TIMELINE_LINE_RE_CN.exec(lines[i]);
-      if (!cm) { i++; continue; }
-      // Normalize Chinese date to YYYY-MM-DD
-      date = `${cm[1]}-${cm[2].padStart(2, '0')}-${cm[3].padStart(2, '0')}`;
-      separator = cm[4];
-      summary = cm[5].trim();
+      // Try English bullet format first, then Chinese.
+      const lineMatch = TIMELINE_LINE_RE.exec(lines[i]);
+      if (lineMatch) {
+        date = lineMatch[1];
+        separator = lineMatch[2];
+        summary = lineMatch[3].trim();
+      } else {
+        const chineseMatch = TIMELINE_LINE_RE_CN.exec(lines[i]);
+        if (!chineseMatch) { i++; continue; }
+        // Normalize Chinese date to YYYY-MM-DD.
+        date = `${chineseMatch[1]}-${chineseMatch[2].padStart(2, '0')}-${chineseMatch[3].padStart(2, '0')}`;
+        separator = chineseMatch[4];
+        summary = chineseMatch[5].trim();
+      }
     }
+
     if (!isValidDate(date) || summary.length === 0) { i++; continue; }
     // #4277: backlink materialization historically wrote dated navigation
     // receipts such as `- **2026-06-13** | Referenced in [Acme](../companies/acme.md)`.
@@ -1898,7 +2003,7 @@ export function parseTimelineEntries(content: string): TimelineCandidate[] {
     // shape; split them exactly like the FS extractor (extractTimelineFromContent
     // Format 1) so FS- and DB-extracted rows share one (source, summary) shape
     // and the DB dedup index collapses re-extractions instead of duplicating.
-    // Dash-separated bullets (`- **DATE** - text`) are one summary — no split.
+    // Dash-separated bullets and dated headings are one summary — no split.
     let source = 'markdown';
     if (separator.includes('|')) {
       const at = findTimelineSourceDelimiter(summary);
@@ -1912,7 +2017,7 @@ export function parseTimelineEntries(content: string): TimelineCandidate[] {
     let j = i + 1;
     while (j < lines.length) {
       const next = lines[j];
-      if (TIMELINE_LINE_RE.test(next)) break;
+      if (TIMELINE_LINE_RE.test(next) || TIMELINE_HEADING_RE.test(next)) break;
       if (/^#{1,6}\s/.test(next) || isMaterializedMarkerLine(next)) break; // #5567: a marker opens the next bullet
       if (next.trim().length === 0 && detailLines.length === 0) {
         // skip leading blank line; if we hit a blank after detail content
@@ -1921,8 +2026,7 @@ export function parseTimelineEntries(content: string): TimelineCandidate[] {
         continue;
       }
       if (next.trim().length === 0 && detailLines.length > 0) break;
-      // Indented continuation lines are detail; flush-left non-list lines too.
-      if (/^\s+/.test(next) || (!next.startsWith('-') && !next.startsWith('*') && !next.startsWith('#'))) {
+      if (isHeadingEntry || /^\s+/.test(next) || (!next.startsWith('-') && !next.startsWith('*') && !next.startsWith('#'))) {
         detailLines.push(next.trim());
         j++;
         continue;
@@ -1958,7 +2062,7 @@ function isValidDate(s: string): boolean {
   if (mo < 1 || mo > 12) return false;
   if (d < 1 || d > 31) return false;
   // Use Date object as final check (catches 2026-02-30 etc.)
-  const dt = new Date(Date.UTC(y, mo - 1, d));
+  const dt = new Date(new Date(0).setUTCFullYear(y, mo - 1, d)); // not Date.UTC: it maps years 0-99 to 1900-1999
   return dt.getUTCFullYear() === y && dt.getUTCMonth() === mo - 1 && dt.getUTCDate() === d;
 }
 

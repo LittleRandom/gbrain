@@ -16,23 +16,13 @@ import { isTimeoutError, pushDegraded } from './degraded.ts';
 import { markKeywordHits } from '../evidence.ts';
 import { resolveEffectiveRecency, resolveEffectiveSalience } from './effective-modes.ts';
 import { searchSalvageEnabled } from '../token-budget.ts';
-import { warnOncePerProcess } from '../../utils.ts';
+import { isDatetimeInputError, warnOncePerProcess } from '../../utils.ts';
 
 export interface LexicalArms {
   earlyModality: ModalityMode;
   keywordResults: SearchResult[];
   titleResults: SearchResult[];
   exactLookupOpts: ExactLookupOpts;
-}
-
-/**
- * SQLSTATE 22007 / 22008: a date bound the database could not cast. That is
- * the caller's input, never a degraded arm, so it surfaces instead of
- * becoming an empty result.
- */
-function isDatetimeInputError(err: unknown): boolean {
-  const code = (err as { code?: unknown } | null)?.code;
-  return code === '22007' || code === '22008';
 }
 
 /** Keyword + title FTS arms, fetched concurrently (fail-open per arm, rethrow when both hit a dead database). */
@@ -181,7 +171,12 @@ export async function buildRelationalList(req: HybridRequest): Promise<SearchRes
       excludePrivate: opts?.excludePrivate,
       requireSafeChunks: opts?.requireSafeChunks,
       takesHoldersAllowList: opts?.takesHoldersAllowList,
-      onMeta: opts?.onRelationalMeta,
+      planner: resolvedMode.relational_planner,
+      orientOneHop: resolvedMode.relational_orient_onehop ?? resolvedMode.relational_planner,
+      onMeta: (m) => {
+        if (m.plan) req.relationalPlan = m.plan;
+        opts?.onRelationalMeta?.(m);
+      },
     });
   }
   return relationalList;
@@ -371,8 +366,11 @@ export async function runVectorArms(
     // the global default. Empty embeddingModel falls back to gateway
     // default — preserves pre-v0.36 behavior for the builtin 'embedding'
     // column.
-    const embedOpts = resolvedCol.embeddingModel
-      ? { embeddingModel: resolvedCol.embeddingModel, dimensions: resolvedCol.dimensions }
+    const embedOpts = resolvedCol.embeddingModel || opts?._queryPrefix
+      ? {
+        ...(resolvedCol.embeddingModel ? { embeddingModel: resolvedCol.embeddingModel, dimensions: resolvedCol.dimensions } : {}),
+        ...(opts?._queryPrefix ? { queryPrefix: opts._queryPrefix } : {}),
+      }
       : undefined;
     // v0.42.20.0 (Fix 3) — bound the query embed. Reuse the shared deadline
     // threaded from hybridSearchCached (so the cache-lookup embed + this one

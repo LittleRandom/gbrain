@@ -21,6 +21,7 @@ import { parseMarkdown } from '../markdown.ts';
 import { sanitizeText } from '../batch-rows.ts';
 import { contentHash } from '../utils.ts';
 import { recordFactWithdrawal } from './withdrawal.ts';
+import { maintenanceTransaction } from '../persistence/attribution.ts';
 import { withdrawnFact } from './withdrawal-overlay.ts';
 
 export interface ForgetFactResult {
@@ -62,7 +63,7 @@ const FENCE_END = '<!--- gbrain:facts:end -->';
  * `superseded by #N` reference instead of the withdrawal marker, so the next
  * reconcile links it and it never becomes a durable withdrawal.
  */
-function supersededFact(fact: ParsedFact, today: string, newRowNum: number | null): ParsedFact {
+export function supersededFact(fact: ParsedFact, today: string, newRowNum: number | null): ParsedFact {
   const context = [newRowNum !== null ? `superseded by #${newRowNum}` : 'superseded', fact.context?.trim()].filter(Boolean).join(' | ');
   const validUntil = fact.validUntil && /^\d{4}-\d{2}-\d{2}$/.test(fact.validUntil) && fact.validUntil < today ? fact.validUntil : today;
   return { ...fact, active: false, validUntil, context };
@@ -75,7 +76,7 @@ function supersededFact(fact: ParsedFact, today: string, newRowNum: number | nul
  * fence lacks the row (DB drifted from markdown) or its markers — callers
  * fall back to a DB-only expire.
  */
-function strikeFenceRow(body: string, rowNum: number, strike: (fact: ParsedFact) => ParsedFact): string | null {
+export function strikeFenceRow(body: string, rowNum: number, strike: (fact: ParsedFact) => ParsedFact): string | null {
   const parsed = parseFactsFence(body);
   const target = parsed.facts.find(f => f.rowNum === rowNum);
   if (!target) return null;
@@ -161,10 +162,10 @@ export async function forgetFactInFence(
   // withdrawn claim. Intent commits independently of filesystem availability.
   // A supersession only expires the row.
   if (supersession) {
-    await engine.executeRaw(`UPDATE facts SET valid_until = LEAST(COALESCE(valid_until, now()), now()), expired_at = now()
-      WHERE id = $1 AND expired_at IS NULL`, [factId]);
+    await maintenanceTransaction(engine, tx => tx.executeRaw(`UPDATE facts SET valid_until = LEAST(COALESCE(valid_until, now()), now()), expired_at = now()
+      WHERE id = $1 AND expired_at IS NULL`, [factId]));
   } else {
-    await recordFactWithdrawal(engine, factId, row.source_id, opts.worldOnly === true);
+    await maintenanceTransaction(engine, tx => recordFactWithdrawal(tx, factId, row.source_id, opts.worldOnly === true));
   }
 
   if (row.expired_at !== null) {
@@ -185,8 +186,8 @@ export async function forgetFactInFence(
     // content_chunks with the live claim for good. A row-shaped hash over the
     // struck body can never equal the unchanged file's, so the next sync
     // re-imports + re-chunks through the withdrawal overlay.
-    await engine.refreshPageBody(slug, row.source_id, struck, page.timeline ?? '',
-      contentHash({ ...page, compiled_truth: struck }));
+    await maintenanceTransaction(engine, tx => tx.refreshPageBody(slug, row.source_id, struck, page.timeline ?? '',
+      contentHash({ ...page, compiled_truth: struck })));
   };
 
   // DB-only path: the withdrawal remains authoritative during reimport.
@@ -266,11 +267,11 @@ export async function forgetFactInFence(
       // This keeps DB query patterns (active facts WHERE expired_at IS NULL)
       // accurate the moment the forget commits, without waiting for the
       // next extract_facts cycle phase to reconcile.
-      await engine.executeRaw(
+      await maintenanceTransaction(engine, tx => tx.executeRaw(
         `UPDATE facts SET valid_until = $1, expired_at = now()
          WHERE id = $2 AND expired_at IS NULL`,
         [today, factId],
-      );
+      ));
 
       // #4696: mirror the rewritten file into the DB body, or the reconcile
       // (which reads pages.compiled_truth) resurrects the claim before the
@@ -287,9 +288,9 @@ export async function forgetFactInFence(
         const reparsed = parseMarkdown(tmpBody, `${slug}.md`);
         const page = await engine.getPage(slug, { sourceId: row.source_id });
         if (page) {
-          await engine.refreshPageBody(slug, row.source_id,
+          await maintenanceTransaction(engine, tx => tx.refreshPageBody(slug, row.source_id,
             sanitizeText(reparsed.compiled_truth), sanitizeText(reparsed.timeline),
-            page.content_hash || contentHash(page));
+            page.content_hash || contentHash(page)));
         }
       } catch { /* degrades to the pre-#4696 window (stale until the next sync) */ }
 

@@ -62,6 +62,7 @@ export const DOMAIN_OF: Record<string, string> = {
   'transactionOn': OOS.helper,
   'withReservedConnection': OOS.lifecycle,
   'getPoolDiagnostics': OOS.lifecycle,
+  'onCheckout': OOS.lifecycle,
   'reconnect': OOS.lifecycle,
   'runUnsafe': OOS.helper,
   'executeRaw': OOS.lifecycle,
@@ -74,6 +75,8 @@ export const DOMAIN_OF: Record<string, string> = {
   'activeEmbeddingColId': OOS.helper,
   '_upsertChunksOnce': OOS.helper,
   '_searchKeywordCJK': OOS.helper,
+  'runVectorAttempt': OOS.helper,
+  'vectorIterativeScanSupported': OOS.helper,
 
   // pages
   'getPage': 'pages', 'readPageSnapshot': 'pages', 'lockPageKeys': 'pages', 'findDuplicatePage': 'pages',
@@ -85,6 +88,7 @@ export const DOMAIN_OF: Record<string, string> = {
   'createVersion': 'pages', 'getVersions': 'pages', 'revertToVersion': 'pages', 'updateSlug': 'pages',
   'resolveSlugWithAlias': 'pages', 'resolveSlugWithAliasDetailed': 'pages', 'setPageAliases': 'pages',
   'countStalePagesForExtraction': 'pages', 'listStalePagesForExtraction': 'pages', 'markPagesExtractedBatch': 'pages',
+  'markPagesAttendanceBlocked': 'pages',
   // links
   'addLink': 'links', 'addLinksBatch': 'links', 'replaceDerivedLinks': 'links', 'removeLinksByPagesAndSource': 'links',
   'removeLink': 'links', 'getLinks': 'links', 'getBacklinks': 'links', 'listLinkSources': 'links',
@@ -108,7 +112,7 @@ export const DOMAIN_OF: Record<string, string> = {
   'getEmbeddingsByChunkIds': 'chunks', 'getChunksWithEmbeddings': 'chunks',
   // facts (incl. the ontology rows of the facts table)
   'insertFact': 'facts', 'expireFact': 'facts', 'insertFacts': 'facts', 'deleteFactsForPage': 'facts',
-  'listFactsByEntity': 'facts', 'listFactsSince': 'facts', 'listFactsBySession': 'facts', 'listSupersessions': 'facts',
+  'listFactsByEntity': 'facts', 'listFactsSince': 'facts', 'listFactsKeyset': 'facts', 'listFactsBySession': 'facts', 'listSupersessions': 'facts',
   'countUnconsolidatedFacts': 'facts', 'findCandidateDuplicates': 'facts', 'consolidateFact': 'facts',
   'findTrajectory': 'facts', 'getFactsHealth': 'facts', 'migrateFactsToCanonical': 'facts',
   'mergeOntologyFact': 'facts', 'getOntology': 'facts', 'discoverOntologyDimensions': 'facts', 'findOntologyConflicts': 'facts',
@@ -129,8 +133,8 @@ export const DOMAIN_OF: Record<string, string> = {
   'searchKeyword': 'cjk-search', 'searchKeywordChunks': 'cjk-search',
 
   // out of scope
-  'searchTitles': OOS.search, 'searchVector': OOS.search,
-  'relationalFanout': OOS.enrichment, 'getBacklinkCounts': OOS.enrichment, 'getAdjacencyBoosts': OOS.enrichment,
+  'searchTitles': OOS.search, 'searchVector': OOS.search, 'explainVectorSearch': OOS.search,
+  'relationalFanout': OOS.enrichment, 'relationalChainHop': OOS.enrichment, 'getBacklinkCounts': OOS.enrichment, 'getAdjacencyBoosts': OOS.enrichment,
   'getContentFlagsByPageIds': OOS.enrichment, 'getUnverifiedExtractionPageIds': OOS.enrichment,
   'getEffectiveDates': OOS.enrichment, 'getSalienceScores': OOS.enrichment, 'resolveAliases': OOS.enrichment,
   'getStats': OOS.stats, 'getHealth': OOS.stats,
@@ -349,6 +353,8 @@ export const SQL_CASES: SqlCase[] = [
     ['sourceId', (e) => e.getVersions(SLUG, { sourceId: SRC })],
     ['sourceIds', (e) => e.getVersions(SLUG, { sourceIds: SRCS })],
     ['excludePrivate', (e) => e.getVersions(SLUG, { excludePrivate: true })],
+    ['limit', (e) => e.getVersions(SLUG, { sourceId: SRC, limit: 3 })],
+    ['metadataOnly', (e) => e.getVersions(SLUG, { sourceIds: SRCS, includeBody: false })],
   ]),
   ...variants('revertToVersion', [
     ['default', (e) => e.revertToVersion(SLUG, 3)],
@@ -370,12 +376,15 @@ export const SQL_CASES: SqlCase[] = [
   ...variants('countStalePagesForExtraction', [
     ['default', (e) => e.countStalePagesForExtraction()],
     ['versionTs+sourceId', (e) => e.countStalePagesForExtraction({ versionTs: '2026-01-01T00:00:00Z', sourceId: SRC })],
+    ['attendance-exclude', (e) => e.countStalePagesForExtraction({ versionTs: '2026-01-01T00:00:00Z', attendance: 'exclude' })],
+    ['attendance-blocked+sourceId', (e) => e.countStalePagesForExtraction({ versionTs: '2026-01-01T00:00:00Z', sourceId: SRC, attendance: 'blocked' })],
   ]),
   ...variants('listStalePagesForExtraction', [
     ['default', (e) => e.listStalePagesForExtraction({ batchSize: 10 })],
     ['afterPageId+versionTs+sourceId', (e) => e.listStalePagesForExtraction({ batchSize: 10, afterPageId: 4, versionTs: '2026-01-01T00:00:00Z', sourceId: SRC })],
   ]),
   ...variants('markPagesExtractedBatch', [['default', (e) => e.markPagesExtractedBatch([{ slug: SLUG, source_id: SRC }], '2026-01-01T00:00:00Z')]]),
+  ...variants('markPagesAttendanceBlocked', [['default', (e) => e.markPagesAttendanceBlocked([{ slug: SLUG, source_id: SRC, revision: '00000000-0000-4000-8000-000000000001' }])]]),
 
   // ── links ──
   ...variants('addLink', [
@@ -575,6 +584,11 @@ export const SQL_CASES: SqlCase[] = [
     ['default', (e) => e.listFactsByEntity(SRC, SLUG)],
     ['allFilters', (e) => e.listFactsByEntity(SRC, SLUG, { activeOnly: false, unconsolidatedOnly: true, kinds: ['fact'], visibility: ['world'], excludeAuditRows: true, grep: 'acme' })],
   ]),
+  ...variants('listFactsKeyset', [
+    ['default', (e) => e.listFactsKeyset(SRC, null)],
+    ['strictTime', (e) => e.listFactsKeyset(SRC, { createdAt: '2026-08-10T12:00:00.000100Z', id: null }, { visibility: ['world'] })],
+    ['keyset', (e) => e.listFactsKeyset(SRC, { createdAt: '2026-08-10T12:00:00.000100Z', id: 7 }, { activeOnly: false, fingerprint: true, limit: 51 })],
+  ]),
   ...variants('listFactsSince', [
     ['default', (e) => e.listFactsSince(SRC, EPOCH)],
     ['allFilters', (e) => e.listFactsSince(SRC, EPOCH, { entitySlug: SLUG, sessionId: 's1', eventTime: true, activeOnly: false, unconsolidatedOnly: true, kinds: ['fact'], visibility: ['world'], excludeAuditRows: true, grep: 'acme' })],
@@ -649,7 +663,7 @@ export const SQL_CASES: SqlCase[] = [
   ...variants('getTakeEmbeddings', [['default', (e) => e.getTakeEmbeddings([1, 2])]]),
   ...variants('countStaleTakes', [['default', (e) => e.countStaleTakes()]]),
   ...variants('listStaleTakes', [['default', (e) => e.listStaleTakes()]]),
-  ...variants('updateTakeEmbeddings', [['default', (e) => e.updateTakeEmbeddings([{ take_id: 1, embedding: EMB }])]]),
+  ...variants('updateTakeEmbeddings', [['default', (e) => e.updateTakeEmbeddings([{ take_id: 1, embedding: EMB, claim: 'x', model: 'openai:text-embedding-3-large' }])]]),
   ...variants('updateTake', [
     ['default', (e) => e.updateTake(1, 1, { since_date: '2026-01-01' }), [[/UPDATE takes/, [{ id: 1 }]]]],
     ['weight', (e) => e.updateTake(1, 1, { weight: 0.8 }), [[/UPDATE takes/, [{ id: 1 }]]]],
@@ -746,7 +760,7 @@ export const EXTRA_READ_CASES: SqlCase[] = [
   ...variants('searchTitles', [['default', (e) => e.searchTitles('alice example', { sourceId: SRC })]]),
   ...variants('searchVector', [['default', (e) => e.searchVector(EMB, { sourceId: SRC }), [[/AS eligible/, [{ eligible: 0 }]]]]]),
   ...variants('getStats', [['default', (e) => e.getStats(), [[/as page_count/, [{ page_count: 0, chunk_count: 0, embedded_count: 0, link_count: 0, tag_count: 0, timeline_entry_count: 0 }]]]]]),
-  ...variants('getHealth', [['default', (e) => e.getHealth(), [[/WITH scoped_pages/, [{ page_count: 0, embed_coverage: 1, dead_links: 0, missing_embeddings: 0, link_count: 0, entity_page_count: 0, link_coverage: 0, timeline_coverage: 0 }]]]]]),
+  ...variants('getHealth', [['default', (e) => e.getHealth(), [[/chunk_totals AS/, [{ page_count: 0, embed_coverage: 1, dead_links: 0, missing_embeddings: 0, link_count: 0, entity_page_count: 0, link_coverage: 0, timeline_coverage: 0 }]]]]]),
   ...variants('getRawData', [['default', (e) => e.getRawData(SLUG)]]),
   ...variants('getIngestLog', [['default', (e) => e.getIngestLog()]]),
   ...variants('getConfig', [['default', (e) => e.getConfig('embedding_model')]]),
