@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { isInsideGitRepo } from '../git-remote.ts';
 import { posix } from 'node:path';
 import { parseDataFrontmatter } from '../data-frontmatter.ts';
 import { parseMarkdown } from '../markdown.ts';
@@ -8,6 +9,7 @@ import { buildSourceLocalReferenceIndex, frontmatterReferenceHints } from '../so
 import { slugifyPath } from '../sync.ts';
 import { opError, OperationError } from '../ops/contract.ts';
 import { QUARANTINE_KEY } from '../quarantine.ts';
+import { QUARANTINE_OVERRIDE_KEY } from '../quarantine-override.ts';
 import { EMBED_SKIP_KEY } from '../embed-skip.ts';
 import { loadResolvedPackByName } from '../schema-pack/load-active.ts';
 import { invalidatePackCache, type ResolvedPack } from '../schema-pack/registry.ts';
@@ -109,7 +111,7 @@ function readPage(content: string, entry: InspectionEntry, plan: CompanyBrainPla
   const path = entry.path;
   const raw = parseDataFrontmatter(content).data;
   canonical(raw, Math.min(plan.limits.maxMetadataBytes, 256 * 1024));
-  if (Object.hasOwn(raw, QUARANTINE_KEY) || Object.hasOwn(raw, EMBED_SKIP_KEY)) {
+  if (Object.hasOwn(raw, QUARANTINE_KEY) || Object.hasOwn(raw, EMBED_SKIP_KEY) || Object.hasOwn(raw, QUARANTINE_OVERRIDE_KEY)) {
     entry.disposition = 'unsupported';
     entry.reason = 'hidden_input';
     finding(plan, 'error', 'hidden_input', 'A reserved search-hiding marker is present. Review it or exclude this file before connecting; markers are never cleared automatically.', path);
@@ -307,7 +309,7 @@ export async function inspectCompanyBrain(options: InspectCompanyBrainOptions): 
         finding(plan, include.length ? 'error' : 'warning', 'unsupported_file', 'Only committed Markdown is supported; this file is not selected for import.', item.path);
       } else if (item.bytes === null || item.bytes > limits.maxFileBytes) {
         entry.disposition = 'unsupported'; entry.reason = 'file_too_large';
-        finding(plan, 'error', 'request_too_large', 'Markdown exceeds the import file limit; split it into smaller files.', item.path);
+        finding(plan, 'error', 'request_too_large', `Markdown exceeds the company-brain file limit (${limits.maxFileBytes} bytes, separate from the 24 MiB page limit); split it into smaller files.`, item.path);
       } else {
         try {
           const bytes = await readCommittedBlob(plan.revision, item, limits);
@@ -345,7 +347,7 @@ export async function inspectCompanyBrain(options: InspectCompanyBrainOptions): 
     if (companyBrainDigest(after) !== companyBrainDigest(plan.revision)) finding(plan, 'error', 'plan_stale', 'The checkout identity or revision changed during inspection; inspect again.');
   } catch (error) {
     finding(plan, 'error', error instanceof OperationError ? error.code : 'invalid_source',
-      error instanceof OperationError && error.code === 'request_too_large' ? 'Inspection exceeds the bounded entry or metadata limit; partition the repository or narrow selection.' : 'Inspect a committed local Git directory with a stable, safe root. No input was changed.');
+      error instanceof OperationError && error.code === 'request_too_large' ? 'Inspection exceeds the bounded entry or metadata limit; partition the repository or narrow selection.' : notGitRepository(options.path) ? 'This folder is not a Git repository, and sources inspect reviews a committed company-brain checkout. To add a plain folder of notes, run gbrain sources add <id> --path <folder>. No input was changed.' : 'Inspect a committed local Git directory with a stable, safe root. No input was changed.');
   }
   for (const entry of plan.manifest) { plan.counts.tracked++; plan.counts[entry.disposition]++; }
   plan.counts.dirty_eligible = plan.uncommitted.filter(item => item.eligible).length;
@@ -395,4 +397,10 @@ export async function validateCompanyBrainPlan(saved: unknown, options: InspectC
     if (!plan.ready) return { valid: false, code: 'source_not_ready', findings: plan.findings, plan: fresh };
     return { valid: true, code: 'ok', findings: fresh.findings, plan: fresh };
   } catch { return stale(); }
+}
+
+
+/** GST-2732: a plain folder gets a pointer to \`sources add\` instead of the generic Git refusal. */
+function notGitRepository(path: string): boolean {
+  try { return !isInsideGitRepo(path); } catch { return false; }
 }

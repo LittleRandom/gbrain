@@ -2,7 +2,9 @@
  * CLI→MCP gap-closure wave [OV6] — per-subcommand thin-client routing for the
  * commands whose reads/writes gained MCP ops: takes (list/search/scorecard/
  * calibration + the write verbs), search (modes/stats/tune, read-only forms),
- * jobs stats, cache stats, and quarantine list. The salience/anomalies/
+ * jobs stats, cache stats, quarantine list, wakeshift watch (watch_job /
+ * watch_write_request / watch_cron) and wakeshift accept-terms
+ * (accept_wakeshift_terms). The salience/anomalies/
  * graph-query precedent, engine-free: each routable subcommand maps onto its
  * op over callRemoteTool; everything else returns false so the caller falls
  * through to refuseThinClient's pinpoint hint.
@@ -62,6 +64,21 @@ export async function routeThinClientCommand(
   const sub = args[0];
   const rest = args.slice(1);
 
+  // #8543: bare `serve` (or gbrain's own registration flags) is the stdio bridge to the remote brain; every other serve
+  // form refuses here with a fix that keeps its flags, so the caller's generic refusal never renders `Fix: gbrain serve`.
+  if (command === 'serve' && !args.includes('--help') && !args.includes('-h')) {
+    const { parseBridgeServeArgs, serveThinClientRefusal } = await import('../mcp/remote-bridge-args.ts');
+    const { exitCliError, usageError } = await import('../cli/cli-error.ts');
+    const { getCliOptions } = await import('../core/cli-options.ts');
+    if (getCliOptions().brain) exitCliError(usageError('--brain is not supported on a thin-client install: the remote server is a single brain.', 'Remove --brain, or run from a machine with local mounts (`gbrain mounts list`).'), 'serve');
+    const parsed = (() => { try { return parseBridgeServeArgs(args); } catch (error) { return exitCliError(error, 'serve'); } })();
+    if (!parsed.bridge) return exitCliError(serveThinClientRefusal(parsed.refused, cfg.remote_mcp?.mcp_url ?? ''), 'serve');
+    const { startRemoteStdioBridge } = await import('../mcp/remote-bridge.ts');
+    const timeoutMs = getCliOptions().timeoutMs;
+    await startRemoteStdioBridge(cfg, { surface: parsed.surface, advertise: parsed.advertise, sourceGuard: parsed.sourceGuard, ...(timeoutMs ? { timeoutMs } : {}) });
+    return true;
+  }
+
   if (command === 'sources' && sub === 'shared-skills') {
     if (rest.includes('--help') || rest.includes('-h')) {
       console.log((await import('./sources-shared-skills.ts')).SOURCES_SHARED_SKILLS_HELP);
@@ -72,6 +89,26 @@ export async function routeThinClientCommand(
     const { sharedSkillsRemoteRefusal } = await import('../core/shared-skills/source-opt-out.ts');
     const { exitCliError } = await import('../cli/cli-error.ts');
     exitCliError(sharedSkillsRemoteRefusal(id, action === 'on' || action === 'off' ? action : 'status'), 'sources');
+  }
+
+  if (command === 'beliefs' && sub === 'changes' && !rest.includes('--help') && !rest.includes('-h')) {
+    if (rest.includes('--source') || rest.some(a => a.startsWith('--source='))) return false; // the remote token names the source
+    const { beliefsChangesArgs } = await import('./beliefs.ts');
+    const { renderBeliefChanges } = await import('../core/belief/changes.ts');
+    const { opError, OperationError } = await import('../core/ops/contract.ts');
+    const { writeCliError } = await import('../cli/cli-error.ts');
+    const { jsonRequested, setCliExitVerdict } = await import('../core/cli-force-exit.ts');
+    try {
+      const { entities, since } = beliefsChangesArgs(args);
+      const result = await call(cfg, 'delta', { since, beliefs: true, ...(entities.length ? { entities: entities.join(',') } : {}) }) as { beliefs?: import('../core/belief/changes.ts').BeliefChanges };
+      if (!result?.beliefs) throw opError('unavailable', 'The remote brain\'s delta does not return belief changes: the brain host runs a gbrain older than the belief ledger weekly diff.', 'Upgrade gbrain on the brain host (gbrain upgrade there).');
+      if (jsonRequested(args)) printJson(result.beliefs);
+      else console.log(renderBeliefChanges(result.beliefs));
+    } catch (error) {
+      if (!(error instanceof OperationError)) throw error;
+      setCliExitVerdict(writeCliError(error, 'beliefs', { json: jsonRequested(args) }));
+    }
+    return true;
   }
 
   if (command === 'config') {
@@ -98,6 +135,7 @@ export async function routeThinClientCommand(
         return true;
       }
       case 'scorecard': {
+        if (rest.includes('--group-by') || rest.includes('--min-n')) return false; // W7: private journal groups, host-bound
         const holder = rest[0] && !rest[0].startsWith('--') ? rest[0] : flagValue(rest, '--holder');
         printJson(await call(cfg, 'takes_scorecard', { ...(holder ? { holder } : {}) }));
         return true;
@@ -120,7 +158,7 @@ export async function routeThinClientCommand(
   }
 
   if (command === 'search') {
-    if (sub === 'modes' && !rest.includes('--reset') && !rest.includes('--source')) {
+    if (sub === 'modes' && !rest.includes('--reset') && !rest.includes('--source') && !rest.includes('--mode')) {
       printJson(await call(cfg, 'search_modes', {}));
       return true;
     }
@@ -132,7 +170,13 @@ export async function routeThinClientCommand(
       printJson(await call(cfg, 'search_tune', {}));
       return true;
     }
-    return false; // modes --reset / modes --source (the reset dry-run) / tune --apply / diagnose — host-side config or live probe
+    return false; // modes --reset / modes --mode|--source (the reset dry-run) / tune --apply / diagnose — host-side config or live probe
+  }
+
+  if (command === 'wakeshift' && (sub === 'watch' || sub === 'accept-terms')) {
+    const { runWakeshiftWatchRemote } = await import('./wakeshift-watch.ts');
+    await runWakeshiftWatchRemote(cfg, sub === 'watch' ? rest : ['accept-terms', ...rest]);
+    return true;
   }
 
   if (command === 'jobs' && sub === 'stats') {

@@ -1,4 +1,5 @@
 import { bodyWriteChunkVersion } from './search/safe-chunks.ts';
+import { assertInlineBody } from './page-body/page-shape.ts';
 /**
  * #1856 — write-through for manual timeline entries.
  *
@@ -66,6 +67,7 @@ import {
   type PushLogOutcome,
 } from './brain-repo-durability.ts';
 import { extractTimelineFromContent } from './timeline-extract.ts';
+import { readOnlyCheckout } from './persistence/mirror-read-only.ts';
 
 /** Raw op params for one manual timeline entry (date pre-validated by caller). */
 export interface TimelineEntryWriteInput {
@@ -105,6 +107,8 @@ export interface TimelineWriteThroughOutcome {
   /** Why the FS-canonical path didn't apply (when handled=false). */
   skipped?:
     | 'disabled_by_config'
+    | 'mirror_read_only'
+    | 'url_clone'
     | 'no_repo_configured'
     | 'repo_not_found'
     | 'source_repo_belongs_to_other_source'
@@ -245,6 +249,8 @@ export function spliceTimelineIntoFileText(fileText: string, date: string, block
     if (m) bullets.push({ index: i, date: m[1] });
   }
 
+  // #7738: a body that ends with an empty sentinel gets the same headed section spliceTimelineBlock('') writes.
+  if (lines.slice(sentinel + 1).every(line => !line.trim())) return `${lines.slice(0, sentinel + 1).join('\n')}\n\n## Timeline\n\n${block}\n`;
   let insertAt: number;
   if (bullets.length === 0) {
     // Empty timeline section (possibly followed by other sections): insert
@@ -308,6 +314,8 @@ export async function writeTimelineEntryThrough(
     if (await isWriteThroughDisabled(engine)) {
       return { handled: false, skipped: 'disabled_by_config' };
     }
+    const readOnly = await readOnlyCheckout(engine, sourceId);
+    if (readOnly) return { handled: false, skipped: readOnly };
     const target = await resolvePageWriteTarget(engine, slug, sourceId);
     if (!target.ok) {
       return { handled: false, skipped: target.skipped };
@@ -323,6 +331,7 @@ export async function writeTimelineEntryThrough(
       // error instead of inventing a second error shape here.
       return { handled: false, skipped: 'page_not_found' };
     }
+    assertInlineBody(page, 'timeline write-through');
 
     const rendered = renderTimelineEntry(entry, slug);
     if (!rendered) {
@@ -420,7 +429,7 @@ export async function writeTimelineEntryThrough(
             committed = commitWriteThroughFile(writeRoot, filePath, slug);
             if (committed) {
               pushed = 'pending';
-              lastPushStatus = getLastPushOutcome(currentBranch(writeRoot));
+              lastPushStatus = getLastPushOutcome(currentBranch(writeRoot), writeRoot);
             }
           }
         } catch { /* best-effort */ }

@@ -35,6 +35,8 @@ import {
 } from '../chronicle/contract.ts';
 import { CHRONICLE_TYPES, RESCUE_SLUG_PREFIXES } from '../chronicle/eligibility.ts';
 import { claimChronicleRow, executeChronicleRow } from '../chronicle/execute.ts';
+import { retireOrphanedChronicleEvents } from '../chronicle/publish.ts';
+import { failExhaustedCampaignRows } from '../chronicle/campaign.ts';
 import { defaultJudge, type ChronicleDropReason, type ChronicleJudge } from '../chronicle/extract-events.ts';
 import {
   RETIRE_REASONS, chronicleDailyRemaining, decideChronicle, pruneChronicleReservations, upsertChronicleRow,
@@ -65,8 +67,9 @@ async function discover(engine: BrainEngine, sourceId: string, ctx: {
   const pages = await engine.executeRaw<{
     id: number; slug: string; type: string; compiled_truth: string | null; frontmatter: Record<string, unknown> | null;
     effective_date: Date | string | null; effective_date_source: string | null; content_hash: string; updated_at: Date | string;
+    body_storage: 'inline' | 'segmented'; body_bytes: number | null;
   }>(
-    `SELECT p.id, p.slug, p.type, p.compiled_truth, p.frontmatter, p.effective_date, p.effective_date_source, p.content_hash, p.updated_at
+    `SELECT p.id, p.slug, p.type, coalesce(p.compiled_truth, p.truth_lead) AS compiled_truth, p.body_storage, p.body_bytes, p.frontmatter, p.effective_date, p.effective_date_source, p.content_hash, p.updated_at
        FROM pages p
       WHERE p.source_id=$1 AND p.deleted_at IS NULL AND p.content_hash IS NOT NULL AND p.updated_at >= $2::timestamptz
         AND p.type <> 'event' AND p.slug NOT LIKE 'life/%'
@@ -104,8 +107,8 @@ async function candidates(engine: BrainEngine, sourceId: string, enabled: boolea
        JOIN pages p ON p.id=c.page_id AND p.source_id=c.source_id AND p.content_hash=c.content_hash AND p.deleted_at IS NULL
       WHERE c.source_id=$1 AND c.extractor_version=$2
         AND (c.next_attempt_at IS NULL OR c.next_attempt_at <= now())
-        AND ((c.state='pending' AND ($3 OR c.trigger='backfill'))
-          OR (c.state='failed' AND c.attempts < $4 AND ($3 OR c.trigger='backfill')
+        AND ((c.state='pending' AND ($3 OR c.trigger='backfill') AND (c.max_attempts IS NULL OR c.attempts < c.max_attempts))
+          OR (c.state='failed' AND c.attempts < COALESCE(c.max_attempts, $4) AND ($3 OR c.trigger='backfill')
             AND (c.next_attempt_at IS NOT NULL OR c.reason IN ('judge_llm_unavailable','no_pricing')))
           OR (c.state='skipped' AND c.next_attempt_at IS NOT NULL AND c.reason = ANY($5::text[])))
       ORDER BY (c.state='skipped') DESC, (c.trigger='auto') DESC, c.decided_at, c.page_id
@@ -144,15 +147,25 @@ export async function runPhaseChronicle(engine: BrainEngine, opts: ChroniclePhas
 
   if (!dryRun) {
     await pruneChronicleReservations(engine);
+    await failExhaustedCampaignRows(engine);
     await engine.executeRaw(
       `UPDATE chronicle_page_state c SET state='skipped', reason='superseded', next_attempt_at=NULL, updated_at=now()
         WHERE c.state IN ('pending','failed') AND NOT EXISTS (SELECT 1 FROM pages p
           WHERE p.id=c.page_id AND p.content_hash=c.content_hash AND p.deleted_at IS NULL)`);
   }
-  const sources = (await engine.executeRaw<{ id: string }>('SELECT id FROM sources WHERE NOT archived ORDER BY id')).map((s) => s.id);
+  const { withoutGuestSources } = await import('../guests/derived.ts');
+  const sources = await withoutGuestSources(engine, 'chronicle',
+    (await engine.executeRaw<{ id: string }>('SELECT id FROM sources WHERE NOT archived ORDER BY id')).map((s) => s.id), id => id);
   details.sources = sources.length;
   for (const sourceId of sources) {
     await discover(engine, sourceId, { managed, enabled, activatedAt, settings, now: now(), dryRun });
+  }
+  if (!dryRun) {
+    // C-6: a deleted depth page's events retire through `originGone` (no model call, so no chat provider needed).
+    for (const sourceId of sources) {
+      try { details.events_retired += await retireOrphanedChronicleEvents(engine, sourceId); }
+      catch (error) { console.warn(`[chronicle] ${sourceId}: retiring the events of deleted pages failed (${error instanceof Error ? error.message : String(error)}); the next run retries.`); }
+    }
   }
   const queues = new Map<string, ChronicleLedgerRow[]>();
   for (const sourceId of sources) {

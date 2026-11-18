@@ -52,6 +52,25 @@ that `starter` lacks, with their CLI equivalents:
 
 A call to either on a starter session gets the hidden-tool hint below.
 
+**Parameters follow the surface.** A narrower surface hides some parameters of the
+tools it lists (to keep the starter list small), and dispatch refuses them too: a
+starter caller that passes one, such as `include_deleted` on `get_page` or
+`list_pages`, gets `param_not_on_surface` and nothing runs. Its fix is the same
+widen as for a hidden tool (`request_tools {"surface":"full"}`) where the
+connection may widen, and otherwise asks the user, because only the operator widens
+a pinned client. `STARTER_CALLABLE_PARAMS` in `src/mcp/surface.ts` lists the few
+hidden parameters a starter caller may still pass, each with its reason (page
+windows, the shared-skill follower, the thin client's source binding, the
+connection check, a delegating client's `submit_agent` `queue`, `model` and
+`allowed_slug_prefixes`, `list_pages` paging with `offset`). An agent job (`submit_agent`)
+records the surface of the connection that submitted it, and its tool calls are refused
+the same way; a job queued before the surface was recorded keeps the full surface until
+it finishes. A queued or running job keeps the surface it was submitted under even if the
+operator later narrows the client; cancelling the job or withdrawing the grant stops it. `request_tools {tools}` describes only the parameters the caller's surface
+may pass. Structured fixes never name a parameter the caller's
+surface refuses (`page_not_found` offers a search instead of `include_deleted`);
+plain-text suggestions may still name one.
+
 **Session widening.** On the owner's stdio pipe, `request_tools {surface}`
 widens this session's tool set (never past `--access read-only` or
 `GBRAIN_MCP_FORCE_SURFACE`), sends `tools/list_changed`, and returns the new
@@ -110,6 +129,11 @@ Usage counts only successful calls (`success` / `success_with_warnings`) —
 a client flooding denials or errors shows zero usage, so denied traffic can
 never argue its way into a wider surface or the starter derivation.
 
+A memory or coding grant from `gbrain mcp provision` or a `gbrain agent register`
+preset stores `full` with `surface_set_by = install`: it calls the full surface
+but lists only the memory verbs and `request_tools`. An operator rescope (any
+surface) lists that surface in full.
+
 **Expected outcomes:**
 - The client's NEXT request resolves the new surface (per-request
   ceiling-bounded resolution: `min(server --surface ceiling, client row)`)
@@ -117,7 +141,9 @@ never argue its way into a wider surface or the starter derivation.
   lists in a long-lived session go stale until it does.
 - An audit row lands in `mcp_request_log` (`operation='surface_change'`,
   params carrying actor/old/new/via) — every surface mutation writes one
-  (rescope CLI, admin endpoint, request_tools persist):
+  (rescope CLI, admin endpoint, request_tools persist). Request-log retention
+  never prunes these rows; other request rows older than its window are gone
+  ([retention](../mcp/ADMIN.md#request-log-retention)):
 
 ```sql
 SELECT created_at, params FROM mcp_request_log
@@ -142,6 +168,8 @@ Dual-plane read (DB > file), applied on each client's next request,
 ceiling-bounded like everything else; unset means NULL-surface clients
 resolve to the server ceiling. Pre-seed important
 clients with an explicit `rescope-client --surface full` before flipping it.
+The default applies to OAuth clients only; legacy bearer tokens keep the
+server ceiling and stay bounded by their scope, source and operation grants.
 
 ## Move 3 — flip strict params from warn to reject
 
@@ -149,7 +177,10 @@ clients with an explicit `rescope-client --surface full` before flipping it.
 `warn` (default) accepts the call, surfaces `_meta.warnings` + a
 model-visible notice block, and logs the success as
 `status='success_with_warnings'`; `reject` returns `invalid_params` with
-did-you-mean suggestions.
+did-you-mean suggestions. The mode governs reads only: a write
+(`mutating: true`, such as `add_timeline_entry`, `put_page`, `remember`)
+rejects an unknown parameter in every mode, because the warn grace period
+would commit the row with the misnamed field dropped.
 
 **Flip criterion (evidence-based):** near-zero
 `success_with_warnings` rows over 30 days of production traffic —
@@ -168,12 +199,12 @@ gbrain config set mcp.strict_params reject
 
 **Expected outcome (schema emission change):** besides rejecting unknown
 args, tools/list schemas change shape — each `inputSchema` closes with
-`additionalProperties: false` and declares the `_meta`/`dry_run`
+`additionalProperties: false` and declares the `_meta`/`dry_run`/`room`
 passthrough keys (D14.1), keeping schema-validating clients aligned with
 the server's reject posture. Read per request; flipping back to `warn`
 reopens the schemas on the next list. A transient config-read failure
 cannot re-open the grace period: dispatch holds the last successfully
-read mode per process, so a reject-mode server stays reject through a
+read mode per engine, so a reject-mode server stays reject through a
 config outage. `test/mcp-tool-defs.test.ts` pins
 both emission states; the default stays `warn` until the project-level
 flip (see TODOS.md, strict_params reject-flip).
@@ -215,6 +246,11 @@ the database before limits and aggregate calculations. A gated page reads exactl
 like a missing one (no existence oracle), and link/graph output never
 enumerates private slugs.
 
+Facts are separate: a fact stamped `private` (as every fact was before
+`facts.default_visibility` became `world`) stays hidden from remote callers
+that are not the owner until the operator opens it with
+`gbrain repair open-facts` (docs/guides/repair.md); no remote path opens it.
+
 Single-user brains where every connected agent is equally trusted can opt
 out:
 
@@ -230,7 +266,37 @@ restores enforcement on the same schedule. Resolver:
 "not opted out" (enforce).
 
 Page-visibility opt-outs do not change protected-body filtering: remote page
-and history bodies retain only world Facts and omit every Takes fence. History
+and history bodies retain only world Facts and omit every Takes fence. The
+exception is a direct remote call from a credential bound to the brain owner,
+speaking for itself, with no room declared (dispatch switches it on there and
+nowhere else): `get_page` and `fetch_page` give it the Facts fence as stored,
+and the Takes fence as stored when the credential has no holders list
+(GST-3058). A credential with a holders list gets no Takes fence in `get_page`
+and reads its takes through `takes_list`; its graph hops skip evidence pages
+that hold takes. The `get_page` read view (windows, lines, bytes, section,
+grep) is the same text for every caller, the local CLI included; the owner reads
+the private rows of a large or segmented page through `view: 'markdown'` (a
+segmented page only when the credential has no holders list). With no holders
+list it also reads every holder wherever a read filters takes by holder, among
+them `takes_list`, `takes_search`, `takes_scorecard`, `takes_calibration`,
+`search`, `query`, `recall`, `delta`, `think` and `synthesize`;
+`synthesize` reads world takes only for a non-owner with no list. Known
+limits: agent jobs and group chats (a declared room) read as before this PR
+until GST-3066, as do stdio, on-behalf-of audiences and attested actors; an
+agent job reads its client's stored takes holders list, else world takes. The
+owner's `put_page`, inline or streamed, still restores the private rows as
+stored for every remote writer, so editing or deleting one does not stick yet;
+use the local CLI for that until GST-3064 lands. With a room declared, a
+`get_page` whole-body read or `view: 'markdown'` whose returned body carries
+rows a world-only read strips (private rows, held rows, takes) is marked
+`room_access: {readable: false, reason: 'private_label'}`; the mark is per
+page, so a page with one such row is marked whole. Held rows inside read-view
+windows and in a segmented page's markdown view are not marked, as before this
+PR. The local CLI's `--room` marks
+pages the same way. The mark is judged with the caller's own fact grant, so a
+caller with a private-facts grant gets the same mark as before this PR for held
+rows it can read (GST-3066). Owner tokens minted with `gbrain auth create` store
+`['world']`, so they read world takes unless the list is changed. History
 also checks snapshot visibility while page privacy is enforced. Malformed
 protected sections are omitted; unterminated or interleaved sections discard
 the remaining tail. Restricted salience counts only permitted active takes and
@@ -239,9 +305,30 @@ than take-driven salience touches.
 
 Semantic result caching is temporarily disabled even when configuration enables
 it. Searches run fresh, so repeated requests may cost more and take longer.
-Stored rows and cache maintenance remain available. Stored contradiction reports
-are temporarily available only to trusted local callers without a source filter;
-other callers receive an empty list and an availability note.
+Stored rows and cache maintenance remain available. Remote callers of
+`find_contradictions` get only findings whose two sides they can read now, each
+side re-read live with its source and trust tier; stored report text never
+leaves (docs/contradictions.md, "Trust posture").
+
+## Served instruction settings
+
+Three brain config keys change the text of the initialize instructions. Every
+transport reads them when a client initializes (a read error serves the
+defaults); the static contract, bootstrap's GBRAIN-INSTRUCTIONS.md and the SDK
+constructor fallback are always the defaults rendering.
+
+| Key | Default | Effect on the instructions |
+|---|---|---|
+| `entity.names_references` | `true` | Found `entity names` rows (and siblings) carry `referenced_by_count` and a row-level `next` to the full card; the brief clause says "a `names` row's `next` opens the card". `false` drops both. |
+| `entity.record_types` | empty | Comma-separated canonical page types whose referring pages a `names` row lists as `records`; when set, the brief clause says a `names` row lists `records` by type. |
+| `mcp.instructions_governing_rule` | `in_effect` | Instruction 7: the record whose terms are in effect on the date asked about governs, and a page's `date`/`effective_date` is when it was written. `newest` serves the earlier "prefer the newest governing source" sentence, for measuring the rule. |
+
+```bash
+gbrain config set entity.record_types contract,amendment
+gbrain config set mcp.instructions_governing_rule newest   # measurement arm only
+```
+
+Clients read the new text at their next initialize (reconnect the harness).
 
 ## Incident levers
 
@@ -298,7 +385,7 @@ Post-deploy checks, in order:
    `SELECT token_name, params->>'tool_count' FROM mcp_request_log WHERE operation='tools/list' ORDER BY created_at DESC LIMIT 10;`
 2. **Empty-query probe shows the degraded block** — call `search` with a
    nonsense query; the empty result must carry a second content block
-   ("0 results. … clean miss." or degraded stages) + `_meta.retrieval`.
+   ("0 results. … retrieval healthy …" or degraded stages) + `_meta.retrieval`.
 3. **Workerless submit warns** — `submit_agent` while no worker runs must
    still succeed and carry `queue_state.warning` (worker_alive false).
 4. **put_page lint fields present** — put an uncited page; the response

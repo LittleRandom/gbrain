@@ -36,10 +36,12 @@ test('the runner compiles its own CLI and avoids GNU-only xargs flags', () => {
 });
 
 describe('ci-local command rendering', () => {
+  // Every tool the runner's prerequisite gate checks; curl backs check:vendor-postgres (#7765).
+  const prerequisites = ['git', 'python3', 'ps', 'psql', 'cc', 'jq', 'curl'];
   const cases = [
     { phaseExit: 0, missingTool: '' },
     { phaseExit: 7, missingTool: '' },
-    ...['git', 'python3', 'ps', 'psql', 'cc', 'jq'].map(missingTool => ({ phaseExit: 0, missingTool })),
+    ...prerequisites.map(missingTool => ({ phaseExit: 0, missingTool })),
   ];
   for (const { phaseExit, missingTool } of cases) {
     test(`preserves stderr and exit ${phaseExit}; missing prerequisite ${missingTool || 'none'}`, () => {
@@ -51,10 +53,12 @@ describe('ci-local command rendering', () => {
         mkdirSync(bin);
         // Execute the actual runner template, with installation/configuration
         // commands stubbed so this regression needs neither Docker nor root.
-        for (const name of ['bun', 'git', 'python3', 'ps', 'psql', 'cc', 'jq']) {
+        for (const name of ['bun', ...prerequisites]) {
           writeFileSync(join(bin, name), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
         }
         writeFileSync(join(bin, 'apt-get'), '#!/bin/sh\nprintf "%s\\n" "$*" >> "$INSTALL_LOG"\n', { mode: 0o755 });
+        mkdirSync(join(home, 'scripts'));
+        writeFileSync(join(home, 'scripts', 'ci-hydrate-admin-dist.sh'), 'exit 0\n');
         const phaseLog = join(home, 'phase.log');
         const installLog = join(home, 'install.log');
         const phases = [
@@ -86,7 +90,7 @@ describe('ci-local command rendering', () => {
         expect(result.stdout.includes('phase completed')).toBe(phaseExit === 0);
         expect(existsSync(join(home, '__RUN_PHASES__1'))).toBe(false);
         if (missingTool) {
-          expect(readFileSync(installLog, 'utf8')).toBe('update -qq\ninstall -y -qq git ca-certificates python3 procps postgresql-client jq build-essential\n');
+          expect(readFileSync(installLog, 'utf8')).toBe('update -qq\ninstall -y -qq git ca-certificates python3 procps postgresql-client jq curl build-essential\n');
         } else {
           expect(existsSync(installLog)).toBe(false);
         }
@@ -106,8 +110,13 @@ function runPhases(noShard: boolean, diff: boolean, failStage = '') {
     const trace = join(home, 'trace');
     const put = (path: string, body: string) => writeFileSync(join(home, path), `#!/bin/bash\n${body}\n`, { mode: 0o755 });
     for (const name of ['git', 'python3', 'ps', 'psql', 'apt-get']) put(`bin/${name}`, 'exit 0');
+    put('scripts/ci-hydrate-admin-dist.sh', 'exit 0');
     put('bin/bun', `
 case "$*" in
+  "scripts/lib/ensure-e2e-database.ts "*)
+    printf 'admin_db:%s:%s\\n' "$2" "$3" >> "$TRACE"
+    [ "$FAIL_STAGE" != admin_db ] || exit 7
+    exit 0 ;;
   "run verify") stage=verify ;;
   "run test:serial") stage=serial ;;
   "run test:slow") stage=slow ;;
@@ -129,12 +138,12 @@ for line in {1..35}; do printf 'fixture progress %s\\n' "$line"; done
 `);
     put('scripts/run-e2e.sh', `
 set -eu
-case "$DATABASE_URL" in postgresql://postgres:postgres@postgres-*:5432/gbrain_test) ;; *) exit 42 ;; esac
-[ "$GBRAIN_PGBOUNCER_URL" = postgresql://postgres:postgres@pgbouncer:5432/gbrain_pgbouncer_test ] || exit 43
-[ "$GBRAIN_PGBOUNCER_DIRECT_URL" = postgresql://postgres:postgres@postgres-1:5432/gbrain_test ] || exit 44
+case "$DATABASE_URL" in postgresql://postgres:postgres@postgres-*:5432/gbrain_test?sslmode=disable) ;; *) exit 42 ;; esac
+[ "$GBRAIN_PGBOUNCER_URL" = 'postgresql://postgres:postgres@pgbouncer:5432/gbrain_pgbouncer_test?sslmode=disable' ] || exit 43
+[ "$GBRAIN_PGBOUNCER_DIRECT_URL" = 'postgresql://postgres:postgres@postgres-1:5432/gbrain_ci_admin_test?sslmode=disable' ] || exit 44
 [ "$GBRAIN_CI_REQUIRE_PGBOUNCER" = 1 ] || exit 45
 [ "$GBRAIN_TEST_DB" = 1 ] || exit 46
-printf 'target:%s\\n' "$DATABASE_URL" "$GBRAIN_PGBOUNCER_URL" "$GBRAIN_PGBOUNCER_DIRECT_URL" >> "$TRACE"
+printf 'target:%s\\n' "db=$DATABASE_URL" "pgbouncer=$GBRAIN_PGBOUNCER_URL" "direct=$GBRAIN_PGBOUNCER_DIRECT_URL" >> "$TRACE"
 printf 'e2e:%s:%s\\n' "\${SHARD-all}" "$*" >> "$TRACE"
 [ "$FAIL_STAGE" != e2e ] || exit 7
 `);
@@ -176,7 +185,7 @@ describe('ci-local execution coverage', () => {
         expect(e2e).toHaveLength(noShard ? 1 : 4);
         const targets = result.trace.filter(line => line.startsWith('target:'));
         expect(targets).toHaveLength(noShard ? 3 : 12);
-        for (const target of targets) expect(() => assertSafeE2eDatabaseUrl(target.slice(7), {})).not.toThrow();
+        for (const target of targets) expect(() => assertSafeE2eDatabaseUrl(target.slice(target.indexOf('=') + 1), {})).not.toThrow();
         // --diff no longer narrows: every shard runs run-e2e.sh's full discovery.
         expect(e2e.every(line => line.endsWith(':'))).toBe(true);
         if (!noShard) {
@@ -189,6 +198,30 @@ describe('ci-local execution coverage', () => {
       });
     }
   }
+
+  for (const noShard of [false, true]) {
+    test(`the PgBouncer admin database is created first and is no shard's database (#6674, no-shard=${noShard})`, () => {
+      const result = runPhases(noShard, false);
+      expect(result.status, result.stdout + result.stderr).toBe(0);
+      // Shards run concurrently, so their target lines interleave: each line names its role.
+      const role = (name: string) => result.trace.filter(line => line.startsWith(`target:${name}=`)).map(line => new URL(line.slice(line.indexOf('=') + 1)));
+      const shards = role('db');
+      expect(shards).toHaveLength(noShard ? 1 : 4);
+      const admins = new Set(role('direct').map(url => `${url.host}${url.pathname}`));
+      expect([...admins]).toEqual(['postgres-1:5432/gbrain_ci_admin_test']);
+      for (const shard of shards) expect(shard.pathname).not.toBe('/gbrain_ci_admin_test');
+      const created = result.trace.indexOf('admin_db:postgresql://postgres:postgres@postgres-1:5432/gbrain_test?sslmode=disable:gbrain_ci_admin_test');
+      expect(created).toBeGreaterThanOrEqual(0);
+      expect(created).toBeLessThan(result.trace.findIndex(line => line.startsWith('e2e:')));
+    });
+  }
+
+  test('a failed admin database bootstrap starts no shard', () => {
+    const result = runPhases(false, false, 'admin_db');
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('could not create gbrain_ci_admin_test; shards not started');
+    expect(result.trace.some(line => line.startsWith('unit:') || line.startsWith('e2e:'))).toBe(false);
+  });
 
   for (const failStage of ['timeout_guard', 'verify', 'serial', 'slow', 'unit', 'e2e']) {
     test(`a failed ${failStage} stage cannot produce a green local CI result`, () => {

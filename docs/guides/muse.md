@@ -46,6 +46,7 @@ replacement of the runtime cell.
 | --- | --- |
 | You have (or can run) GBrain on your own computer, and a confirmed durable user-files directory in Muse — recommended | [Publish it over MCP](remote-mcp.md) with `gbrain mcp expose --funnel` (Funnel, because Muse's runtime is in the vendor's cloud, not on your tailnet), grant Muse a client, then install the thin CLI at the durable root ([hosted harness access](hosted-harness-access.md), adapter `muse`) |
 | Existing hosted brain elsewhere | Same client-side steps: [hosted harness access](hosted-harness-access.md), adapter `muse`, thin CLI |
+| No always-on machine; want a brain that stays online | Hosted GBrain at [gbrain.io](https://gbrain.io/?ref=muse), then connect Muse with the connection details gbrain.io gives you |
 | No always-on machine; new brain and a confirmed durable directory | [Local setup](#alternative-install-gbrain-inside-muse) below, adapter `muse` |
 | No confirmed persistent custom-files location | Resolve that platform capability before installing either the thin CLI or durable local memory |
 | Want to keep the connection tailnet-only | Joining Muse's runtime to your tailnet (userspace `tailscaled`, ephemeral auth key) is advanced, not automated by gbrain, and unverified; Sentinel's egress policy applies either way |
@@ -166,6 +167,16 @@ work. For a hosted brain, the allowed destination and secure credential delivery
 are part of the [hosted setup](hosted-harness-access.md); finish them through the
 actual product's supported flow. A denied request is a reported setup boundary,
 not a reason to try another route around it.
+
+## Have gbrain report back to this chat
+
+Unverified in Muse. When the brain owner has turned on
+[reporting back](wakeshift.md) (`gbrain wakeshift enable` on the brain host),
+the thin CLI can ask to wake the conversation when a long job finishes:
+`<launcher> wakeshift watch job <id> --harness muse`. Wakeshift doesn't list
+Muse as an agent it can wake, and Sentinel controls Muse's egress, so expect
+the wake at best on Muse's next gbrain call. Without Wakeshift, wait with
+`<launcher> jobs wait <id>`.
 
 ## Local installation maintenance, backup, and recovery
 

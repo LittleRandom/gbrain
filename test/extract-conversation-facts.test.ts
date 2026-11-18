@@ -50,6 +50,7 @@ import { loadOpCheckpoint } from '../src/core/op-checkpoint.ts';
 import { runIngestFacts } from '../src/core/transcripts/ingest-facts.ts';
 import { runTranscripts } from '../src/commands/transcripts.ts';
 import { _resetCliExitVerdictForTests, currentExitCode } from '../src/core/cli-force-exit.ts';
+import { SLOT_TAG_SYSTEM } from '../src/core/facts/slot-tagging.ts';
 
 // ---------------------------------------------------------------------------
 // pageTypesForAllowed — logical→concrete page-type expansion.
@@ -386,6 +387,11 @@ describe('runExtractConversationFactsCore', () => {
           model: opts.model!,
           providerId: 'stub',
         };
+      }
+      // GBRA-574: the stub's company gets a name key, so each window also makes a slot-tagging call; it tags nothing.
+      if (opts.system === SLOT_TAG_SYSTEM) {
+        return { text: '{"slots":[]}', blocks: [], stopReason: 'end', usage: { input_tokens: 0, output_tokens: 0, cache_read_tokens: 0, cache_creation_tokens: 0 },
+          model: 'stub:stub', providerId: 'stub' };
       }
       mainChatCalls++;
       if (chatFailure) throw chatFailure;
@@ -766,7 +772,8 @@ describe('runExtractConversationFactsCore', () => {
         sourceId: 'default', slug, sleepMs: 0,
         extractor: async ({ turnText }) => {
           extracted.push(turnText);
-          return [{ fact: 'alice-example said hi', kind: 'event', confidence: 1, entity_slug: null, source: 'test' }];
+          // #7043: each body states its own claim; the very same claim on the second page is skipped as a duplicate.
+          return [{ fact: `alice-example said hi in body ${index}`, kind: 'event', confidence: 1, entity_slug: null, source: 'test' }];
         },
       });
       expect(result).toMatchObject({ pages_processed: 1, pages_skipped_unparsed: 0, segments_processed: 1, facts_inserted: 1 });
@@ -1660,6 +1667,16 @@ describe('runExtractConversationFactsCore', () => {
       quiet: true,
     });
     expect(result).toMatchObject({ pages: 1, pagesFailed: 1 });
+  });
+
+  test('transcript ingest reports a budget stop and skipped pages instead of reading complete (#8722)', async () => {
+    const slugs = ['conversations/batch-first', 'conversations/batch-last'];
+    await seedBatch(slugs);
+    chatFailure = new BudgetExhausted('reserve denied', { reason: 'cost', spent: 5, cap: 5 });
+    await withEnv({ ANTHROPIC_API_KEY: 'sk-test' }, async () => {
+      const result = await runIngestFacts(engine, { sourceId: 'default', slugs, quiet: true });
+      expect(result).toMatchObject({ pages: 2, pagesFailed: 0, budgetExhausted: true, budgetReason: 'cost', pagesSkippedTooLarge: 0, pagesLockSkipped: 0 });
+    });
   });
 
   test.each([

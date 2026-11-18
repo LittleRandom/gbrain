@@ -10,7 +10,7 @@ uses `gbrain jobs authorize-legacy` to preview selected work for review.
 
 ## Runtime and outbound requests
 
-Use Bun **1.4.0 or newer**; run `bun upgrade` on an older Bun. CI covers 1.4.0 and the build runtime, 1.4.2.
+Use Bun **1.4.4 or newer**; run `bun upgrade` on an older Bun. CI covers 1.4.4, which is also the build runtime.
 Compiled distributions include their Bun runtime.
 
 URL reachability checks, HTTP integration checks, and remote image loading use
@@ -113,8 +113,7 @@ no tools; only an absent trusted-local binding uses the default registry.
 
    For a linked source checkout, update that checkout to the chosen release
    through its normal Git workflow, then run `bun install --ignore-scripts`.
-   Do not use `gbrain upgrade --swap-only` for this source/package cutover: its
-   underlying Bun installation can still run postinstall. Plain `gbrain upgrade`,
+   Do not use `gbrain upgrade --swap-only` for this source/package cutover. Plain `gbrain upgrade`,
    `gbrain post-upgrade`, and `gbrain apply-migrations --yes` can run pending
    setup phases that start autopilot or perform other maintenance.
 

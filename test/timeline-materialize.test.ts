@@ -15,6 +15,8 @@ import { importFromContent } from '../src/core/import-file.ts';
 import { submitPageMutation } from '../src/core/persistence/page-mutations.ts';
 import { withCoordinatedWrite } from '../src/core/persistence/context.ts';
 import { TEST_WRITE_ATTRIBUTION } from './helpers/write-attribution.ts';
+/** A publication declares its writer's tier (the coordinator does); the timeline rows these put_page fixtures project are agent_written. */
+const AGENT_PUBLICATION = { ...TEST_WRITE_ATTRIBUTION, trust: { tier: 'agent_written' as const, origin: null } };
 import { disposePersistenceConsumer } from '../src/core/persistence/service.ts';
 import { claimWorktree } from '../src/core/persistence/ownership.ts';
 import { materializeTimeline, prepareCanonicalProjections, renderMaterializedBullet, type ProjectionWriter } from '../src/core/persistence/canonical-projections.ts';
@@ -177,8 +179,9 @@ describe('#5567 database-only rows are materialized as marked bullets', () => {
       const edited = f.file(slug).replace('Kickoff held before write-through', 'Kickoff held in person');
       await f.put(slug, edited, { expected_revision: await f.revision(slug) });
       expect((await f.timeline(slug)).map(r => r.summary)).toEqual(['Kickoff held in person']);
-      await f.put(slug, page('Draft.'), { force: true });
-      expect(await f.timeline(slug)).toEqual([]);
+      // #5969 (D3): a preserving put that omits the section keeps every row, so the dropped bullet is dropped from a present section.
+      await f.put(slug, page('Draft.', '- **2026-08-02** | markdown — Next step'), { force: true });
+      expect((await f.timeline(slug)).map(r => r.summary)).toEqual(['Next step']);
     });
   });
 
@@ -272,7 +275,7 @@ describe('#5567 per-writer classes for marked rows', () => {
         const carried = await materializeTimeline(f.engine, next, slug, prior, writer);
         expect(carried.materialized).toBe(renders ? 1 : 0);
         const project = await prepareCanonicalProjections(f.engine, { ...next, timeline: carried.timeline }, slug, f.sourceId, prior, writer);
-        await f.engine.transaction(tx => withCoordinatedWrite(tx, [f.sourceId], () => project(tx), TEST_WRITE_ATTRIBUTION));
+        await f.engine.transaction(tx => withCoordinatedWrite(tx, [f.sourceId], () => project(tx), AGENT_PUBLICATION));
         expect(await f.timeline(slug)).toEqual(keeps ? [normalized] : []);
       });
     });
@@ -283,9 +286,11 @@ describe('#5567 per-writer classes for marked rows', () => {
       await f.put(slug, page('Draft.', '- **2026-08-01** | connector — Old item'));
       await f.legacy(slug, legacy);
       await f.put(slug, page('Draft.', '- **2026-08-01** | connector — Old item'), { force: true });
-      for (const render of [page('Connector render.'), page('Connector render.')]) {
+      // #5969 (D3): each render carries its section (an omitted one keeps every row for a preserving put).
+      const current = '- **2026-08-02** | connector — Current item';
+      for (const render of [page('Connector render.', current), page('Connector render.', current)]) {
         await f.put(slug, render, { force: true });
-        expect(await f.timeline(slug)).toEqual([normalized]);
+        expect(await f.timeline(slug)).toEqual([normalized, { date: '2026-08-02', source: 'connector', summary: 'Current item', detail: '' }]);
         expect(await f.body(slug)).toContain(bullet);
       }
     });
@@ -316,5 +321,65 @@ describe('#5567 marker parsing', () => {
     expect(renderMaterializedBullet({ date: '2026-07-01', source: 'a — b', summary: 'x' }, slug)).toBeNull();
     expect(renderMaterializedBullet({ date: '2026-07-01', source: 'markdown', summary: 'Referenced in [X](x.md)' }, slug)).toBeNull();
     expect(renderMaterializedBullet({ date: '2026-07-01', source: 'notes', summary: 'x', detail: '**2026-07-02** | nested' }, slug)).toBeNull();
+  });
+});
+
+describe('#6226 rows the older citation reading stored', () => {
+  const cited = '- **Widget-co:** per Alice, builds widgets. [Source: meeting transcript, 2026-10-06; Gmail "Intro", 2026-09-28]';
+  const oldSource = 'meeting transcript, 2026-10-06; Gmail "Intro"';
+  const oldRow = { date: '2026-09-28', source: oldSource, summary: 'Widget-co:** per Alice, builds widgets.' };
+  const current = [
+    { date: '2026-09-28', source: 'Gmail "Intro"', summary: 'Widget-co: per Alice, builds widgets.', detail: 'Source: Gmail "Intro"' },
+    { date: '2026-10-06', source: 'meeting transcript', summary: 'Widget-co: per Alice, builds widgets.', detail: 'Source: meeting transcript' },
+  ];
+
+  test('an editing write retires the old multi-source row instead of writing it back into the page', async () => {
+    await fixture(async f => {
+      await f.put(slug, page(cited));
+      await f.legacy(slug, { ...oldRow, detail: `Source: ${oldSource}` });
+      await f.put(slug, page(`${cited}\n\nA later edit.`), { expected_revision: await f.revision(slug) });
+      expect(await f.body(slug)).not.toContain('gbrain:materialized');
+      expect(f.file(slug)).not.toContain(`| ${oldSource} —`);
+      expect(await f.timeline(slug)).toEqual(current);
+    });
+  });
+
+  test('a file-extracted old row (no detail) is retired too', async () => {
+    await fixture(async f => {
+      await f.put(slug, page(cited));
+      await f.legacy(slug, oldRow);
+      await f.put(slug, page(`${cited}\n\nA later edit.`), { expected_revision: await f.revision(slug) });
+      expect(await f.timeline(slug)).toEqual(current);
+    });
+  });
+
+  test('a row sharing the old tuple but carrying its own detail stays in the database and is never materialized (T3)', async () => {
+    await fixture(async f => {
+      await f.put(slug, page(cited));
+      await f.legacy(slug, { ...oldRow, detail: 'confirmed by phone' });
+      await f.put(slug, page(`${cited}\n\nA later edit.`), { expected_revision: await f.revision(slug) });
+      expect(await f.body(slug)).not.toContain('gbrain:materialized');
+      expect(await f.timeline(slug)).toEqual([{ ...oldRow, detail: 'confirmed by phone' }, ...current]
+        .sort((a, b) => a.date.localeCompare(b.date) || a.summary.localeCompare(b.summary)));
+    });
+  });
+
+  test('a preserving write that omits the Timeline section still retires the old row and never renders it', async () => {
+    await fixture(async f => {
+      await f.put(slug, page(cited, '- **2026-08-01** | markdown — Launch review'));
+      await f.legacy(slug, { ...oldRow, detail: `Source: ${oldSource}` });
+      await f.put(slug, page(`${cited}\n\nA later edit.`), { force: true });
+      expect(await f.body(slug)).not.toContain(`| ${oldSource} —`);
+      expect((await f.timeline(slug)).some(row => row.source === oldSource)).toBe(false);
+    });
+  });
+
+  test('a database-only row the citation text never produced is still materialized', async () => {
+    await fixture(async f => {
+      await f.put(slug, page(cited));
+      await f.legacy(slug, { date: '2026-10-06', source: 'meeting transcript', summary: 'Signed the pilot' });
+      await f.put(slug, page(`${cited}\n\nA later edit.`), { expected_revision: await f.revision(slug) });
+      expect(await f.body(slug)).toContain('- **2026-10-06** | meeting transcript — Signed the pilot');
+    });
   });
 });

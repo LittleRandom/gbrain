@@ -29,6 +29,15 @@ const BASE_OPTS = {
 };
 
 describe('buildAmbientWritebackSection (F1 leaf — the single source)', () => {
+  test('GST-2243: a member caller is told to omit visibility and share team facts with share: true', () => {
+    for (const visibility of ['world', 'private'] as const) {
+      const s = buildAmbientWritebackSection({ ...BASE_OPTS, visibility, member: true });
+      expect(s).not.toContain('Pass visibility:');
+      expect(s).toContain('share: true');
+      expect(s).toContain('only the brain host can withdraw it');
+    }
+  });
+
   test('salient mode carries the durable-only candidate policy', () => {
     const s = buildAmbientWritebackSection(BASE_OPTS);
     expect(s).toContain('mode: salient');
@@ -104,9 +113,14 @@ describe('buildMcpInstructions composition', () => {
     expect(buildMcpInstructions({})).toBe(GBRAIN_MCP_INSTRUCTIONS);
     expect(buildMcpInstructions({ writeback: null })).toBe(GBRAIN_MCP_INSTRUCTIONS);
   });
-  test('enabled → base + blank line + section, base untouched', () => {
+  // #6170 replaced the "base untouched" pin on purpose: capped harnesses read only
+  // the first 2,048 characters, so the base carries a short writeback line.
+  test('enabled → base = contract with the writeback line in place of the opt-in line, then a blank line and the section last', () => {
     const out = buildMcpInstructions({ writeback: BASE_OPTS });
-    expect(out.startsWith(GBRAIN_MCP_INSTRUCTIONS + '\n\n')).toBe(true);
+    const line = `Ambient writeback is ON (${BASE_OPTS.mode}): unprompted, \`remember\` the user's preferences, corrections, decisions and commitments`;
+    const head = out.slice(0, out.length - buildAmbientWritebackSection(BASE_OPTS).length);
+    expect(head.endsWith('\n\n')).toBe(true);
+    expect(head.trimEnd()).toBe(GBRAIN_MCP_INSTRUCTIONS.replace('Automatic capture is opt-in.', `${line} (rules below).`));
     expect(out.endsWith(buildAmbientWritebackSection(BASE_OPTS))).toBe(true);
   });
 });

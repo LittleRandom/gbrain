@@ -37,6 +37,7 @@
  * restores exactly that set.
  */
 import type { BrainEngine } from '../engine.ts';
+import { NOT_CONVERSATION_SLOT_SQL } from '../chronicle/ontology.ts';
 import { OperationError } from '../ops/contract.ts';
 import { maintenanceTransaction } from '../persistence/attribution.ts';
 import { coordinatedDatabaseWrite } from '../persistence/database-write.ts';
@@ -84,7 +85,7 @@ export async function classifyOntologyFacts(db: BrainEngine, sourceIds: string[]
            ${DUPLICATE_SQL('f')} AS duplicate
       FROM facts f
      WHERE f.source_id=ANY($1::text[]) AND f.dimension IS NOT NULL AND f.entity_slug IS NOT NULL AND f.source IS NOT NULL
-       AND (f.row_num IS NOT NULL OR f.source_markdown_slug IS DISTINCT FROM f.source)
+       AND (f.row_num IS NOT NULL OR f.source_markdown_slug IS DISTINCT FROM f.source) AND ${NOT_CONVERSATION_SLOT_SQL}
      ORDER BY f.id`, [sourceIds]);
   return rows.map(row => {
     const [klass, reason] = row.withdrawn ? ['excluded', 'withdrawn'] as const
@@ -143,7 +144,8 @@ export const ontologyFactsRepair: RepairHandler = {
         `Preview first: ${command} — then run the apply command it prints: ${command} --apply --expect <preview-hash>`,
         'docs/guides/repair.md#explicit-only-repair-kinds');
     }
-    const approved = await loadApprovedSet<ApprovedFact>(engine, { command: 'ontology-facts', hash: opts.expect, previewCommand: command });
+    const approved = await loadApprovedSet<ApprovedFact>(engine, { command: 'ontology-facts', hash: opts.expect, previewCommand: command,
+      emptyHash: async () => previewHash({ kind: 'ontology-facts-v1', brain_id: scope.brain_id, sources: (await engine.executeRaw<{ id: string; incarnation: string }>('SELECT id, incarnation::text AS incarnation FROM sources WHERE id=ANY($1::text[]) ORDER BY id', [scope.source_ids])), selection: { source_ids: scope.source_ids }, facts: [] }) });
     if (approved.items.some(f => JSON.stringify(f.selection) !== JSON.stringify(scope.source_ids))) throw previewChangedError(opts.expect, command);
     const items = approved.items.map(({ selection: _selection, ...f }, index) => item(f, opts.expect!, index === approved.items.length - 1));
     return { items: items.filter(entry => afterCursor(entry.cursor, after)), preview_hash: opts.expect, residuals: {} };
@@ -152,7 +154,7 @@ export const ontologyFactsRepair: RepairHandler = {
     const { fact, hash, last } = entry as FactItem;
     const restore = (tx: BrainEngine) => tx.executeRaw<{ id: number | string; expired: boolean }>(
       `UPDATE facts f SET row_num=NULL, source_markdown_slug=f.source, expired_at=NULL
-        WHERE f.id=$1 AND f.source_id=$2 AND f.dimension IS NOT NULL
+        WHERE f.id=$1 AND f.source_id=$2 AND f.dimension IS NOT NULL AND ${NOT_CONVERSATION_SLOT_SQL}
           AND f.row_num IS NOT DISTINCT FROM $3::integer AND f.source_markdown_slug IS NOT DISTINCT FROM $4::text
           AND ${EXPIRY_TEXT('f.expired_at')} IS NOT DISTINCT FROM $5::text AND NOT ${DUPLICATE_SQL('f')}
         RETURNING f.id, f.expired_at IS NOT NULL AS expired`,

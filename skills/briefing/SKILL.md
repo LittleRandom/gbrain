@@ -136,14 +136,19 @@ Before generating any briefing, load context from gbrain systematically.
 ### Before a meeting
 
 For every attendee on the calendar invite:
-- `gbrain search "<attendee name>"` -- find their brain page
+- Find their brain page by an exact match only: `gbrain whois <email> --json`,
+  then `gbrain whois "<name>" --json` when the address has no match; exactly
+  one match counts ([identity rule](../conventions/brain-first.md#identity-exact-match)).
+  A search's top hit is not the attendee.
 - `gbrain get <slug>` -- load compiled truth, recent timeline, relationship context
 - If no page exists, note the gap ("No brain page for alice-example -- consider enrichment")
 
 ### Before an email reply
 
 Before drafting or triaging any email:
-- `gbrain search "<sender name>"` -- load sender context
+- Resolve the sender with `gbrain whois <address> --json` (exact email, title
+  or alias; [identity rule](../conventions/brain-first.md#identity-exact-match)); no
+  match, or an ambiguous one, means an unknown sender, not the nearest known contact
 - Read their compiled truth to understand who they are, what they care about, and
   your relationship history. This turns a cold reply into an informed one.
 
@@ -193,7 +198,7 @@ When presenting facts from brain pages, include inline citations:
 
 ## When it fails
 
-Follow the [agent operator protocol](../../docs/protocol/AGENT_OPERATOR_v1.md) for any gbrain error `code`, exit code, `[AGENT]` block or notice block. Specific to this skill:
+Follow the [agent operator protocol](../conventions/agent-operator-protocol.md) for any gbrain error `code`, exit code, `[AGENT]` block or notice block. Specific to this skill:
 
 - `gbrain waiting` refuses on stale data: run the sync command it names (or tell the user to, when it needs the brain host), then retry. Do not build the "waiting on you" section from stale mail.
 - `recall` / `query` sections come back empty with a degraded notice: write "the brain is searching keywords only right now" in that section instead of "nothing happened".

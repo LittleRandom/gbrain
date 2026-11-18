@@ -3,7 +3,7 @@
  *
  * gbrain's CLI_ONLY commands read flags ad hoc (`args.includes('--force')`,
  * per-command parseFlags helpers), so there is no parser to make strict. The
- * pre-dispatch validator in src/cli.ts needs to know each command's legal
+ * pre-dispatch validator in src/cli/main.ts needs to know each command's legal
  * flags; this script derives them from the source instead of a hand-typed
  * list that would rot.
  *
@@ -11,7 +11,7 @@
  * its dispatch text: the record's module under src/cli/commands/ (the former
  * `case 'X':` / plain `if (command === 'X')` body, moved verbatim in refactor
  * wave 1) plus every block of the explicit handleCliOnly pipeline in
- * src/cli.ts (handleCliOnly and its @cliPipelineStage functions, see
+ * src/cli/main.ts (handleCliOnly and its @cliPipelineStage functions, see
  * scripts/lib/cli-pipeline.ts) segmented on its dispatch markers — every
  * `if (command === 'X' …)` head, plain or compound, and `case 'X':` labels (see
  * segmentDispatchBlocks). Collect every `import('…/commands/Y.ts')` in that
@@ -27,6 +27,8 @@
  * Output: src/core/cli-flag-registry.generated.ts (committed; freshness is
  * pinned by test/cli-flag-validation.test.ts the same way build:llms pins the
  * llms bundles). Regenerate: bun run build:flag-registry
+ * Check: bun scripts/generate-flag-registry.ts --check exits 1 when the
+ * committed file differs from a fresh render (what regen:all --check runs).
  *
  * Hand-tuning lane: EXTRA_FLAGS below, for flags that live deeper than the
  * one-level scan (add with a comment naming the deep module).
@@ -52,8 +54,11 @@ const EXTRA_FLAGS: Record<string, string[]> = {
   embed: ['--pace', '--pace-max-concurrency'],
   // sync shares the same pace surface via env/config plus CLI passthrough.
   sync: ['--pace', '--pace-max-concurrency'],
-  // Deferred persistence routing reaches runForget in recall.ts two levels deep.
-  forget: ['--reason', '--request-id'],
+  // Deferred persistence routing reaches runForget in recall.ts two levels deep;
+  // `forget --purge` hands off from there to src/commands/forget-purge.ts.
+  forget: ['--reason', '--request-id', '--purge', '--dry-run', '--yes', '--match', '--status', '--vacuum', '--all-subjects'],
+  // sources add reads the meetings and slack options as bare names in src/commands/sources-lifecycle-args.ts (its valued set).
+  sources: ['--provider', '--transcript', '--lookback-days', '--sync-interval-min', '--record', '--visibility', '--channels', '--timezone', '--max-requests', '--skip'],
 };
 
 /**
@@ -66,6 +71,14 @@ const DELEGATED_MODULES: Record<string, string[]> = {
   // runPersistenceAdminCli (#5595), and `auth rescope-client|rescope-token` to
   // parseRescopeGrantArgs; both parse --dry-run themselves.
   auth: ['src/commands/persistence-admin.ts', 'src/core/grants/cli.ts'],
+  // `forget --purge` (and forget --help) hand the argv to runForgetPurge, which
+  // parses --dry-run itself; a plain forget refuses --dry-run (recall.ts).
+  forget: ['src/commands/forget-purge.ts'],
+  // `upgrade --restart-only --dry-run` is parsed by restartDryRun in
+  // upgrade-restart.ts, which refuses --dry-run without --restart-only;
+  // post-upgrade shares upgrade.ts and never takes it. A plain `upgrade --dry-run`
+  // is the channel preview, parsed by runUpgradeDryRun in upgrade-channel.ts.
+  upgrade: ['src/commands/upgrade-restart.ts', 'src/commands/upgrade-channel.ts'],
 };
 
 /**
@@ -77,9 +90,19 @@ const DELEGATED_MODULES: Record<string, string[]> = {
  * builds the INTERNAL `jobs run-child` argv (`--job-id`, `--allow-shell-jobs`):
  * those literals are what a worker passes to its child, not flags an importer
  * parses — autopilot imports it only to resolve the child CLI, and `jobs`
- * declares both flags in its own source.
+ * declares both flags in its own source. strict-args.ts is the strict-argument
+ * table for several commands' destructive subcommands (#6114): its literals
+ * belong to pages, cache, schema, integrity and search, each of which reads
+ * its own flags in its own source. flag-equals.ts (#7619) names flags as
+ * arity data for the `=` split; each handler reads its own flags.
+ * direct-pool-profile.ts reads other commands'
+ * argv to pick the process's pool profile (`sync --watch`, `serve --access`):
+ * serve imports it for the read-only check, and its `--watch` made
+ * `gbrain serve --watch` pass validation. grants/shared-exposure.ts (GST-363)
+ * names other commands' flags (auth rescope, mcp grant, doctor) in warning
+ * text that setup, mcp, connect, skillpack and auth print.
  */
-const EXCLUDED_MODULES = ['thin-client-routing.ts', 'persistence-delegate.ts', 'job-isolation.ts'];
+const EXCLUDED_MODULES = ['thin-client-routing.ts', 'persistence-delegate.ts', 'job-isolation.ts', 'strict-args.ts', 'direct-pool-profile.ts', 'flag-equals.ts', 'shared-exposure.ts'];
 
 function isExcludedModule(p: string): boolean {
   // Basename comparison is path-separator agnostic: on Windows p ends in
@@ -353,9 +376,10 @@ export function buildFlagRegistry(root: string = ROOT): Record<string, string[]>
  * - `--brain` when the command opens its brain through the connect terminator
  *   (phase other than `pre-connect`), or its own code reads the global brain
  *   option;
- * - `--source` when the record declares `routes_source` (its source resolves
- *   through the ambient chain). The declaration needs consumption evidence (the
- *   tight-quoted `'--source'` literal in the command's own code, the
+ * - `--source` when the record declares `routes_source: true` (its source resolves
+ *   through the ambient chain), or the flag it declares instead (`'--source-id'`
+ *   for extract, whose `--source` selects fs|db). The declaration needs consumption
+ *   evidence (the tight-quoted flag literal in the command's own code, the
  *   SAFETY_FLAGS rule); a declaration without it fails the generator.
  */
 export function buildRoutingFlags(root: string = ROOT): Record<string, string[]> {
@@ -370,7 +394,7 @@ function buildFlagArtifacts(root: string): { registry: Record<string, string[]>;
   const commands = records.map(r => r.name);
 
   // Dispatch text per command, from two sources (refactor wave 1, W4 cli):
-  //  1. the explicit handleCliOnly pipeline in src/cli.ts: handleCliOnly and
+  //  1. the explicit handleCliOnly pipeline in src/cli/main.ts: handleCliOnly and
   //     every @cliPipelineStage function it calls, each segmented on its own
   //     (bounded at the function, so no function's tail bleeds into the next;
   //     unbounded, the LAST block once absorbed every --flag literal in the
@@ -380,10 +404,10 @@ function buildFlagArtifacts(root: string): { registry: Record<string, string[]>;
   // Import specifiers resolve relative to the file the text came from.
   const blocks = new Map<string, Array<{ text: string; dir: string }>>();
   const addBlock = (label: string, text: string, dir: string) => blocks.set(label, [...(blocks.get(label) ?? []), { text, dir }]);
-  const pipeline = flattenCliPipeline(parseSource(root, 'src/cli.ts'));
+  const pipeline = flattenCliPipeline(parseSource(root, 'src/cli/main.ts'));
   for (const fn of [pipeline.entry, ...pipeline.stages]) {
     // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal -- build-time generator over this repository's own source tree; every joined segment is a constant module name or a path the generator itself discovered under ROOT
-    for (const [label, text] of segmentDispatchBlocks(fn.getText())) addBlock(label, text, join(root, 'src'));
+    for (const [label, text] of segmentDispatchBlocks(fn.getText())) addBlock(label, text, join(root, 'src', 'cli'));
   }
   for (const record of records) {
     const mod = record.loadSpecifier ? readCommandModule(root, record.loadSpecifier) : null;
@@ -408,6 +432,8 @@ function buildFlagArtifacts(root: string): { registry: Record<string, string[]>;
     reindex: ['--type'],
     upgrade: ['--type', '--aliases'],
     'post-upgrade': ['--type', '--aliases'],
+    // bundled-skill's skill_not_found hint names setup's refresh command; it parses its own flags strictly.
+    'bundled-skill': ['--skill-loading', '--skills-index-only', '--install'],
   };
   const consumes = (text: string, flag: string): boolean =>
     new RegExp(`['"\`]${flag}['"\`]`).test(text);
@@ -478,12 +504,12 @@ function buildFlagArtifacts(root: string): { registry: Record<string, string[]>;
     }
     registry[command] = [...flags].sort();
     const record = records.find(r => r.name === command);
-    if (record?.routesSource && !consumes(depthZeroText, '--source')) {
-      throw new Error(`generate-flag-registry: ${command} declares routes_source but its code never reads '--source'`);
+    if (record?.routesSource && !consumes(depthZeroText, record.routesSource)) {
+      throw new Error(`generate-flag-registry: ${command} declares routes_source but its code never reads '${record.routesSource}'`);
     }
     const routed = [
       ...(record?.phase !== 'pre-connect' || /getCliOptions\(\)\.brain|cliOpts\.brain/.test(depthZeroText) ? ['--brain'] : []),
-      ...(record?.routesSource ? ['--source'] : []),
+      ...(record?.routesSource ? [record.routesSource] : []),
     ];
     if (routed.length) routing[command] = routed;
   }
@@ -518,7 +544,8 @@ ${entries}
 // Routing flags a fix naming each CLI-only command carries (A1 render-time pin,
 // src/core/fix-routing.ts): '--brain' when the command opens its brain (not a
 // pre-connect command, or its code reads the global brain option); '--source'
-// when the command-table record declares routes_source (consumption-checked).
+// (or the declared '--source-id') when the command-table record declares
+// routes_source (consumption-checked).
 export const CLI_ROUTING_FLAGS: Record<string, readonly string[]> = {
 ${render(routing)}
 };
@@ -528,7 +555,15 @@ ${render(routing)}
 if (import.meta.main) {
   const { registry, routing } = buildFlagArtifacts(ROOT);
   const outPath = join(ROOT, 'src/core/cli-flag-registry.generated.ts');
-  writeFileSync(outPath, renderRegistryModule(registry, routing));
+  const next = renderRegistryModule(registry, routing);
+  if (process.argv.includes('--check')) {
+    if ((existsSync(outPath) ? readFileSync(outPath, 'utf8') : '') !== next) {
+      console.error('src/core/cli-flag-registry.generated.ts is stale: run bun run regen:all');
+      process.exit(1);
+    }
+    process.exit(0);
+  }
+  writeFileSync(outPath, next);
   const n = Object.keys(registry).length;
   const total = Object.values(registry).reduce((a, v) => a + v.length, 0);
   console.log(`wrote ${outPath} (${n} commands, ${total} flag entries)`);

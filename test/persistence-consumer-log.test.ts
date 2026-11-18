@@ -47,6 +47,10 @@ describe('persistence consumer stderr line', () => {
     const line = stderr.find(entry => entry.startsWith('[persistence] phase='));
     expect(line).toBeDefined();
     expect(line).toContain('reason=53300');
+    // GBRA-133: the pooler's client cap names itself and the pool-sizing fix ahead of the writer-status pointer.
+    expect(line).toContain('reason=53300 cause=pool_exhausted ');
+    expect(line).toContain('fix: gbrain sources writer status --json; pool: every gbrain process on this database shares the pooler');
+    expect(line).toContain('(docs/ENGINES.md#pool-sizing); docs: docs/ENGINES.md#persistence-consumer-log');
     expect(line).toContain('message="(EMAXCONNSESSION) max clients reached in session mode - pool_size: 15 for ');
     expect(line).not.toContain('secret-pw');
     expect(line).toContain('fix: gbrain sources writer status --json');
@@ -119,5 +123,46 @@ describe('#5801 connection-wait evidence on the consumer line', () => {
     const line = stderr.find(entry => entry.includes('reason=deadline_exceeded'));
     expect(line).toContain('checkout=not_observed');
     expect(line).not.toContain('first_conn_ms=');
+  });
+});
+
+/** #6278: every statement parks until its signal aborts, then (as the engine's client-side discard does) rejects CONNECTION_DESTROYED. */
+function clientReadWedgeEngine(settleAfterAbortMs: number) {
+  let statements = 0;
+  const call = (..._args: unknown[]) => {
+    const signal = _args.find((arg): arg is { signal?: AbortSignal } => !!arg && typeof arg === 'object' && 'signal' in (arg as object))?.signal;
+    statements++;
+    return new Promise<never>((_, reject) => {
+      const end = () => setTimeout(() => reject(Object.assign(new Error('write CONNECTION_DESTROYED'), { code: 'CONNECTION_DESTROYED' })), settleAfterAbortMs);
+      if (signal?.aborted) end(); else signal?.addEventListener('abort', end, { once: true });
+    });
+  };
+  const target: Record<string, unknown> = { kind: 'postgres', onCheckout: () => () => undefined };
+  const engine = new Proxy(target, {
+    get(t, prop) {
+      if (prop in t) return t[prop as string];
+      if (prop === 'then') return undefined;
+      return call;
+    },
+  }) as unknown as BrainEngine;
+  return { engine, statements: () => statements };
+}
+
+describe('#6278 a round-trip the pooler never completes ends as the phase deadline, and the consumer keeps ticking', () => {
+  test('the phase logs deadline_exceeded once, the discarded connection is not reported as storage_error, and the next tick runs', async () => {
+    const { engine, statements } = clientReadWedgeEngine(30);
+    captureStderr();
+    const consumer = new PersistenceConsumer(engine, { engine: 'postgres' }, async () => { throw new Error('unused'); }, { hostId: crypto.randomUUID(), phaseMs: 100 });
+    try {
+      await consumer.tick();
+      const first = statements();
+      expect(first).toBeGreaterThan(0);
+      expect(consumer.status().last_error).toMatchObject({ code: 'deadline_exceeded' });
+      expect(stderr.filter(entry => entry.includes('reason=deadline_exceeded')).length).toBe(1);
+      expect(stderr.filter(entry => entry.includes('CONNECTION_DESTROYED') || entry.includes('reason=storage_error'))).toEqual([]);
+      // The consumer is not parked: a later tick issues statements again.
+      await consumer.tick();
+      expect(statements()).toBeGreaterThan(first);
+    } finally { await consumer.stop(); }
   });
 });

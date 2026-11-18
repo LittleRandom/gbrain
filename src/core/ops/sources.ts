@@ -10,8 +10,8 @@ import type { Operation, OperationContext } from './contract.ts';
 import { authTransport, opError } from './contract.ts';
 import { hostFix, hostOnlyError, paramUse } from './op-fix.ts';
 import { isValidSourceId } from '../source-id.ts';
-import { assertSourceInCallerScope, assertSourceInCallerWriteScope, sourceScopeOpts } from './context.ts';
-import { resolveAuthCapabilities } from '../harness/capabilities.ts';
+import { assertSourceInCallerScope, assertSourceInCallerWriteScope, readPolicyOpts, sourceScopeOpts } from './context.ts';
+import { resolveAuthCapabilities, resolveGrantDiagnosis } from '../harness/capabilities.ts';
 
 // --- v0.28: whoami + sources management ---
 
@@ -27,6 +27,9 @@ function managedLifecycleRefusal(ctx: OperationContext, args: string[]) {
     ['gbrain', ...args],
     'With managed persistence on, adding or removing a source changes the brain\'s writer topology, which only its owner CLI may do.');
 }
+
+/** GBRA-498: what this server supports, so a harness checks once per connection (room: room-aware results, access/room.ts). */
+const WHOAMI_FEATURES = { room: true } as const;
 
 const whoami: Operation = {
   name: 'whoami',
@@ -48,8 +51,21 @@ const whoami: Operation = {
       const entries = configReadiness(ctx.config, { transport }).entries;
       return transport === 'http' ? readinessHttpView(entries) : entries;
     };
+    const { accessView, appliedAccessSummary, credentialAccessView, stdioAccessView } = await import('../access/caller.ts');
+    // GBRA-231: the view this call is answered under (the shared-agent audience when the harness asserted one), so a
+    // model can check it when its harness does not forward _meta.access.
+    // GST-2490: and, while the owner opt-in is on, that the owner reads the pages kept to this caller; GBRA-108: and,
+    // while access.members_read_lineage is on, that members read the derived pages of pages listed to them.
+    const withApplied = async <T extends object>(view: T) => ({ ...view, applied: await appliedAccessSummary(ctx.engine, ctx.auth, [ctx.sourceId, ...(ctx.localFederatedSourceIds ?? [])]),
+      ...await (await import('../access/owner.ts')).ownerReadsRestrictedNotice(ctx.engine),
+      ...await (await import('../access/lineage.ts')).membersReadLineageNotice(ctx.engine),
+      // GST-363: and, remotely, what the requester-scope gate does with this connection's reads.
+      requester_scope: await (await import('../access/requester-scope.ts')).requesterScopeView(ctx.engine, (await import('../search/private-visibility.ts')).currentCallerAccess(), ctx.auth, ctx.transport) });
     if (ctx.remote === false) {
-      return { transport: 'local', scopes: [], readiness: readiness('cli') };
+      // GBRA-218: a local --as <member> preview reports the member it reads as; the plain local CLI reads every page.
+      const access = ctx.applyRemoteReadPolicy && ctx.accessIdentity?.length ? accessView(ctx.accessIdentity, 'as')
+        : accessView([], 'none', null, 'The local CLI reads every page; pass --as <member> to preview what a member can read.');
+      return { transport: 'local', scopes: [], features: WHOAMI_FEATURES, access, readiness: readiness('cli') };
     }
     // #1061: stdio MCP is remote/untrusted by design but has no per-token
     // auth (local pipe) — a known transport, not a bug. Report it instead of
@@ -63,7 +79,7 @@ const whoami: Operation = {
         if (verified.remote) scopes = verified.grant.scopes;
       } catch { /* no registration: no scopes */ }
       const session = ctx.stdioSurface;
-      return { transport: 'stdio', scopes, ...(session ? { surface: session.surface, surface_source: session.source } : {}), readiness: readiness('stdio') };
+      return { transport: 'stdio', scopes, features: WHOAMI_FEATURES, ...(session ? { surface: session.surface, surface_source: session.source } : {}), access: await withApplied(await stdioAccessView(ctx.engine, ctx.stdioMember)), readiness: readiness('stdio') };
     }
     if (!ctx.auth) {
       throw opError(
@@ -76,19 +92,35 @@ const whoami: Operation = {
     }
     // Legacy access_tokens reuse `name` as both clientId and clientName, so the
     // transport comes from the verifier-set principal (prefix only as fallback).
+    // GST-2898: where this connection writes and the sources it reads unqualified, resolved (the read-shared switch
+    // included), so an agent can tell the user without learning it from refusals.
+    const { NO_SOURCES } = await import('../source-id.ts');
+    const writeSource = ctx.auth.sourceId && ctx.auth.sourceId !== NO_SOURCES ? ctx.auth.sourceId : null;
+    const sourcesView = {
+      write_source: writeSource,
+      read_sources: ctx.auth.allowedSources ?? (ctx.localFederatedSourceIds?.length ? [...ctx.localFederatedSourceIds] : writeSource ? [writeSource] : []),
+      read_shared: ctx.auth.readShared === true,
+    };
     if (authTransport(ctx.auth) === 'oauth') {
       return {
         transport: 'oauth',
+        features: WHOAMI_FEATURES,
         client_id: ctx.auth.clientId,
         client_name: ctx.auth.clientName ?? ctx.auth.clientId,
-        ...await resolveAuthCapabilities(ctx.auth, ctx.engine, ctx.config),
+        ...sourcesView,
+        ...await resolveAuthCapabilities(ctx.auth, ctx.engine, ctx.config, { surfaceCeiling: ctx.surfaceCeiling }),
+        access: await withApplied(await credentialAccessView(ctx.engine, ctx.auth)),
       };
     }
     return {
       transport: 'legacy',
+      features: WHOAMI_FEATURES,
       token_name: ctx.auth.clientName ?? ctx.auth.clientId,
       scopes: ctx.auth.scopes,
       expires_at: null,
+      ...sourcesView,
+      access: await withApplied(await credentialAccessView(ctx.engine, ctx.auth)),
+      grant_diagnosis: await resolveGrantDiagnosis(ctx.auth, ctx.engine, ctx.config, { surfaceCeiling: ctx.surfaceCeiling }),
       readiness: readiness('http'),
     };
   },
@@ -131,7 +163,7 @@ const sources_add: Operation = {
   mutating: true,
   scope: 'sources_admin',
   handler: async (ctx, p) => {
-    const { addSource } = await import('../sources-ops.ts');
+    const { addSource, SourceOpError } = await import('../sources-ops.ts');
     if(ctx.remote!==false&&await (await import('../persistence/ownership.ts')).managedPersistenceEnabled(ctx.engine))
       throw managedLifecycleRefusal(ctx, ['sources', 'add', ...sourceIdArg(p.id), ...(typeof p.url === 'string' && /^https:\/\/\S+$/.test(p.url) ? ['--url', p.url] : [])]);
 
@@ -170,9 +202,15 @@ const sources_add: Operation = {
       name: p.name as string | undefined,
       localPath: remotePath,
       remoteUrl: p.url as string | undefined,
+      addedByRemoteCaller: !isLocal,
       federated:
         p.federated === undefined ? null : (p.federated as boolean),
       cloneDir: remoteCloneDir,
+    }).catch((err: unknown) => {
+      // git's own error names the far end and how it answered; a remote caller gets a fixed message, the host log keeps it.
+      if (isLocal || !(err instanceof SourceOpError) || err.code !== 'clone_failed') throw err;
+      console.error(`[gbrain] sources_add ${String(p.id)}: ${err.message}`);
+      throw new SourceOpError('clone_failed', 'git clone failed for this URL. The brain host\'s log has the reason.', err);
     });
     const { redactSourceConfig } = await import('../source-config-redact.ts');
     const { parseSourceConfig } = await import('../sources-load.ts');
@@ -299,7 +337,9 @@ const sources_status: Operation = {
     const status = await getSourceStatus(ctx.engine, p.id as string);
     const { readCompanyBrainSourceStatus } = await import('../company-brain/status.ts');
     const ingestion = await readCompanyBrainSourceStatus(ctx.engine, p.id as string);
-    return ingestion ? { ...status, ingestion } : status;
+    const { readAppliedWatermark } = await import('../persistence/applied-watermark.ts');
+    const watermark = await readAppliedWatermark(ctx.engine, p.id as string, { remote: ctx.remote !== false }).catch(() => null);
+    return { ...status, ...(ingestion ? { ingestion } : {}), ...(watermark ? { watermark } : {}) };
   },
   cliHints: { name: 'sources_status', hidden: true },
 };
@@ -332,6 +372,29 @@ const sources_inspect: Operation = {
   cliHints: { name: 'sources_inspect', hidden: true },
 };
 
+const sources_resolve_path: Operation = {
+  name: 'sources_resolve_path',
+  mutating: false,
+  idempotent: true,
+  outputRedaction: 'no_stored_text',
+  description:
+    'Read-only: what gbrain did with each file path of a source, by its own rules. Per path: the slug sync gives it, whether ' +
+    'sync skips it (metafile, excluded, pruned) and why, its sync hold, its page with chunk and embedding counts, whether ' +
+    'search finds it now, and the command that moves it on. A deleted path is checked by the page that records it as its ' +
+    'origin, never by slug. Use it in landing checks instead of re-implementing slugging. Confined to the caller\'s source scope.',
+  params: {
+    id: { type: 'string', required: true, description: "Source id, as listed by sources_list (e.g. 'default')." },
+    paths: { type: 'array', items: { type: 'string' }, required: true, description: 'File paths relative to the source root (or to the Git top level), at most 200, e.g. the paths a commit changed.' },
+  },
+  scope: 'read',
+  handler: async (ctx, p) => {
+    assertSourceInCallerScope(ctx, p.id as string);
+    const { resolveSourcePaths } = await import('../persistence/resolve-paths.ts');
+    return resolveSourcePaths(ctx.engine, p.id as string, (p.paths as unknown[] ?? []).map(String), await readPolicyOpts(ctx, { sourceId: p.id as string }));
+  },
+  cliHints: { name: 'sources_resolve_path', hidden: true },
+};
+
 export const sourcesOperations: Operation[] = [
-  whoami, sources_add, sources_list, sources_remove, sources_status, sources_inspect,
+  whoami, sources_add, sources_list, sources_remove, sources_status, sources_inspect, sources_resolve_path,
 ];

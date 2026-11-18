@@ -26,14 +26,17 @@ import type { GBrainConfig } from '../config.ts';
 import { opError, OperationError, type OperationContext } from '../ops/contract.ts';
 import { serializePageToMarkdown } from '../markdown.ts';
 import { formatFenceDate, parseFactsFence, upsertFactRow } from '../facts-fence.ts';
+import { withHeldFactsFence } from './unfenced-facts.ts';
 import { digest } from '../persistence/digest.ts';
 import type { PreparedMutation } from '../persistence/coordinator.ts';
 import type { WriteRequest } from '../persistence/model.ts';
-import { applyPreservingTakeResolutions, readFacts, type FactSnapshot } from '../persistence/prepared-maintenance.ts';
+import { readFacts, type FactSnapshot } from '../persistence/prepared-maintenance.ts';
+import { withTrustKeep } from '../persistence/context.ts';
 import { decideSingleFact } from './single-prepare.ts';
 import { isFactWithdrawn } from './withdrawal.ts';
 import { appendContextNote } from './subject-infer.ts';
 import { normalizeTargetFences } from '../fence-repair/import-step.ts';
+import { refuseUnparsedRewrite } from '../fence-repair/refusal.ts';
 import { pageFencesNormalized } from '../fence-repair/report.ts';
 
 export const RELINK_OPERATION = 'relink_facts';
@@ -66,8 +69,8 @@ function fenceRow(v: Record<string, unknown>, rowNum: number, context: string) {
   return {
     rowNum, claim: String(v.fact), kind: v.kind as never, confidence: Number(v.confidence ?? 1),
     visibility: v.visibility as never, notability: (v.notability ?? 'medium') as never,
-    validFrom: formatFenceDate(new Date(String(v.valid_from))),
-    validUntil: v.valid_until ? formatFenceDate(new Date(String(v.valid_until))) : undefined,
+    validFrom: fenceInstant(v.valid_from)!,
+    validUntil: v.valid_until ? fenceInstant(v.valid_until)! : undefined,
     source: v.source == null ? undefined : String(v.source),
     context,
     ...(v.claim_metric ? { claimMetric: String(v.claim_metric) } : {}),
@@ -79,11 +82,24 @@ function fenceRow(v: Record<string, unknown>, rowNum: number, context: string) {
 }
 
 /**
+ * A stored validity instant as its fence cell. Whole seconds keep formatFenceDate's shapes; milliseconds are kept, since
+ * the page projection writes the cell back to the row. Null for an instant finer than a millisecond, which no cell carries.
+ */
+function fenceInstant(value: unknown): string | null {
+  const text = String(value);
+  const date = new Date(text);
+  if (/\.\d{3}\d*[1-9]/.test(text) || !Number.isFinite(date.getTime())) return null;
+  return date.getUTCMilliseconds() ? date.toISOString() : formatFenceDate(date);
+}
+
+/**
  * A claim the fence cannot carry unchanged (wrapped in ~~, or otherwise not
- * parsing back to the same active claim and visibility) would be expired and
- * re-inserted as a different fact by the page projection, so it is never moved.
+ * parsing back to the same active claim and visibility, or a validity instant
+ * a cell cannot hold) would be expired and re-inserted as a different fact, or
+ * have its dates rounded, by the page projection, so it is never moved.
  */
 function roundTrips(v: Record<string, unknown>, context: string): boolean {
+  if (fenceInstant(v.valid_from) === null || v.valid_until != null && fenceInstant(v.valid_until) === null) return false;
   const parsed = parseFactsFence(upsertFactRow('', fenceRow(v, 1, context)).body);
   const cell = parsed.facts[0];
   return parsed.warnings.length === 0 && parsed.facts.length === 1 && cell!.active && cell!.claim === String(v.fact)
@@ -126,6 +142,19 @@ async function classify(db: BrainEngine, row: WriteRequest, intent: RelinkIntent
       out.push(same.visibility === visibility ? { id: f.id, action: 'retire', duplicateOf: Number(same.id) }
         : { id: f.id, action: 'skip', reason: 'visibility_conflict' });
       continue;
+    }
+    // B-10: an ontology observation the page already holds at the same key would collide on
+    // idx_facts_ontology_stint_dedup once linked; it retires as that row's duplicate instead.
+    if (v.dimension != null) {
+      const [held] = await db.executeRaw<{ id: number | string }>(
+        `SELECT t.id FROM facts m JOIN facts t ON t.source_id = m.source_id AND t.dimension = m.dimension AND t.value_hash = m.value_hash
+             AND t.valid_from = m.valid_from AND t.id <> m.id
+           WHERE m.source_id=$1 AND m.id=$3 AND t.entity_slug=$2 AND t.source_markdown_slug=$2
+           ORDER BY (t.expired_at IS NULL) DESC, t.id LIMIT 1`, [row.source_id, row.slug, f.id]);
+      if (held) {
+        out.push({ id: f.id, action: 'retire', duplicateOf: Number(held.id) });
+        continue;
+      }
     }
     const exact = await decideSingleFact(db, row.source_id,
       { entity_slug: row.slug, fact: String(v.fact), kind: v.kind as never, visibility }, null);
@@ -175,7 +204,7 @@ export async function prepareRelinkMutation(engine: BrainEngine, row: WriteReque
   if (links.length) {
     // #6188 (D20): Tier 1 normalizes the entity's stored fence in this write; a residual refuses typed `target_fence_malformed`.
     const target = await normalizeTargetFences(engine, { sourceId: row.source_id, slug: row.slug, kind: 'facts', page: snapshot.page });
-    ({ compiled_truth: body, timeline } = target.page);
+    ({ compiled_truth: body, timeline } = await withHeldFactsFence(engine, row.source_id, row.slug, { compiled_truth: target.page.compiled_truth, timeline: target.page.timeline }));
     if (target.fixes.length) normalized = { fences_normalized: pageFencesNormalized({ sourceId: row.source_id, slug: row.slug, fixes: target.fixes,
       writer: row.principal_kind, path: snapshot.page.source_path ?? null, remote: row.authority.remote }) };
     const parsed = parseFactsFence(body);
@@ -186,7 +215,9 @@ export async function prepareRelinkMutation(engine: BrainEngine, row: WriteReque
       const v = link.value;
       const rowNum = next++;
       rowNums.set(link.id, rowNum);
-      body = upsertFactRow(body, fenceRow(v, rowNum, appendContextNote(v.context as string | null, byId.get(link.id)!.note))).body;
+      // #6385 R12: a fence that does not parse cleanly refuses typed (`fence_malformed` below) instead of losing rows.
+      body = refuseUnparsedRewrite({ compiled_truth: body, timeline }, row.slug, row.source_id,
+        () => upsertFactRow(body, fenceRow(v, rowNum, appendContextNote(v.context as string | null, byId.get(link.id)!.note))).body);
     }
   }
   const page = links.length ? await (await import('../persistence/page-prepare.ts')).preparePageMutation(engine, { ...row, intent: {
@@ -200,7 +231,8 @@ export async function prepareRelinkMutation(engine: BrainEngine, row: WriteReque
     }
     await page?.validate?.(tx);
   };
-  const apply = async (tx: BrainEngine): Promise<Record<string, unknown>> => {
+  // Linking places a fact; it does not author it, so its rows keep the tier and write origin they were written with.
+  const apply = (tx: BrainEngine): Promise<Record<string, unknown>> => withTrustKeep(tx, ['facts'], async () => {
     const outcome: RelinkGroupOutcome = { linked: [], deduped: [], skipped: [], queued: 0 };
     const guard = 'WHERE source_id=$1 AND id=$2 AND entity_slug IS NULL AND row_num IS NULL AND source_markdown_slug IS NULL AND expired_at IS NULL RETURNING id';
     // Rows take their fence positions before the page projection runs, so the
@@ -223,7 +255,7 @@ export async function prepareRelinkMutation(engine: BrainEngine, row: WriteReque
         outcome.skipped.push({ id: c.id, reason: c.reason });
       }
     }
-    const published = page ? await applyPreservingTakeResolutions(tx, row.page_id, page) : {};
+    const published = page ? await page.apply(tx) : {};
     for (const c of planned) {
       if (c.action === 'skip') continue;
       const f = byId.get(c.id)!;
@@ -238,7 +270,7 @@ export async function prepareRelinkMutation(engine: BrainEngine, row: WriteReque
       outcome.queued = await enqueueRelinked(tx, row.source_id, outcome.linked.map(l => l.id));
     }
     return { ...published, status: 'relinked', slug: row.slug, ...outcome, ...normalized };
-  };
+  });
   if (!page) return { observedRevision, validate, apply };
   return { ...page, validate, apply };
 }
@@ -271,7 +303,13 @@ export async function submitRelinkGroup(engine: BrainEngine, config: GBrainConfi
   }
   const snapshot = await engine.readPageSnapshot(slug, { sourceId });
   if (!snapshot) return { ok: false, reason: 'no_page', message: `${slug} no longer exists` };
-  const target = await resolveFactWriteTarget(engine, sourceId, source);
+  let target: Awaited<ReturnType<typeof resolveFactWriteTarget>>;
+  try {
+    target = await resolveFactWriteTarget(engine, sourceId, source, { fileBacked: Boolean(snapshot.page.source_path), remote: false });
+  } catch (error) {
+    if (error instanceof OperationError && error.code === 'owner_unavailable') return { ok: false, reason: 'unfenceable', message: error.message };
+    throw error;
+  }
   if (target.kind === 'unbound') return { ok: false, reason: 'unfenceable', message: `source ${sourceId} writes through to ${target.root} but has no canonical owner` };
   const authority = await submissionAuthority(ctx, RELINK_OPERATION, sourceId, source.incarnation, slug);
   if (target.databaseOnlyReason) authority.databaseOnlyReason = target.databaseOnlyReason;

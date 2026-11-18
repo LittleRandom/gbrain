@@ -13,6 +13,7 @@
  *      + salience ×1.05 (mattering)             ← when salience_boost > 1
  *      + recency  ×1.00 (no decay applied)      ← when recency_boost > 1
  *      + exact-match ×1.50                      ← when exact_match_boost > 1
+ *      + title-mention ×1.25                    ← when title_mention_boost > 1
  *      + adjacency ×1.05 (hits=3)               ← when graph_adjacency_boost set
  *      + cross_source ×1.10 (other_sources=2)   ← when graph_cross_source_boost set
  *      - session_demote ×0.95 (prefix=chat/x)   ← when session_demote_factor set
@@ -31,6 +32,7 @@
 import type { SearchResult, HybridSearchMeta } from '../types.ts';
 import type { DeliveryMeta } from './evidence-delivery.ts';
 import type { AutocutDecision } from './autocut.ts';
+import { formatTimingsSummary, type SearchTimingsMeta } from './stage-timings.ts';
 
 /**
  * Format a single result with per-stage attribution. Returns a string
@@ -79,6 +81,10 @@ export function formatResultExplain(
   if (result.exact_match_boost !== undefined && result.exact_match_boost !== 1.0) {
     anyBoost = true;
     lines.push(`   + exact-match ×${fmt(result.exact_match_boost)}`);
+  }
+  if (result.title_mention_boost !== undefined && result.title_mention_boost !== 1.0) {
+    anyBoost = true;
+    lines.push(`   + title-mention ×${fmt(result.title_mention_boost)}`);
   }
   if (result.graph_adjacency_boost !== undefined) {
     anyBoost = true;
@@ -149,6 +155,22 @@ export function formatDegradedSummary(degraded: HybridSearchMeta['degraded'] | u
   return `degraded: ${degraded.map((d) => (d.reason ? `${d.stage} (${d.reason})` : d.stage)).join(', ')}`;
 }
 
+/**
+ * W3 — one-line rerank gate summary for `--explain` (null when the gate is
+ * off, so gate-off explain output is byte-identical).
+ */
+export function formatRerankGateSummary(gate: HybridSearchMeta['rerank_gate'] | undefined): string | null {
+  if (!gate) return null;
+  if (!gate.eligible) return `rerank gate (${gate.mode}): not graded (${gate.ineligible_reason})`;
+  const signal = [
+    gate.top_cosine !== undefined ? `cosine ${fmt(gate.top_cosine)}` : null,
+    gate.gap !== undefined ? `gap ${fmt(gate.gap)}` : null,
+    `${gate.candidates} candidates`,
+  ].filter(Boolean).join(', ');
+  const verdict = gate.would_skip ? 'would skip' : gate.skip_blocked ? `would rerank (${gate.skip_blocked})` : 'would rerank';
+  return `rerank gate (${gate.mode}): ${gate.grade} ${gate.reason} — ${verdict} (${signal})`;
+}
+
 /** One-line evidence-delivery summary for `--explain` (null when the stage did not run). */
 export function formatDeliverySummary(delivery: DeliveryMeta | undefined): string | null {
   if (!delivery) return null;
@@ -185,13 +207,13 @@ export function formatDecideSummary(decide: HybridSearchMeta['decide'] | undefin
  */
 export function formatResultsExplain(
   results: SearchResult[],
-  meta?: HybridSearchMeta & { delivery?: DeliveryMeta },
+  meta?: HybridSearchMeta & { delivery?: DeliveryMeta; timings?: SearchTimingsMeta },
 ): string {
   if (results.length === 0) return 'No results.\n';
   const body = results.map((r, i) => formatResultExplain(r, i + 1)).join('\n\n') + '\n';
   // v0.42.3.0 — prepend the autocut summary when meta carries a decision;
   // v0.48.2 — and the degraded summary when any stage was skipped.
-  const head = [formatAutocutSummary(meta?.autocut), formatDegradedSummary(meta?.degraded), formatDeliverySummary(meta?.delivery), formatDecideSummary(meta?.decide)]
+  const head = [formatAutocutSummary(meta?.autocut), formatDegradedSummary(meta?.degraded), formatRerankGateSummary(meta?.rerank_gate), formatDeliverySummary(meta?.delivery), formatDecideSummary(meta?.decide), formatTimingsSummary(meta?.timings)]
     .filter((l): l is string => l !== null);
   return head.length > 0 ? `${head.join('\n')}\n\n${body}` : body;
 }
@@ -241,6 +263,7 @@ export function buildScoreDetails(result: SearchResult): ScoreDetails {
   add('recency', result.recency_boost);
   add('chronicle', result.chronicle_boost);
   add('title', result.title_match_boost);
+  add('title_mention', result.title_mention_boost);
   add('adjacency', result.graph_adjacency_boost, { hits: result.graph_adjacency_hits });
   add('cross_source', result.graph_cross_source_boost, { other_sources: result.graph_cross_source_hits });
   add('session_demote', result.session_demote_factor, { prefix: result.graph_session_prefix });

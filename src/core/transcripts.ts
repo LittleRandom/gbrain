@@ -14,11 +14,12 @@
  */
 
 import { readFileSync, readdirSync, statSync } from 'node:fs';
+import { corpusSpoolDir } from './context/corpus-segments.ts';
 import { join, basename, dirname } from 'node:path';
 import type { BrainEngine } from './engine.ts';
 import type { Action } from './agent-output.ts';
 import { isDreamOutput } from './cycle/transcript-discovery.ts';
-import { redactFindings } from './secret-scan.ts';
+import { TRANSCRIPT_LANE_SCAN_OPTS, redactFindings } from './secret-scan.ts';
 
 export interface RecentTranscriptOpts {
   /** Window in days. Default 7. */
@@ -85,7 +86,7 @@ export async function listRecentTranscripts(
     const name = basename(c.path);
     const dateMatch = DATE_RE.exec(name);
     // Redact the whole file before the summary/full-read cap cuts it.
-    const text = redactFindings(raw, { highEntropy: true }).text;
+    const text = redactFindings(raw, TRANSCRIPT_LANE_SCAN_OPTS).text;
     out.push({
       path: name,
       date: dateMatch ? dateMatch[1] : null,
@@ -102,7 +103,8 @@ export async function transcriptCorpusDirs(engine: Pick<BrainEngine, 'getConfig'
   const dirs: string[] = [];
   const sessionDir = await engine.getConfig('dream.synthesize.session_corpus_dir');
   const meetingDir = await engine.getConfig('dream.synthesize.meeting_transcripts_dir');
-  if (sessionDir) dirs.push(sessionDir);
+  // #6268: source-stamped session files live in the corpus spool subdirectory.
+  if (sessionDir) dirs.push(sessionDir, corpusSpoolDir(sessionDir));
   if (meetingDir) dirs.push(meetingDir);
   return dirs;
 }

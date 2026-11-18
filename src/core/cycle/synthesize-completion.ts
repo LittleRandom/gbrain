@@ -10,16 +10,31 @@ import type { BrainEngine } from '../engine.ts';
 import type { MaintenanceAuthority } from '../persistence/prepared-maintenance.ts';
 import { managedPersistenceEnabled } from '../persistence/ownership.ts';
 import type { DiscoveredTranscript } from './transcript-discovery.ts';
+import type { PhaseResult } from '../cycle.ts';
 
 /**
  * #5145: split transcripts into already-synthesized and candidates BEFORE the
  * paid triage pass. Classic brains (no maintenance) and dry runs (maintenance
  * forced null) used to triage completed transcripts first and only skip them
- * afterwards, re-buying triage whenever the verdict cache expired. Legacy
- * `dream:synth:` keys count on classic brains only (as the fan-out always
- * did); a dry run on a managed brain reads the source incarnation read-only
- * so its synth-v2 keys match the identity a real run would use. The key lists
- * are returned for the fan-out's own per-transcript checks.
+ * afterwards, re-buying triage whenever the verdict cache expired. A dry run
+ * on a managed brain reads the source incarnation read-only so its synth-v2
+ * keys match the identity a real run would use.
+ *
+ * `retainedSkips` maps each transcript the fan-out must skip without
+ * re-attaching children to its skip reason: legacy `dream:synth:` completions
+ * and, on a managed brain, synth-v2 completions under the bare source id.
+ * Completions keyed to this run's own identity stay out of the map; the
+ * fan-out re-checks them against `successfulV2Keys` (a managed run re-attaches
+ * their children for postprocessing).
+ *
+ * #6924: on a managed brain a completion without an incarnation (legacy keys,
+ * bare-source synth-v2 keys) was recorded before the brain went managed, so
+ * its identity cannot say which row of this source id it belongs to. It
+ * counts only when this source still holds that synthesis's output: a live
+ * `dream_generated` page whose `raw_source` names the transcript (matched by
+ * basename, like the keys). Pages are deleted with their source row, so a
+ * completion of a removed and re-added source, or of another source, never
+ * suppresses synthesis.
  */
 export async function partitionCompletedSynthesis(
   engine: BrainEngine,
@@ -27,19 +42,48 @@ export async function partitionCompletedSynthesis(
   sourceId: string,
   maintenance: MaintenanceAuthority | null,
   dryRun: boolean,
-): Promise<{ completed: Set<string>; successfulLegacyKeys: string[]; successfulV2Keys: string[]; synthesisIdentity: string }> {
+): Promise<{ completed: Set<string>; retainedSkips: Map<string, string>; successfulV2Keys: string[]; synthesisIdentity: string }> {
   const incarnation = maintenance
     ? maintenance.writer.sourceIncarnation
     : dryRun ? await readManagedSourceIncarnation(engine, sourceId) : null;
   const synthesisIdentity = incarnation !== null ? `${sourceId}/${incarnation}` : sourceId;
   const successfulV2Keys = await loadSuccessfulSynthesisKeys(engine, sourceId, 'dream:synth-v2:');
-  const successfulLegacyKeys = incarnation !== null ? [] : await loadSuccessfulSynthesisKeys(engine, sourceId, 'dream:synth:');
-  const completed = new Set(transcripts.filter(t => {
+  const successfulLegacyKeys = await loadSuccessfulSynthesisKeys(engine, sourceId, 'dream:synth:');
+  const retainedOutputs = incarnation !== null ? await loadRetainedOutputSources(engine, sourceId) : null;
+  const completed = new Set<string>();
+  const retainedSkips = new Map<string, string>();
+  for (const t of transcripts) {
     const hash16 = t.contentHash.slice(0, 16);
-    return findLegacyCompletion(successfulLegacyKeys, t.filePath, hash16) !== null
-      || findSynthV2Completion(successfulV2Keys, t.filePath, hash16, synthesisIdentity) !== null;
-  }).map(t => t.filePath));
-  return { completed, successfulLegacyKeys, successfulV2Keys, synthesisIdentity };
+    const current = findSynthV2Completion(successfulV2Keys, t.filePath, hash16, synthesisIdentity);
+    if (current) completed.add(t.filePath);
+    if (retainedOutputs && (current || !retainedOutputs.has(basename(t.filePath)))) continue;
+    const legacy = findLegacyCompletion(successfulLegacyKeys, t.filePath, hash16);
+    const premanaged = retainedOutputs ? findSynthV2Completion(successfulV2Keys, t.filePath, hash16, sourceId) : null;
+    const reason = legacy ? `already_synthesized_legacy_${legacy === 'chunked' ? 'chunked' : 'single_chunk'}`
+      : premanaged ? `already_synthesized_v2_${premanaged === 'chunked' ? 'chunked' : 'single_chunk'}` : null;
+    if (!reason) continue;
+    completed.add(t.filePath);
+    retainedSkips.set(t.filePath, reason);
+  }
+  return { completed, retainedSkips, successfulV2Keys, synthesisIdentity };
+}
+
+/**
+ * #6924: basenames of the transcripts this source's live synthesis output
+ * names (`raw_source`, stamped on every classic synthesis page by
+ * stampDreamProvenance).
+ */
+async function loadRetainedOutputSources(engine: BrainEngine, sourceId: string): Promise<Set<string>> {
+  const rows = await engine.executeRaw<{ raw_source: string }>(
+    `SELECT DISTINCT frontmatter->>'raw_source' AS raw_source
+       FROM pages
+      WHERE source_id = $1
+        AND deleted_at IS NULL
+        AND frontmatter->>'dream_generated' = 'true'
+        AND COALESCE(frontmatter->>'raw_source', '') <> ''`,
+    [sourceId],
+  );
+  return new Set(rows.map(row => basename(row.raw_source)));
 }
 
 /**
@@ -98,6 +142,42 @@ async function loadSuccessfulSynthesisKeys(
     [sourceId, `${keyPrefix}%`],
   );
   return rows.map(row => row.idempotency_key);
+}
+
+/**
+ * #6753: the synth-v2 completions of the source recorded within the last `hours`, with when each finished: completed
+ * subagent jobs and the durable completion archive. Failed, cancelled and still-running jobs are not completions.
+ */
+export async function recentSynthesisCompletions(engine: BrainEngine, sourceId: string, hours: number): Promise<Array<{ key: string; at: number }>> {
+  if (hours <= 0) return [];
+  const rows = await engine.executeRaw<{ idempotency_key: string; at: string | Date }>(
+    `SELECT idempotency_key, finished_at AS at FROM minion_jobs
+      WHERE name = 'subagent' AND status = 'completed' AND finished_at > now() - ($3 || ' hours')::interval
+        AND COALESCE(NULLIF(data->>'source_id', ''), 'default') = $1 AND idempotency_key LIKE $2
+     UNION ALL
+     SELECT idempotency_key, completed_at FROM dream_synthesis_completions
+      WHERE source_id = $1 AND idempotency_key LIKE $2 AND completed_at > now() - ($3 || ' hours')::interval`,
+    [sourceId, 'dream:synth-v2:%', String(hours)],
+  );
+  return rows.map(row => ({ key: row.idempotency_key, at: new Date(row.at).getTime() }));
+}
+
+/**
+ * #6753: a growing transcript (a live session) has a new content hash on every pass, so its completion key never
+ * matches and it was synthesized again in full each time. When another version of the same file completed in full
+ * (single or a whole chunk set, as findSynthV2Completion counts it) within `hours`, the current version waits: the
+ * ISO time the hold ends, else null. The hold only delays; once it ends the current version synthesizes once, whole.
+ */
+export function resynthesisHoldUntil(recent: Array<{ key: string; at: number }>, filePath: string, hash16: string,
+  sourceId: string, hours: number): string | null {
+  const prefix = `dream:synth-v2:${encodeURIComponent(sourceId)}:filename:${encodeURIComponent(basename(filePath))}:`;
+  const mine = recent.filter(r => r.key.startsWith(prefix));
+  let latest = 0;
+  for (const other of new Set(mine.map(r => r.key.slice(prefix.length, prefix.length + 16)))) {
+    if (other === hash16 || !findSynthV2Completion(mine.map(r => r.key), filePath, other, sourceId)) continue;
+    for (const r of mine) if (r.key.startsWith(prefix + other)) latest = Math.max(latest, r.at);
+  }
+  return latest > 0 ? new Date(latest + hours * 3_600_000).toISOString() : null;
 }
 
 /**
@@ -168,4 +248,46 @@ export function findLegacyCompletion(
     if (seen.size === n) return 'chunked';
   }
   return null;
+}
+
+/**
+ * #5848: the synthesize result for a window with zero candidates: no model call, no queue, no budget spend. Status
+ * stays ok (not skipped) so finishDeferredPostprocess still finishes outputs an earlier pass deferred (#6757).
+ */
+export function noCandidates(summary: string, details: Record<string, unknown>): PhaseResult {
+  return { phase: 'synthesize', status: 'ok', duration_ms: 0, summary, details: { reason: 'no_candidates', transcripts_processed: 0, pages_written: 0, ...details } };
+}
+
+/**
+ * #5848: a classic real run whose every discovered transcript is already synthesized returns here, before triage,
+ * the manifest context and the fan-out; it stamps the cooldown as a fully completed run would and reports each
+ * transcript's skip reason. A managed run never comes here: it re-attaches completed children for publication.
+ */
+export async function noNewTranscripts(engine: BrainEngine, transcripts: DiscoveredTranscript[],
+  partition: Pick<Awaited<ReturnType<typeof partitionCompletedSynthesis>>, 'retainedSkips' | 'successfulV2Keys' | 'synthesisIdentity'>): Promise<PhaseResult> {
+  await engine.setConfig('dream.synthesize.last_completion_ts', new Date().toISOString());
+  const skips = transcripts.map(t => ({ filePath: t.filePath, reason: partition.retainedSkips.get(t.filePath)
+    ?? (findSynthV2Completion(partition.successfulV2Keys, t.filePath, t.contentHash.slice(0, 16), partition.synthesisIdentity) === 'chunked'
+      ? 'already_synthesized_v2_chunked' : 'already_synthesized_v2_single_chunk') }));
+  return noCandidates(`no new transcripts to synthesize (${transcripts.length} already synthesized)`, { transcripts_discovered: transcripts.length,
+    synthesis_state: { candidates: 0, already_synthesized: transcripts.length }, children_submitted: 0, skips });
+}
+
+/**
+ * #6753: the per-transcript re-synthesis hold for one run, read once: a function giving the `resynthesis_cooldown`
+ * skip reason for a transcript an earlier version of which completed within `hours`, else null. Zero hours (an explicit
+ * --input/--date run, or a cooldown of 0) holds nothing.
+ */
+export async function resynthesisHold(engine: BrainEngine, sourceId: string, hours: number): Promise<(filePath: string, hash16: string, identity: string) => string | null> {
+  const recent = await recentSynthesisCompletions(engine, sourceId, hours);
+  return (filePath, hash16, identity) => {
+    const until = resynthesisHoldUntil(recent, filePath, hash16, identity, hours);
+    return until && `resynthesis_cooldown: an earlier version of this transcript was synthesized within ${hours}h; the current version synthesizes after ${until}`;
+  };
+}
+
+/** #6753: the summary's note of transcripts held by the per-transcript re-synthesis hold, empty when none. */
+export function resynthesisHoldSuffix(skips: Array<{ reason: string }>): string {
+  const held = skips.filter(s => s.reason.startsWith('resynthesis_cooldown')).length;
+  return held ? ` (${held} grown transcript(s) held by resynthesis_cooldown)` : '';
 }

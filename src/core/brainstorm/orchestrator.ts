@@ -32,7 +32,9 @@
  */
 
 import type { BrainEngine } from '../engine.ts';
-import { chat as defaultChat, embedQuery, type ChatResult, type ChatOpts } from '../ai/gateway.ts';
+import { chat as defaultChat, type ChatResult, type ChatOpts } from '../ai/gateway.ts';
+import { embedQueryWithPrefix } from '../search/query-prefix.ts';
+import { embeddingSendBlocked } from '../embedding-disabled.ts';
 import { hybridSearch, hybridSearchCached } from '../search/hybrid.ts';
 import { INTERNAL_BREADTH_SEARCH_OPTS } from '../search/internal-breadth.ts';
 import { fetchFar, type CloseRef, type FarPage } from './domain-bank.ts';
@@ -661,7 +663,7 @@ async function _runBrainstormInner(
   const profile = opts.profile ?? BRAINSTORM_PROFILE;
   const stderr = opts.stderrWrite ?? ((s: string) => { process.stderr.write(s); });
   const chat = opts.chatFn ?? defaultChat;
-  const embedFn = opts.embedQueryFn ?? embedQuery;
+  const embedFn = opts.embedQueryFn ?? ((q: string) => embedQueryWithPrefix(engine, q));
 
   // ---- Phase 0: cost preview + TTY grace ----
   const { aborted, estimate } = await previewCostAndWait({
@@ -692,7 +694,7 @@ async function _runBrainstormInner(
   // ---- Phase 1: question embedding + close-set retrieval ----
   let questionEmbedding: Float32Array | null = null;
   try {
-    questionEmbedding = await embedFn(opts.question);
+    if (!await embeddingSendBlocked(engine)) questionEmbedding = await embedFn(opts.question);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     stderr(`[${profile.label}] WARN: question embedding failed (${msg}); distance scores will be neutral.\n`);

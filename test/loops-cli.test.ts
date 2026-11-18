@@ -194,6 +194,18 @@ describe('runWaiting', () => {
     expect(r.verdict).toBe(0);
   });
 
+  // #5871: no-counterparty loops are listed in their own section, never as a person.
+  test('only no-counterparty loops → their section and the management hint, never "You are clean"', async () => {
+    await upsertOpenLoop(engine, loop({ dedupKey: 'decision:solo', loopType: 'decision_pending', counterpartyEmail: null, threadId: null,
+      summary: 'Decide on the offsite venue', detector: 'llm_extract' }));
+    const r = await captured(() => runWaiting(engine, []));
+    expect(r.out).toContain('## No counterparty (1 open: decision_pending 1)');
+    expect(r.out).not.toContain('You are clean');
+    expect(r.out).toContain('gbrain loops done <id>');
+    const j = await captured(() => runWaiting(engine, ['--json']));
+    expect(JSON.parse(j.out)).toMatchObject({ ok: true, groups: [], no_counterparty: { loop_count: 1, loops_omitted: 0 } });
+  });
+
   test('partially stale google sources warn with source ids without refusing, including JSON', async () => {
     await engine.executeRaw(
       `INSERT INTO sources (id, name, config, last_sync_at)
@@ -395,7 +407,9 @@ describe('runLoops', () => {
   test('mute sender writes the suppression row (lowercased) and prints the semantics', async () => {
     const r = await captured(() => runLoops(engine, ['mute', 'sender', 'Bob@Example.com']));
     expect(r.out).toContain('Muted sender Bob@Example.com');
-    expect(r.out).toContain("existing loops keep their state");
+    // #5012: a mute now closes the sender's open reply-owed loops and prints the count and the undo.
+    expect(r.out).toContain('closed 0 open reply-owed loop(s)');
+    expect(r.out).toContain('Undo: gbrain loops unmute sender bob@example.com --source default');
     expect(r.verdict).toBe(0);
     const set = await loadSuppressions(engine, 'default');
     expect(set.senders.has('bob@example.com')).toBe(true);

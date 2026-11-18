@@ -51,10 +51,11 @@ import {
   CHARS_PER_TOKEN,
   type TriageFileReport,
 } from '../core/cycle/synthesize.ts';
-import { discoverTranscripts } from '../core/cycle/transcript-discovery.ts';
+import { discoverTranscripts, conversationPagesOptedIn, withConversationPages } from '../core/cycle/transcript-discovery.ts';
 import { passesTriageGate, rescueConfigOf } from '../core/cycle/triage-rescue.ts';
 import { estimateTriageDecideUsd, resolveTriageDecide } from '../core/cycle/triage-decide.ts';
 import { jsonRequested, setCliExitVerdict, writeJsonDocument } from '../core/cli-force-exit.ts';
+import { printHelpText } from '../cli/help/render.ts';
 import { opError, type OperationError } from '../core/ops/contract.ts';
 import { usageError, writeCliRefusal } from '../cli/cli-error.ts';
 import { MinionQueue } from '../core/minions/queue.ts';
@@ -161,8 +162,8 @@ function parseRetriageArgs(args: string[]): RetriageArgs {
   return out;
 }
 
-function printRetriageHelp(): void {
-  console.log(`gbrain dream retriage — re-score the corpus, reconcile the synth backlog
+function printRetriageHelp(args: string[]): Promise<void> {
+  return printHelpText('dream retriage', `gbrain dream retriage — re-score the corpus, reconcile the synth backlog
 
 USAGE
   gbrain dream retriage [flags]
@@ -176,7 +177,8 @@ FLAGS
   --reconcile-queue    Cancel waiting synth jobs per the gate (opt-in; see below)
   --cancel-unmatched   With --reconcile-queue: also cancel jobs whose file no
                        longer matches any discovered transcript
-  --source <id>        Scope queue reconciliation to one source's jobs
+  --source <id>        Scope queue reconciliation to one source's jobs, and
+                       read that source's conversation pages (default: default)
   --yes                Skip the spend confirmation
   --max-usd <n>        Soft-stop judging when the ESTIMATED spend crosses n
                        (estimate-based; every judge attempt counts, including
@@ -210,7 +212,7 @@ the same passesTriageGate the synthesize fan-out reads)
   legacy dream:synth: (v1) keys                 never touched
 
 Cancelled rows release their idempotency slot, so lowering the threshold
-later cleanly re-submits the work.`);
+later cleanly re-submits the work.`, args);
 }
 
 interface QueueCandidate {
@@ -302,7 +304,7 @@ export async function runDreamRetriage(engine: BrainEngine | null, args: string[
   }
   // IRON RULE: --help short-circuits before any engine-bearing work.
   if (parsed.help) {
-    printRetriageHelp();
+    await printRetriageHelp(args);
     return;
   }
   if (engine === null) {
@@ -312,9 +314,9 @@ export async function runDreamRetriage(engine: BrainEngine | null, args: string[
   }
 
   const config = await loadSynthConfig(engine);
-  if (!config.corpusDir) {
-    refuse(args, opError('config_error', 'dream retriage: dream.synthesize.session_corpus_dir is unset — nothing to retriage',
-      'Ask the user where their session transcripts live, then: gbrain config set dream.synthesize.session_corpus_dir <dir>'));
+  if (!config.corpusDir && !(await conversationPagesOptedIn(engine))) {
+    refuse(args, opError('config_error', 'dream retriage: dream.synthesize.session_corpus_dir is unset and dream.synthesize.conversation_pages is not true — nothing to retriage',
+      'Ask the user where their session transcripts live, then: gbrain config set dream.synthesize.session_corpus_dir <dir> (or, for imported conversation pages: gbrain config set dream.synthesize.conversation_pages true)'));
     return;
   }
   const threshold = parsed.threshold ?? config.triage.threshold;
@@ -324,12 +326,14 @@ export async function runDreamRetriage(engine: BrainEngine | null, args: string[
   const rescueCfg = rescueConfigOf(config.triage);
   const { decide, gate: decideGate, cacheValid, model: triageModel, perFileUsd } = await retriageS7(engine, config, parsed.since ?? undefined);
 
-  let transcripts = discoverTranscripts({
+  // #7307: the same list synthesize triages, the corpus walk plus the source's
+  // conversation pages (the maintenance lane's synthesize reads 'default').
+  let transcripts = await withConversationPages(engine, { sourceId: parsed.source ?? 'default' }, config, !config.corpusDir ? [] : discoverTranscripts({
     corpusDir: config.corpusDir,
     meetingTranscriptsDir: config.meetingTranscriptsDir ?? undefined,
     minChars: config.minChars,
     excludePatterns: config.excludePatterns,
-  });
+  }));
   if (parsed.limit !== null) transcripts = transcripts.slice(0, parsed.limit);
 
   // ── Half 1: score the corpus (cached reads in --dry-run; judged otherwise) ──

@@ -10,7 +10,6 @@ import { load } from 'js-yaml';
 import {
   escapeAnchorLines,
   MESSAGE_ANCHOR_RE,
-  MESSAGE_CHAR_CAP,
   OVERLAP_MESSAGES,
   PART_TARGET_BYTES,
   redactSession,
@@ -251,7 +250,7 @@ describe('redaction [fail-closed page lane]', () => {
 
 describe('part splitting [embed-skip is the binding limit]', () => {
   test('long sessions split at message boundaries with overlap; ids unique; base slug stable', () => {
-    const chunk = 'x'.repeat(MESSAGE_CHAR_CAP - 100);
+    const chunk = 'x'.repeat(3_900);
     const many = Array.from({ length: 150 }, (_, i) => ({
       role: (i % 2 === 0 ? 'user' : 'assistant') as 'user' | 'assistant',
       timestamp: `2026-08-02T09:${String(Math.floor(i / 60)).padStart(2, '0')}:${String(i % 60).padStart(2, '0')}.000Z`,
@@ -266,9 +265,13 @@ describe('part splitting [embed-skip is the binding limit]', () => {
     const ids = new Set(r.parts.map((p) => p.frontmatterId));
     expect(ids.size).toBe(r.parts.length);
     // Every part body stays under the embed-skip threshold with margin.
+    // Wave B: the part count stays out of hashed content (no `of`, no "of N" in the title).
     for (const p of r.parts) {
       expect(Buffer.byteLength(splitBody(p.content), 'utf8')).toBeLessThan(PART_TARGET_BYTES + 64 * 1024);
-      expect(frontmatter(p.content).transcript_import.of).toBe(r.parts.length);
+      const fm = frontmatter(p.content);
+      expect(fm.transcript_import.of).toBeUndefined();
+      expect(fm.transcript_import).toMatchObject({ part: p.part, part_bytes: PART_TARGET_BYTES });
+      expect(fm.title.endsWith(` (part ${p.part})`)).toBe(true);
     }
     // Overlap: part 2 starts with the tail messages of part 1.
     const p1Body = splitBody(r.parts[0].content);

@@ -22,6 +22,7 @@ import { computeAnomaliesFromBuckets } from '../cycle/anomaly.ts';
 import type { SqlExecutor } from './executor.ts';
 import type { LegacyUnscopedRead } from './brands.ts';
 import { sqlFragment, trustedSql } from './fragment.ts';
+import { rankingLinkSql } from '../link-ranking-policy.ts';
 
 export async function batchLoadEmotionalInputs(exec: LegacyUnscopedRead, slugs?: string[]): Promise<EmotionalWeightInputRow[]> {
     // Two CTEs avoid the N×M cartesian product (codex C4#4): a page with N tags
@@ -149,6 +150,7 @@ export async function getRecentSalience(exec: LegacyUnscopedRead, opts: Salience
     // Scope is already bound above; use the shared live/privacy predicate
     // before ranking and LIMIT, including for holder-unrestricted callers.
     const readCondition = trustedSql(`AND ${pageReadFilter('p', { excludePrivate: opts.excludePrivate }, [], true)}`);
+    // Score ties sort by source_id, then slug, so the order never depends on heap order.
     const rows = (await exec.run(sqlFragment`
       SELECT p.slug, p.source_id, p.title, p.type, p.updated_at, ${trustedSql(emotionalSql)} AS emotional_weight,
              COUNT(DISTINCT t.id) AS take_count,
@@ -164,7 +166,7 @@ export async function getRecentSalience(exec: LegacyUnscopedRead, opts: Salience
          ${excludeBriefings}
          ${sourceCondition} ${readCondition}
        GROUP BY p.id
-       ORDER BY score DESC
+       ORDER BY score DESC, p.source_id ASC, p.slug ASC
        LIMIT ${limit}
     `)).rows;
     return rows.map((r: Record<string, unknown>) => ({
@@ -226,6 +228,7 @@ export async function listEnrichCandidates(exec: LegacyUnscopedRead, opts: Enric
             FROM links l
            WHERE l.to_page_id = p.id
              AND l.link_source IS DISTINCT FROM 'mentions'
+             AND ${trustedSql(rankingLinkSql('l'))}
         ), 0)::int AS inbound_count
       FROM pages p
       WHERE p.deleted_at IS NULL

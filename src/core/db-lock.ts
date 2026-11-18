@@ -23,18 +23,27 @@
  */
 import { hostname } from 'os';
 import { randomUUID } from 'node:crypto';
-import type { BrainEngine } from './engine.ts';
+import type { BrainEngine, CycleLockFilter } from './engine.ts';
+import { rethrowCapabilityRefusal } from './engine-capability-refusal.ts';
+import { isRustEngineKind } from './sql-engine-kind.ts';
 
 export interface DbLockHandle {
   id: string;
-  /** Epoch-seconds timestamp retained for diagnostics and legacy mutation detection. */
+  /** Epoch-seconds text of acquired_at, diagnostics only (#6028: never a predicate term). */
   acquiredAt: string;
-  /** Opaque UUID identity; timestamps are retained only for compatibility/diagnostics. */
+  /**
+   * The lease identity. Every acquisition mints a fresh UUID (v152), so
+   * refresh/release/cleanup match on (id, holder_pid, acquisition_token)
+   * alone: a successor's row has another token, and a rewrite of
+   * `acquired_at` under a live holder (its epoch text is session-fragile:
+   * numeric scale, DateStyle, a maintenance touch) no longer costs the
+   * holder its own lease (#6028).
+   */
   acquisitionToken: string;
   release: () => Promise<void>;
   /**
    * Bump ttl_expires_at + last_refreshed_at. Returns true when this handle
-   * still owns the row (exactly one row matched the fenced predicate);
+   * still owns the row (exactly one row matched (id, holder_pid, acquisition_token));
    * false means the lock was stolen or released — the caller must stop
    * relying on mutual exclusion. Transient DB errors still THROW (they are
    * not evidence of a steal; the TTL is the backstop).
@@ -198,7 +207,25 @@ export function isLockHolderLive(snap: LockSnapshot, ttlMinutes: number = DEFAUL
  * Empty RETURNING means the existing row is still live. An expired holder
  * (worker crashed without releasing) is auto-superseded by the UPDATE
  * branch.
+ *
+ * On Postgres the handle's release and exit cleanup run on the engine's pool as
+ * it is when they run, never the pool the acquire used: `engine.reconnect()`
+ * ends that pool while the lock is held (a write admission that lost its
+ * connection rebuilds it), and a statement on an ended pool fails
+ * `CONNECTION_ENDED`, which turned a finished sync into a thrown error and left
+ * its lock row behind until the TTL lapsed.
  */
+/**
+ * #7442: the fence on a lock row: the row with this token, unexpired, `FOR KEY SHARE`. KEY SHARE lets the holder's own
+ * renewal (an UPDATE of non-key columns) through while a fenced transaction is open, so fenced transactions, however long
+ * or overlapping, can no longer starve it and lapse a live lease. A takeover still waits for the fence: its upsert also
+ * writes the key (`id = EXCLUDED.id` in `tryAcquireDbLock`), which takes the row lock KEY SHARE conflicts with, as every
+ * DELETE (release, break-lock) does. Returns the row when the fence holds, none when the lease is gone.
+ */
+export function fenceLockRow(tx: Pick<BrainEngine, 'executeRaw'>, lockId: string, token: string): Promise<unknown[]> {
+  return tx.executeRaw('SELECT 1 FROM gbrain_cycle_locks WHERE id=$1 AND acquisition_token=$2::uuid AND ttl_expires_at > now() FOR KEY SHARE', [lockId, token]);
+}
+
 export async function tryAcquireDbLock(
   engine: BrainEngine,
   lockId: string,
@@ -210,13 +237,6 @@ export async function tryAcquireDbLock(
   // from the ON CONFLICT steal even if its TTL lapsed (starved-but-alive).
   const stealGraceSeconds = resolveStealGraceSeconds(ttlMinutes);
 
-  // Engine-agnostic: prefer the engine's raw escape hatch (`sql` for postgres-js,
-  // `db.query` for PGLite). Mirrors cycle.ts's pattern so behavior stays identical.
-  const maybePG = engine as unknown as { sql?: (...args: unknown[]) => Promise<unknown> };
-  const maybePGLite = engine as unknown as {
-    db?: { query: (sql: string, params?: unknown[]) => Promise<{ rows: unknown[] }> };
-  };
-
   // v0.41.6.0 D5: auto-register cleanup so abnormal termination (SIGTERM/
   // SIGHUP/SIGPIPE/uncaughtException/EPIPE-on-stdout) releases the lock.
   // The returned handle's release() deregisters before deleting — atomic
@@ -225,126 +245,36 @@ export async function tryAcquireDbLock(
   // registration for free (single ownership site per outside-voice F11).
   const { registerCleanup } = await import('./process-cleanup.ts');
 
+  // The lease statements are typed engine methods (engine-sql/cycle-locks.ts); each engine keeps its own transport
+  // (Postgres: retryReadOnlyAutocommit on the pool, the renewal on the direct session pool; PGLite: its database).
   const acquireOnce = async (): Promise<DbLockHandle | null> => {
-  const acquisitionToken = randomUUID();
-  if (engine.kind === 'postgres' && maybePG.sql) {
-    const sql = maybePG.sql as any;
-    const ttl = `${ttlMinutes} minutes`;
-    // v0.41.13.0 (D-V3-4 / migration v98): write last_refreshed_at on INSERT
-    // AND on takeover. last_refreshed_at = acquired_at on initial INSERT;
-    // every refresh() tick bumps both ttl_expires_at AND last_refreshed_at.
-    // `gbrain sync --break-lock --max-age <s>` uses last_refreshed_at (not
-    // acquired_at) to identify wedged-but-alive holders without stealing
+    const acquisitionToken = randomUUID();
+    // v0.41.13.0 (D-V3-4 / migration v98): last_refreshed_at is written on INSERT AND on takeover (= acquired_at
+    // initially; every refresh() tick bumps both ttl_expires_at AND last_refreshed_at). `gbrain sync --break-lock
+    // --max-age <s>` uses last_refreshed_at (not acquired_at) to identify wedged-but-alive holders without stealing
     // healthy long-running holders that are actively refreshing.
-    const rows: Array<{ id: string; fence: string }> = await sql`
-      INSERT INTO gbrain_cycle_locks (id, holder_pid, holder_host, acquired_at, ttl_expires_at, last_refreshed_at, acquisition_token)
-      VALUES (${lockId}, ${pid}, ${host}, NOW(), NOW() + ${ttl}::interval, NOW(), ${acquisitionToken}::uuid)
-      ON CONFLICT (id) DO UPDATE
-        SET holder_pid = ${pid},
-            holder_host = ${host},
-            acquired_at = NOW(),
-            acquisition_token = ${acquisitionToken}::uuid,
-            ttl_expires_at = NOW() + ${ttl}::interval,
-            last_refreshed_at = NOW()
-        WHERE gbrain_cycle_locks.ttl_expires_at < NOW()
-          AND (gbrain_cycle_locks.last_refreshed_at IS NULL
-               OR gbrain_cycle_locks.last_refreshed_at < NOW() - ${stealGraceSeconds} * INTERVAL '1 second')
-      RETURNING id, extract(epoch from acquired_at)::text AS fence
-    `;
-    if (rows.length === 0) return null;
-    // Epoch text avoids per-session TimeZone/DateStyle differences. The
-    // UUID distinguishes acquisitions sharing one transaction-stable NOW().
-    const fence = rows[0].fence;
+    const held = await engine.acquireCycleLock(lockId, { holderPid: pid, holderHost: host, acquisitionToken, ttlMinutes, stealGraceSeconds });
+    if (!held) return null;
+    // The UUID is the fence; the epoch text rides on the handle for diagnostics (migration-orchestration-lock.ts
+    // reports it when a lease is lost) and is never compared (#6028).
+    const fence = held.fence;
+    const owner = { holderPid: pid, acquisitionToken };
     const deregister = registerCleanup(`db-lock:${lockId}`, async () => {
-      await sql`
-        DELETE FROM gbrain_cycle_locks
-        WHERE id = ${lockId} AND holder_pid = ${pid} AND extract(epoch from acquired_at)::text = ${fence} AND acquisition_token = ${acquisitionToken}::uuid
-      `;
+      await engine.releaseCycleLock(lockId, owner);
     });
     return {
       id: lockId,
       acquiredAt: fence,
       acquisitionToken,
-      refresh: async (refreshOpts?: { signal?: AbortSignal }) => {
-        // v0.41.13.0: bump BOTH ttl_expires_at AND last_refreshed_at.
-        // v0.42.x (#1794): route through the DIRECT session pool, not the
-        // transaction pool, so a Supavisor pooler exhaustion (EMAXCONNSESSION)
-        // can't kill the heartbeat and let the live lock get stolen.
-        const updated = await engine.executeRawDirect<{ id: string }>(
-          `UPDATE gbrain_cycle_locks
-              SET ttl_expires_at = NOW() + ($1)::interval,
-                  last_refreshed_at = NOW()
-            WHERE id = $2 AND holder_pid = $3 AND extract(epoch from acquired_at)::text = $4 AND acquisition_token = $5::uuid
-            RETURNING id`,
-          [ttl, lockId, pid, fence, acquisitionToken],
-          refreshOpts,
-        );
-        return updated.length > 0;
-      },
+      // v0.41.13.0: bumps BOTH ttl_expires_at AND last_refreshed_at. v0.42.x (#1794): Postgres routes it through the
+      // DIRECT session pool, not the transaction pool, so a Supavisor pooler exhaustion (EMAXCONNSESSION) can't kill
+      // the heartbeat and let the live lock get stolen.
+      refresh: async (refreshOpts?: { signal?: AbortSignal }) => engine.refreshCycleLock(lockId, { ...owner, ttlMinutes }, refreshOpts),
       release: async () => {
         deregister();
-        await sql`
-          DELETE FROM gbrain_cycle_locks
-          WHERE id = ${lockId} AND holder_pid = ${pid} AND extract(epoch from acquired_at)::text = ${fence} AND acquisition_token = ${acquisitionToken}::uuid
-        `;
+        await engine.releaseCycleLock(lockId, owner);
       },
     };
-  }
-
-  if (engine.kind === 'pglite' && maybePGLite.db) {
-    const db = maybePGLite.db;
-    const ttl = `${ttlMinutes} minutes`;
-    const { rows } = await db.query(
-      `INSERT INTO gbrain_cycle_locks (id, holder_pid, holder_host, acquired_at, ttl_expires_at, last_refreshed_at, acquisition_token)
-       VALUES ($1, $2, $3, NOW(), NOW() + $4::interval, NOW(), $6::uuid)
-       ON CONFLICT (id) DO UPDATE
-         SET holder_pid = $2,
-             holder_host = $3,
-             acquired_at = NOW(),
-             acquisition_token = $6::uuid,
-             ttl_expires_at = NOW() + $4::interval,
-             last_refreshed_at = NOW()
-         WHERE gbrain_cycle_locks.ttl_expires_at < NOW()
-           AND (gbrain_cycle_locks.last_refreshed_at IS NULL
-                OR gbrain_cycle_locks.last_refreshed_at < NOW() - $5 * INTERVAL '1 second')
-       RETURNING id, extract(epoch from acquired_at)::text AS fence`,
-      [lockId, pid, host, ttl, stealGraceSeconds, acquisitionToken],
-    );
-    if (rows.length === 0) return null;
-    // Fencing identity (D5.10) — see the postgres branch for rationale.
-    const fence = String((rows[0] as { fence: string }).fence);
-    const deregister = registerCleanup(`db-lock:${lockId}`, async () => {
-      await db.query(
-        `DELETE FROM gbrain_cycle_locks WHERE id = $1 AND holder_pid = $2 AND extract(epoch from acquired_at)::text = $3 AND acquisition_token = $4::uuid`,
-        [lockId, pid, fence, acquisitionToken],
-      );
-    });
-    return {
-      id: lockId,
-      acquiredAt: fence,
-      acquisitionToken,
-      refresh: async () => {
-        const res = await db.query(
-          `UPDATE gbrain_cycle_locks
-              SET ttl_expires_at = NOW() + $1::interval,
-                  last_refreshed_at = NOW()
-            WHERE id = $2 AND holder_pid = $3 AND extract(epoch from acquired_at)::text = $4 AND acquisition_token = $5::uuid
-            RETURNING id`,
-          [ttl, lockId, pid, fence, acquisitionToken],
-        );
-        return res.rows.length > 0;
-      },
-      release: async () => {
-        deregister();
-        await db.query(
-          `DELETE FROM gbrain_cycle_locks WHERE id = $1 AND holder_pid = $2 AND extract(epoch from acquired_at)::text = $3 AND acquisition_token = $4::uuid`,
-          [lockId, pid, fence, acquisitionToken],
-        );
-      },
-    };
-  }
-
-  throw new Error(`Unknown engine kind for db-lock: ${engine.kind}`);
   };
 
   const first = await acquireOnce();
@@ -367,8 +297,10 @@ export async function tryAcquireDbLock(
         if (second) return second;
       }
     }
-  } catch {
-    // Auto-takeover is best-effort; never throw from the acquire path.
+  } catch (err) {
+    // Auto-takeover is best-effort; never throw from the acquire path. A capability refusal is not a failure to
+    // take over: the engine cannot serve the lock at all, so it propagates.
+    rethrowCapabilityRefusal(err);
   }
   return null;
 }
@@ -494,6 +426,8 @@ export interface LockSnapshot {
   last_refreshed_at: Date | null;
   /** ms since the most recent refresh, or null when last_refreshed_at is null. */
   ms_since_last_refresh: number | null;
+  /** #7982: the clock the derived fields were computed against: the database's at the read (the reader's only for a row without it). */
+  db_now: Date;
 }
 
 /**
@@ -508,19 +442,20 @@ interface RawLockRow {
   acquired_at?: Date | string;
   ttl_expires_at?: Date | string;
   last_refreshed_at?: Date | string | null;
+  /** #7614: the database clock at the read, so every derived age compares database stamps with the database clock. */
+  db_now?: Date | string;
 }
-
-/** Canonical column list for every lock SELECT — keep in lockstep with `RawLockRow`. */
-const LOCK_SELECT_COLS = 'id, holder_pid, holder_host, acquired_at, ttl_expires_at, last_refreshed_at, acquisition_token';
 
 /**
  * Row → `LockSnapshot` mapper. Coerces postgres.js Date|string columns to Date
- * and computes the derived fields (age_ms, ttl_expired, ms_since_last_refresh).
+ * and computes the derived fields (age_ms, ttl_expired, ms_since_last_refresh) against the database clock the row
+ * carries (#7614: a reader whose clock runs ahead of the database read a renewing holder as expired), else `now`.
  * Returns null for a structurally-incomplete row (missing pid / acquired_at /
  * ttl). v0.41.13.0: last_refreshed_at may be NULL on pre-v98 brains.
  */
-function rowToLockSnapshot(row: RawLockRow, now: number): LockSnapshot | null {
+function rowToLockSnapshot(row: RawLockRow, readerNow: number): LockSnapshot | null {
   if (row.holder_pid === undefined || !row.acquired_at || !row.ttl_expires_at) return null;
+  const now = row.db_now == null ? readerNow : new Date(row.db_now).getTime();
   const acquired = row.acquired_at instanceof Date ? row.acquired_at : new Date(row.acquired_at);
   const ttlExpires = row.ttl_expires_at instanceof Date ? row.ttl_expires_at : new Date(row.ttl_expires_at);
   const lastRefreshed = row.last_refreshed_at == null
@@ -537,51 +472,31 @@ function rowToLockSnapshot(row: RawLockRow, now: number): LockSnapshot | null {
     ttl_expired: ttlExpires.getTime() < now,
     last_refreshed_at: lastRefreshed,
     ms_since_last_refresh: lastRefreshed ? now - lastRefreshed.getTime() : null,
+    db_now: new Date(now),
   };
 }
 
 interface SelectLockRowsOpts {
   /** Return only the row for this exact lock id (the `inspectLock` case). */
   lockId?: string;
+  /** #7614: return only the rows for these lock ids, in one read (the `inspectLocks` case). */
+  lockIds?: readonly string[];
   /** Return only rows whose ttl_expires_at < NOW() (the `listStaleLocks` case). */
   staleOnly?: boolean;
 }
 
 /**
- * The single canonical reader for `gbrain_cycle_locks`. Engine-branches once
- * (postgres / pglite) so `inspectLock`, `listStaleLocks`, and the reaper don't
- * each re-roll the SELECT + Date-coercion (previously triplicated). Returns
- * fully-mapped `LockSnapshot[]`; callers filter in JS (the table holds 0-2 rows
- * in practice, so a no-WHERE full read is cheap and keeps the SQL trivial).
+ * The single canonical reader for `gbrain_cycle_locks`. The SELECT is the engine's typed `readCycleLocks`
+ * (engine-sql/cycle-locks.ts), so `inspectLock`, `listStaleLocks`, and the reaper don't each re-roll it (previously
+ * triplicated); this maps the rows. Returns fully-mapped `LockSnapshot[]`; callers filter in JS (the table holds 0-2
+ * rows in practice, so a no-WHERE full read is cheap and keeps the SQL trivial).
  */
 async function selectLockRows(engine: BrainEngine, opts: SelectLockRowsOpts = {}): Promise<LockSnapshot[]> {
-  const maybePG = engine as unknown as { sql?: (...args: unknown[]) => Promise<unknown> };
-  const maybePGLite = engine as unknown as {
-    db?: { query: (sql: string, params?: unknown[]) => Promise<{ rows: unknown[] }> };
-  };
-
-  let rows: RawLockRow[];
-  if (engine.kind === 'postgres' && maybePG.sql) {
-    const sql = maybePG.sql as any;
-    if (opts.lockId !== undefined) {
-      rows = await sql`SELECT id, holder_pid, holder_host, acquired_at, ttl_expires_at, last_refreshed_at, acquisition_token FROM gbrain_cycle_locks WHERE id = ${opts.lockId}`;
-    } else if (opts.staleOnly) {
-      rows = await sql`SELECT id, holder_pid, holder_host, acquired_at, ttl_expires_at, last_refreshed_at, acquisition_token FROM gbrain_cycle_locks WHERE ttl_expires_at < NOW() ORDER BY acquired_at`;
-    } else {
-      rows = await sql`SELECT id, holder_pid, holder_host, acquired_at, ttl_expires_at, last_refreshed_at, acquisition_token FROM gbrain_cycle_locks ORDER BY acquired_at`;
-    }
-  } else if (engine.kind === 'pglite' && maybePGLite.db) {
-    if (opts.lockId !== undefined) {
-      rows = (await maybePGLite.db.query(`SELECT ${LOCK_SELECT_COLS} FROM gbrain_cycle_locks WHERE id = $1`, [opts.lockId])).rows as RawLockRow[];
-    } else if (opts.staleOnly) {
-      rows = (await maybePGLite.db.query(`SELECT ${LOCK_SELECT_COLS} FROM gbrain_cycle_locks WHERE ttl_expires_at < NOW() ORDER BY acquired_at`)).rows as RawLockRow[];
-    } else {
-      rows = (await maybePGLite.db.query(`SELECT ${LOCK_SELECT_COLS} FROM gbrain_cycle_locks ORDER BY acquired_at`)).rows as RawLockRow[];
-    }
-  } else {
-    throw new Error(`Unknown engine kind for selectLockRows: ${engine.kind}`);
-  }
-
+  const filter: CycleLockFilter = opts.lockId !== undefined ? { by: 'id', lockId: opts.lockId }
+    : opts.lockIds !== undefined ? { by: 'ids', lockIds: [...opts.lockIds] }
+    : opts.staleOnly ? { by: 'stale' }
+    : { by: 'all' };
+  const rows: RawLockRow[] = await engine.readCycleLocks(filter);
   const now = Date.now();
   return rows
     .map((r) => rowToLockSnapshot(r, now))
@@ -591,6 +506,12 @@ async function selectLockRows(engine: BrainEngine, opts: SelectLockRowsOpts = {}
 export async function inspectLock(engine: BrainEngine, lockId: string): Promise<LockSnapshot | null> {
   const rows = await selectLockRows(engine, { lockId });
   return rows[0] ?? null;
+}
+
+/** #7614: the rows of several locks in one read, by lock id (a lock with no row is absent from the map). */
+export async function inspectLocks(engine: BrainEngine, lockIds: readonly string[]): Promise<Map<string, LockSnapshot>> {
+  if (!lockIds.length) return new Map();
+  return new Map((await selectLockRows(engine, { lockIds })).map(snap => [snap.id, snap]));
 }
 
 /**
@@ -638,30 +559,7 @@ export async function deleteLockRow(
   holderPid: number,
   acquisitionToken: string,
 ): Promise<{ deleted: boolean }> {
-  const maybePG = engine as unknown as { sql?: (...args: unknown[]) => Promise<unknown> };
-  const maybePGLite = engine as unknown as {
-    db?: { query: (sql: string, params?: unknown[]) => Promise<{ rows: unknown[] }> };
-  };
-
-  if (engine.kind === 'postgres' && maybePG.sql) {
-    const sql = maybePG.sql as any;
-    const rows: Array<{ id: string }> = await sql`
-      DELETE FROM gbrain_cycle_locks
-       WHERE id = ${lockId} AND holder_pid = ${holderPid} AND acquisition_token = ${acquisitionToken}::uuid
-      RETURNING id
-    `;
-    return { deleted: rows.length > 0 };
-  }
-  if (engine.kind === 'pglite' && maybePGLite.db) {
-    const { rows } = await maybePGLite.db.query(
-      `DELETE FROM gbrain_cycle_locks
-        WHERE id = $1 AND holder_pid = $2 AND acquisition_token = $3::uuid
-       RETURNING id`,
-      [lockId, holderPid, acquisitionToken],
-    );
-    return { deleted: rows.length > 0 };
-  }
-  throw new Error(`Unknown engine kind for deleteLockRow: ${engine.kind}`);
+  return { deleted: await engine.deleteCycleLock(lockId, { holderPid, acquisitionToken }) };
 }
 
 /**
@@ -709,45 +607,7 @@ export async function deleteLockRowIfStale(
   maxAgeSeconds: number,
   acquisitionToken: string,
 ): Promise<{ deleted: boolean; lastRefreshedAt: Date | null }> {
-  const maybePG = engine as unknown as { sql?: (...args: unknown[]) => Promise<unknown> };
-  const maybePGLite = engine as unknown as {
-    db?: { query: (sql: string, params?: unknown[]) => Promise<{ rows: unknown[] }> };
-  };
-
-  if (engine.kind === 'postgres' && maybePG.sql) {
-    const sql = maybePG.sql as any;
-    const rows: Array<{ id: string; last_refreshed_at: Date | string | null }> = await sql`
-      DELETE FROM gbrain_cycle_locks
-       WHERE id = ${lockId}
-         AND holder_pid = ${holderPid}
-         AND acquisition_token = ${acquisitionToken}::uuid
-         AND last_refreshed_at IS NOT NULL
-         AND last_refreshed_at < NOW() - ${maxAgeSeconds} * INTERVAL '1 second'
-      RETURNING id, last_refreshed_at
-    `;
-    if (rows.length === 0) return { deleted: false, lastRefreshedAt: null };
-    const lr = rows[0].last_refreshed_at;
-    const lastRefreshed = lr == null ? null : (lr instanceof Date ? lr : new Date(lr));
-    return { deleted: true, lastRefreshedAt: lastRefreshed };
-  }
-  if (engine.kind === 'pglite' && maybePGLite.db) {
-    const { rows } = await maybePGLite.db.query(
-      `DELETE FROM gbrain_cycle_locks
-        WHERE id = $1
-          AND holder_pid = $2
-          AND acquisition_token = $4::uuid
-          AND last_refreshed_at IS NOT NULL
-          AND last_refreshed_at < NOW() - $3 * INTERVAL '1 second'
-       RETURNING id, last_refreshed_at`,
-      [lockId, holderPid, maxAgeSeconds, acquisitionToken],
-    );
-    if (rows.length === 0) return { deleted: false, lastRefreshedAt: null };
-    const r = rows[0] as { id: string; last_refreshed_at: Date | string | null };
-    const lr = r.last_refreshed_at;
-    const lastRefreshed = lr == null ? null : (lr instanceof Date ? lr : new Date(lr));
-    return { deleted: true, lastRefreshedAt: lastRefreshed };
-  }
-  throw new Error(`Unknown engine kind for deleteLockRowIfStale: ${engine.kind}`);
+  return engine.deleteCycleLockIfStale(lockId, { holderPid, acquisitionToken, maxAgeSeconds });
 }
 
 /** Snapshot-matched delete using the full UUID; never millisecond timestamp equality. */
@@ -1073,8 +933,8 @@ export async function buildTenantLockId(engine: BrainEngine, scope: string): Pro
       const dbname = rows[0]?.db || 'unknown';
       return `${scope}:${dbname}`;
     }
-    // PGLite is single-tenant by construction; suffix is cosmetic.
-    return `${scope}:pglite`;
+    // PGLite and the Rust engine are single-tenant by construction; the suffix is cosmetic.
+    return `${scope}:${isRustEngineKind(engine.kind) ? 'rust' : 'pglite'}`;
   } catch {
     return `${scope}:unknown`;
   }

@@ -27,8 +27,11 @@ import {
   resolveTakesRepoDir,
   resolveTakesWritePath,
   TakesWriteError,
+  withStoredTakesFence,
 } from './takes-write.ts';
-import { managedPersistenceEnabled } from './persistence/ownership.ts';
+import { getWorktreeBinding, managedPersistenceEnabled } from './persistence/ownership.ts';
+import { isWriteThroughDisabled, resolvePageWriteTarget } from './write-through.ts';
+import { isDbOnly, loadStorageConfig } from './storage-config.ts';
 import { serializePageToMarkdown } from './markdown.ts';
 import { BudgetMeter, loadPricingOverrides } from './cycle/budget-meter.ts';
 import { parseTakesFence } from './takes-fence.ts';
@@ -56,8 +59,13 @@ Max 15 claims per page; output [] if no gradeable claims are present.`;
 export interface ExtractTakesFromPagesOpts {
   /** Required: must be true for any work to happen (A12). */
   bootstrapEnabled: boolean;
-  /** Dry-run: classify but don't write to takes table. */
+  /**
+   * Dry-run: write nothing. Without `yes` it only lists the candidate pages
+   * and calls no model; with `yes` it also classifies them.
+   */
   dryRun?: boolean;
+  /** The user passed --yes: page content may be sent to the chat model. */
+  yes?: boolean;
   /** Scope to a single source. */
   sourceIdFilter?: string;
   /** Max pages to classify per run (caps cost). Default 50. */
@@ -91,7 +99,12 @@ export interface ExtractTakesFromPagesOpts {
 
 export interface ExtractTakesFromPagesResult {
   pages_scanned: number;
-  claims_extracted: number;
+  /** Null on a dry run without `yes`: no claims were classified. */
+  claims_extracted: number | null;
+  /** Set on a dry run without `yes`: candidates listed, nothing sent to the model. */
+  dry_run?: true;
+  /** The candidate pages a dry run without `yes` listed. */
+  candidates?: Array<{ slug: string; source_id: string }>;
   /**
    * Where the next run should resume, as `<updated_at text>,<page id>`: the
    * position of the last page this run finished with, or null if it finished
@@ -143,6 +156,19 @@ interface PageRow {
   resume_at: string;
 }
 
+/** Whether an unmanaged page's database body is its copy of record: write-through off, or its target in a storage.db_only directory. */
+async function databaseOnlyPage(engine: BrainEngine, slug: string, sourceId: string): Promise<boolean> {
+  if (await isWriteThroughDisabled(engine)) return true;
+  const target = await resolvePageWriteTarget(engine, slug, sourceId);
+  if (!target.ok) return false;
+  try {
+    const storage = loadStorageConfig(target.writeRoot);
+    return storage !== null && isDbOnly(slug, storage);
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Pure helper: parse Haiku JSON output into typed claims. Returns []
  * on any parse failure (caller treats as "no claims extracted").
@@ -187,7 +213,9 @@ export async function extractTakesFromPages(
     };
   }
 
-  if (!isAvailable('chat')) {
+  const dryRun = opts.dryRun ?? false;
+  const listOnly = dryRun && !opts.yes;
+  if (!listOnly && !isAvailable('chat')) {
     return {
       pages_scanned: 0,
       claims_extracted: 0,
@@ -197,7 +225,6 @@ export async function extractTakesFromPages(
     };
   }
 
-  const dryRun = opts.dryRun ?? false;
   const managedJournalWrites = await managedPersistenceEnabled(engine);
   const maxPages = opts.maxPages ?? 50;
   const holder = opts.holder ?? 'system';
@@ -235,6 +262,19 @@ export async function extractTakesFromPages(
     params,
   );
 
+  if (listOnly) {
+    return {
+      ...emptyTail,
+      dry_run: true,
+      pages_scanned: pages.length,
+      claims_extracted: null,
+      next_before: pages.at(-1)?.resume_at ?? null,
+      consent_gate_blocked: false,
+      llm_unavailable: false,
+      candidates: pages.map((page) => ({ slug: page.slug, source_id: page.source_id })),
+    };
+  }
+
   let pagesScanned = 0;
   let claimsExtracted = 0;
   let pagesSkipped = 0;
@@ -264,11 +304,22 @@ export async function extractTakesFromPages(
 
     if (!page.compiled_truth || page.compiled_truth.length < 200) continue;
 
-    // #4473: locate the page's markdown home BEFORE the LLM call — a page the
-    // fence writer would refuse must not burn classifier budget (skipped pages
-    // hold no takes, so every future run would re-classify them).
+    // The database is the page's copy of record on a managed brain, and on an
+    // unmanaged one when write-through is off or the page sits in a declared
+    // storage.db_only directory: its takes are composed from the database
+    // snapshot and published through put_page, never from a file. A source
+    // with a canonical owner (bound before the run, or by this run's first
+    // put_page) fences the md-first writer, so its file-backed pages publish
+    // through put_page too.
+    const databaseOnly = !dryRun && await databaseOnlyPage(engine, page.slug, page.source_id);
+    const ownedFileBacked = !dryRun && !managedJournalWrites && !databaseOnly && await getWorktreeBinding(engine, page.source_id) !== null;
+    const fromDatabase = managedJournalWrites || databaseOnly || ownedFileBacked;
+
+    // #4473: locate a file-backed page's markdown home BEFORE the LLM call — a
+    // page the fence writer would refuse must not burn classifier budget
+    // (skipped pages hold no takes, so every future run would re-classify them).
     let mdPath: string | null = null;
-    if (!dryRun) {
+    if (!dryRun && (!fromDatabase || ownedFileBacked)) {
       try {
         const { path } = await resolveTakesWritePath(engine, repoDir, page.slug, page.source_id);
         if (existsSync(path)) mdPath = path;
@@ -281,11 +332,11 @@ export async function extractTakesFromPages(
       }
     }
 
-    // Pin the selected page before spending time on extraction. A managed
-    // publication with a newer revision must skip the whole page atomically.
-    const managedSnapshot = managedJournalWrites && !dryRun
+    // Pin the selected page before spending time on extraction. A publication
+    // with a newer revision must skip the whole page atomically.
+    const managedSnapshot = fromDatabase && !dryRun
       ? await engine.readPageSnapshot(page.slug, { sourceId: page.source_id }) : null;
-    if (managedJournalWrites && !dryRun && (!managedSnapshot || managedSnapshot.page.id !== page.id)) {
+    if (fromDatabase && !dryRun && (!managedSnapshot || managedSnapshot.page.id !== page.id)) {
       skipPage(page.slug, 'page_identity_changed');
       continue;
     }
@@ -348,9 +399,16 @@ export async function extractTakesFromPages(
     // Never append a claim the page's takes fence already holds (a rerun with
     // includeCovered, or a hand-added take): duplicate gradeable takes skew
     // calibration. The fence is canonical, so dedupe against its active rows.
-    const duplicateBody = managedJournalWrites
-      ? serializePageToMarkdown(managedSnapshot!.page, managedSnapshot!.tags)
-      : readFileSync(mdPath!, 'utf-8');
+    let duplicateBody: string;
+    try {
+      duplicateBody = await withStoredTakesFence(engine, page.id, fromDatabase
+        ? serializePageToMarkdown(managedSnapshot!.page, managedSnapshot!.tags)
+        : readFileSync(mdPath!, 'utf-8'));
+    } catch (err) {
+      if (!(err instanceof TakesWriteError)) throw err;
+      skipPage(page.slug, err.code);
+      continue;
+    }
     const held = new Set(parseTakesFence(duplicateBody).takes
       .filter((t) => t.active).map((t) => claimKey(t.claim, t.holder)));
     const safeClaims = claims.filter((c) => {
@@ -372,8 +430,8 @@ export async function extractTakesFromPages(
           weight: c.weight,
           source: 'cli:takes-bootstrap-from-pages',
         }));
-      if (managedJournalWrites) {
-        const body = await materializeTakeResolutions(engine, managedSnapshot!.page.id, serializePageToMarkdown(managedSnapshot!.page, managedSnapshot!.tags));
+      if (fromDatabase) {
+        const body = await materializeTakeResolutions(engine, managedSnapshot!.page.id, duplicateBody);
         const composed = appendTakesToPageBody(body, rows);
         const { operations } = await import('./operations.ts');
         const putPage = operations.filter(operation => !operation.localOnly).find(operation => operation.name === 'put_page');
@@ -398,7 +456,8 @@ export async function extractTakesFromPages(
       }
     } catch (err) {
       const code = (err as { code?: string; writeError?: string })?.code ?? (err as { writeError?: string })?.writeError;
-      if (managedJournalWrites && (code === 'revision_conflict' || code === 'page_identity_changed' || code === 'source_changed')) {
+      if (fromDatabase && (code === 'revision_conflict' || code === 'page_identity_changed' || code === 'source_changed'
+        || (!managedJournalWrites && code === 'owner_unavailable'))) {
         skipPage(page.slug, code);
         continue;
       }

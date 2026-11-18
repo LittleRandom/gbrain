@@ -1,4 +1,4 @@
-import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
+import { describe, test, expect, beforeAll, afterAll, afterEach } from 'bun:test';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { importFromContent } from '../src/core/import-file.ts';
 import { operationsByName } from '../src/core/operations.ts';
@@ -7,6 +7,8 @@ import { sanitizeTakeForPrompt, renderTakesBlock } from '../src/core/think/sanit
 import { resolveCitations, parseInlineCitations, normalizeStructuredCitations } from '../src/core/think/cite-render.ts';
 import { runGather, renderPagesBlock } from '../src/core/think/gather.ts';
 import { withoutAnthropicKey } from './helpers/no-anthropic-key.ts';
+import { configureGateway, resetGateway, __setGenerateTextTransportForTests } from '../src/core/ai/gateway.ts';
+import { __resetChatFallbackHopNoticeForTests } from '../src/core/ai/fallback-hop-queue.ts';
 
 let engine: PGLiteEngine;
 let alicePageId: number;
@@ -235,9 +237,10 @@ describe('runGather — per-stream typed warnings (GATHER_*_FAILED)', () => {
     }) as PGLiteEngine;
   }
 
-  test('clean run reports no gather warnings', async () => {
+  test('clean run reports no stream failure; its keyless page search is reported as degraded (GBRA-200)', async () => {
     const r = await runGather(engine, { question: 'technical founder' });
-    expect(r.warnings).toEqual([]);
+    // This test brain has no embedding provider, so the page search is keyword-only: reported, never silent.
+    expect(r.warnings).toEqual(['GATHER_DEGRADED:embed_unavailable', 'GATHER_DEGRADED:keyword_zero']);
   });
 
   test('a keyword-arm failure degrades inside hybrid — no gather warning, takes keep working', async () => {
@@ -246,6 +249,8 @@ describe('runGather — per-stream typed warnings (GATHER_*_FAILED)', () => {
     // throws outright, not a degraded arm.
     const r = await runGather(withFailing(['searchKeyword']), { question: 'technical founder' });
     expect(r.warnings).not.toContain('GATHER_HYBRID_FAILED');
+    // GBRA-200: the degraded arm is reported as a GATHER_DEGRADED stage instead of silently.
+    expect(r.warnings).toContain('GATHER_DEGRADED:keyword_arm_failed');
     // Fail-open: the takes stream keeps working.
     expect(r.takes.length).toBeGreaterThan(0);
   });
@@ -262,6 +267,9 @@ describe('runGather — per-stream typed warnings (GATHER_*_FAILED)', () => {
     // #4296: a degraded keyword arm no longer surfaces GATHER_HYBRID_FAILED;
     // the takes/graph streams still map failures to their own codes.
     expect([...r.warnings].sort()).toEqual([
+      'GATHER_DEGRADED:embed_unavailable',
+      'GATHER_DEGRADED:keyword_arm_failed',
+      'GATHER_DEGRADED:keyword_zero',
       'GATHER_GRAPH_FAILED',
       'GATHER_TAKES_KEYWORD_FAILED',
       'GATHER_TAKES_VECTOR_FAILED',
@@ -540,6 +548,56 @@ describe('runThink — #1698 explicit-model hard error', () => {
   });
 });
 
+describe('runThink — chat_fallback_chain answer', () => {
+  afterEach(() => {
+    __setGenerateTextTransportForTests(null);
+    __resetChatFallbackHopNoticeForTests();
+    resetGateway();
+  });
+
+  test('modelUsed names the chain model that answered, not the one that failed', async () => {
+    configureGateway({
+      chat_model: 'openai:gpt-5.2',
+      chat_fallback_chain: ['deepseek:deepseek-chat'],
+      env: { OPENAI_API_KEY: 'fake-openai', DEEPSEEK_API_KEY: 'fake-deepseek' },
+    });
+    __setGenerateTextTransportForTests((async (args: any) => {
+      if (args.model.modelId === 'gpt-5.2') throw Object.assign(new Error('upstream 503'), { status: 503 });
+      return {
+        content: [{ type: 'text', text: JSON.stringify({ answer: 'Alice founded Acme.', citations: [], gaps: [] }) }],
+        finishReason: 'stop',
+        usage: { inputTokens: 3, outputTokens: 2 },
+      };
+    }) as any);
+
+    const result = await runThink(engine, { question: 'who founded Acme', model: 'openai:gpt-5.2' });
+
+    expect(result.answer).toBe('Alice founded Acme.');
+    expect(result.modelUsed).toBe('deepseek:deepseek-chat');
+    expect(result.requested_model).toBe('openai:gpt-5.2');
+    expect(result.fallback_reason).toContain('upstream 503');
+  });
+
+  test('an answer from the requested model carries no fallback fields', async () => {
+    configureGateway({
+      chat_model: 'openai:gpt-5.2',
+      chat_fallback_chain: ['deepseek:deepseek-chat'],
+      env: { OPENAI_API_KEY: 'fake-openai', DEEPSEEK_API_KEY: 'fake-deepseek' },
+    });
+    __setGenerateTextTransportForTests((async () => ({
+      content: [{ type: 'text', text: JSON.stringify({ answer: 'Alice founded Acme.', citations: [], gaps: [] }) }],
+      finishReason: 'stop',
+      usage: { inputTokens: 3, outputTokens: 2 },
+    })) as any);
+
+    const result = await runThink(engine, { question: 'who founded Acme', model: 'openai:gpt-5.2' });
+
+    expect(result.modelUsed).toBe('openai:gpt-5.2');
+    expect(result.requested_model).toBeUndefined();
+    expect(result.fallback_reason).toBeUndefined();
+  });
+});
+
 describe('runThink + persistSynthesis — #1698 never persist empty', () => {
   test('#3734: question embedder is called for vector takes retrieval', async () => {
     let embeddedQuestion: string | undefined;
@@ -631,12 +689,18 @@ describe('think MCP op — #1698 C3 + #10', () => {
     logger: { info() {}, warn() {}, error() {}, debug() {} } as any,
   });
 
-  test('C3: remote caller with explicit bad model → op throws (modelExplicit wired)', async () => {
+  test('C3: local caller with explicit bad model → op throws (modelExplicit wired)', async () => {
     const op = operationsByName['think'];
     expect(op).toBeDefined();
     await expect(
-      op.handler(baseCtx(true) as any, { question: 'q', model: 'bogusprovider:foo' }),
+      op.handler(baseCtx(false) as any, { question: 'q', model: 'bogusprovider:foo' }),
     ).rejects.toThrow(/not usable.*unknown_provider/);
+  });
+
+  test('GBRA-437: remote caller with a model the host does not allow → host model, never a throw', async () => {
+    const op = operationsByName['think'];
+    const res: any = await withoutAnthropicKey(() => op.handler(baseCtx(true) as any, { question: 'q', model: 'bogusprovider:foo' }));
+    expect(res.warnings.some((w: string) => w.startsWith('MODEL_NOT_USABLE'))).toBe(false);
   });
 
   test('#10: local save with no synthesis → saved_slug is null, not "" + warning surfaced', async () => {

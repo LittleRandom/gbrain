@@ -83,6 +83,23 @@ function scrubErrorChain(err: unknown, redact: (text: string) => string): void {
   }
 }
 
+/** #9466: the registry code of a success response whose body the AI SDK could not parse as one JSON document. */
+export const UNPARSEABLE_RESPONSE_CODE = 'provider_response_unparseable';
+
+/**
+ * #9466: the provider answered with a success status and a body that is not one JSON document. The AI SDK raises its
+ * JSON parse error, wrapped in an API call error that carries the 2xx status when it read a response. The same request
+ * gets the same body (the common case: a route that streams Server-Sent Events when `stream` is omitted), so retrying
+ * cannot help. A body that parsed but failed the response schema, and an error status whose body did not parse, are not
+ * this case.
+ */
+function unparseableSuccessResponse(err: unknown): boolean {
+  const e = err as { name?: unknown; statusCode?: unknown; cause?: unknown } | null;
+  if (e?.name === 'AI_JSONParseError') return true;
+  return e?.name === 'AI_APICallError' && typeof e.statusCode === 'number' && e.statusCode >= 200 && e.statusCode < 300
+    && (e.cause as { name?: unknown } | null)?.name === 'AI_JSONParseError';
+}
+
 /** Model ids a provider renamed, mapped to the current id (B-N7: suggested on a 404). */
 const KNOWN_MODEL_RENAMES: Readonly<Record<string, string>> = {
   'deepseek:deepseek-v4-flash': 'deepseek:deepseek-flash',
@@ -91,23 +108,26 @@ const KNOWN_MODEL_RENAMES: Readonly<Record<string, string>> = {
 /**
  * Recovery text for a provider 404 (`model_not_found`): the model id and
  * provider from the call context (`chat(provider:model)`), the command that
- * lists the configured routes, and a known rename when there is one.
+ * lists the configured routes, a known rename when there is one and, #5304,
+ * `routeHint`: the sentence naming the config key that selected the model
+ * (`model-not-found-hint.ts`), appended when the caller knows it.
  */
-export function modelNotFoundFix(context: string | undefined): string {
+export function modelNotFoundFix(context: string | undefined, routeHint = ''): string {
   const model = context?.match(/\(([^()\s]+:[^()\s]+)\)\s*$/)?.[1];
   const provider = model?.slice(0, model.indexOf(':'));
   const rename = model ? KNOWN_MODEL_RENAMES[model] : undefined;
   return `Check the model id: ${model ? `the ${provider} provider does not serve ${model}` : 'the provider does not serve this model'}, or this key has no access to it. ` +
     'Run `gbrain models` to see the configured model routes, then set a model the provider lists.' +
-    (rename ? ` ${model} was renamed: use ${rename}.` : '');
+    (rename ? ` ${model} was renamed: use ${rename}.` : '') +
+    (routeHint ? ` ${routeHint}` : '');
 }
 
 /**
  * `redact` scrubs upstream text before it becomes the message, and in the
  * wrapped error (#5137: the gateway passes its provider-key redactor, since
- * auth errors echo keys).
+ * auth errors echo keys). `routeHint` (#5304) is appended to a 404's fix only.
  */
-export function normalizeAIError(err: unknown, context?: string, redact?: (text: string) => string): AIServiceError {
+export function normalizeAIError(err: unknown, context?: string, redact?: (text: string) => string, routeHint = ''): AIServiceError {
   if (redact) scrubErrorChain(err, redact);
   if (err instanceof AIServiceError) return err;
 
@@ -131,16 +151,31 @@ export function normalizeAIError(err: unknown, context?: string, redact?: (text:
   const msg = redact ? redact(raw) : raw;
   const ctxPrefix = context ? `[${context}] ` : '';
 
-  // 4xx (except 429) = config-level, non-retryable
+  // 4xx (except 429) = config-level, non-retryable. A 403 whose body says the
+  // project has no access to the model is a model problem, not a key problem.
   if (typeof status === 'number' && status >= 400 && status < 500 && status !== 429) {
+    // #9696: Ollama answers 400 while the runner behind a model restarts; a refused connection to it is an outage.
+    const body = (err as { responseBody?: unknown }).responseBody;
+    if (/\bconnect: connection refused\b|"error"\s*:\s*"connection refused"/.test(`${raw}\n${typeof body === 'string' ? body : ''}`)) {
+      return carryStatusFields(err, new AITransientError(`${ctxPrefix}${msg}`, err));
+    }
     return carryStatusFields(err, new AIConfigError(
       `${ctxPrefix}${msg}`,
-      status === 401 || status === 403
-        ? 'Check your API key is valid and has access to this model.'
-        : status === 404 ? modelNotFoundFix(context)
+      status === 404 || MODEL_NOT_FOUND_MESSAGE_RE.test(msg) ? modelNotFoundFix(context, routeHint)
+        : status === 401 || status === 403 ? 'Check your API key is valid and has access to this model.'
         : 'Check your model id + provider options match the provider API.',
       err,
     ));
+  }
+
+  // #9466: fixed text only; the SDK's parse error quotes the response body, which must not reach a log or a job row.
+  if (unparseableSuccessResponse(err)) {
+    return Object.assign(carryStatusFields(err, new AIConfigError(
+      `${ctxPrefix}The provider answered with a success status, but the response body could not be parsed as one JSON document.`,
+      'Check that this provider route returns one JSON body for a non-streaming request; a route that streams when `stream` is omitted is the common cause. '
+        + 'Send the field the route needs for that model with gbrain config set provider_chat_options.<provider>:<model> \'{"stream": false}\', or fix the route.',
+      err,
+    )), { code: UNPARSEABLE_RESPONSE_CODE, retryable: false });
   }
 
   // AI SDK named errors
@@ -169,12 +204,28 @@ function contentPolicy400Reason(responseBody: string): string | undefined {
   return error?.message === 'Content Exists Risk' ? 'content_exists_risk' : undefined;
 }
 
+/**
+ * #6816: Claude Code reports a usage-policy refusal as an error envelope with no API status, which the claude-cli
+ * adapter surfaces as `claude-cli reported error: API Error: ...`. The wordings it has used all link the policy:
+ * "<model> can't help with this. Start a new session to continue. ... https://www.anthropic.com/legal/aup",
+ * "<model>'s safeguards flagged this message (https://www.anthropic.com/legal/aup)" and, before 2.1.219,
+ * "Claude Code is unable to respond to this request, which appears to violate our Usage Policy (https://www.anthropic.com/legal/aup)".
+ * Only that adapter error counts: the anchored prefix, no API status, the policy link and one of the refusal phrases.
+ */
+const CLAUDE_CLI_REFUSAL_RE = /^claude-cli reported error: API Error: (?=[\s\S]*https:\/\/www\.anthropic\.com\/legal\/aup)[\s\S]*(?:can['\u2019]t help with this|violate our Usage Policy|safeguards flagged this)/;
+
+function claudeCliRefusal(value: { name?: unknown; message?: unknown; apiErrorStatus?: unknown }): boolean {
+  return value.name === 'ClaudeCliProcessError' && value.apiErrorStatus === undefined
+    && typeof value.message === 'string' && CLAUDE_CLI_REFUSAL_RE.test(value.message);
+}
+
 /** A provider refusal tied to the prompt, even when the SDK wraps its response. */
 export function providerContentBlockReason(err: unknown): string | undefined {
   for (let depth = 0; depth < 8 && err != null; depth++) {
     try {
       if (typeof err !== 'object') break;
-      const value = err as { responseBody?: unknown; statusCode?: unknown; status?: unknown; cause?: unknown };
+      const value = err as { responseBody?: unknown; statusCode?: unknown; status?: unknown; cause?: unknown; name?: unknown; message?: unknown; apiErrorStatus?: unknown };
+      if (claudeCliRefusal(value)) return 'claude_cli_usage_policy';
       if (typeof value.responseBody === 'string' && (value.statusCode === 400 || value.status === 400)) {
         const reason = contentPolicy400Reason(value.responseBody);
         if (reason) return reason;
@@ -198,6 +249,26 @@ export function providerContentBlockReason(err: unknown): string | undefined {
     }
   }
   return undefined;
+}
+
+const CONTEXT_OVERFLOW_RE = /context[_ ]length|maximum context|prompt is too long|too many (?:input )?tokens|input (?:is )?too long/i;
+
+/**
+ * GBRA-130: a provider refusal of one request's own input, which fails the same
+ * way until that input changes: a content-policy block (`content_rejected`), or
+ * a 413 / a context-length 400 (`request_too_large`). A 400 without a
+ * context-length phrase can be a malformed request every call shares, so it
+ * stays unclassified.
+ */
+export function providerItemRefusal(err: unknown): 'content_rejected' | 'request_too_large' | null {
+  if (providerContentBlockReason(err)) return 'content_rejected';
+  const { status } = readProviderFailureSignals(err);
+  if (status === 413) return 'request_too_large';
+  if (status !== 400) return null;
+  for (const layer of wrappedErrorLayers(err)) {
+    if (typeof layer.message === 'string' && CONTEXT_OVERFLOW_RE.test(layer.message)) return 'request_too_large';
+  }
+  return null;
 }
 
 /** Whole-run LLM failure classes — see classifyGlobalLlmError. */
@@ -225,15 +296,31 @@ const PER_ITEM_HTTP_STATUSES = new Set([400, 408, 413, 422]);
 // EMBEDDING_QUOTA regex (which matches bare /billing/): a global-error hit
 // halts an entire cycle phase, so a stray word inside a raw-output slice
 // must not trip it. Only specific provider phrasings qualify.
-const BILLING_MESSAGE_RE =
-  /insufficient_quota|quota exceeded|exceeded your (?:current )?quota|credit balance is too low|spend limit|billing_not_active|billing hard limit|payment required/i;
+export const BILLING_MESSAGE_RE =
+  /insufficient_quota|quota exceeded|exceeded your (?:current )?quota|credit balance is too low|no credits remaining|spend limit|billing_not_active|billing hard limit|payment required/i;
+// #8385: the provider's structured error type or code, read from a parsed
+// response body, so a 429 whose message names no billing phrase still halts.
+const BILLING_ERROR_CODES = new Set(['insufficient_quota', 'credit_balance_exhausted', 'billing_not_active']);
+
+function billingErrorBody(responseBody: unknown): boolean {
+  if (typeof responseBody !== 'string') return false;
+  try {
+    const error = JSON.parse(responseBody)?.error;
+    return [error?.type, error?.code].some(v => typeof v === 'string' && BILLING_ERROR_CODES.has(v));
+  } catch {
+    return false;
+  }
+}
 const AUTH_MESSAGE_RE =
-  /authentication_error|permission_error|invalid (?:x-)?api[-_ ]?key|api key (?:is )?(?:invalid|expired|missing)|unauthorized/i;
-const RATE_MESSAGE_RE = /rate[-_ ]?limit(?:ed|_error)?\b|too many requests/i;
-// Provider 404 phrasings for an unknown or inaccessible model (OpenAI
-// `model_not_found` / "does not exist or you do not have access", Anthropic
-// `not_found_error`), for errors that carry no numeric 404.
-const MODEL_NOT_FOUND_MESSAGE_RE = /\bmodel_not_found\b|\bnot_found_error\b|does not exist or you do not have access/i;
+  /authentication_error|permission_error|invalid (?:x-)?api[-_ ]?key|api key (?:is )?(?:invalid|expired|missing)|unauthorized|failed to authenticate|oauth session expired/i;
+export const RATE_MESSAGE_RE = /rate[-_ ]?limit(?:ed|_error)?\b|too many requests/i;
+// Provider phrasings for an unknown or inaccessible model: OpenAI
+// `model_not_found` / "does not exist or you do not have access" (404),
+// Anthropic `not_found_error`, and the project-level access denial OpenAI
+// returns as a 403 ("Project … does not have access to model …", #5394).
+// Tested before the status map, so the denial is not reported as a bad key.
+const MODEL_NOT_FOUND_MESSAGE_RE =
+  /\bmodel_not_found\b|\bnot_found_error\b|does not exist or you do not have access|(?:does not|doesn't|do not|don't) have access to (?:the |this )?model/i;
 // Structured status forms only; a bare number in prose ("processed 429
 // pages") never matches either shape. The quoted-JSON form
 // (`"api_error_status":429`, the claude-cli result blob) cannot occur as free
@@ -245,7 +332,7 @@ const STRUCTURED_JSON_STATUS_RE =
 const STRUCTURED_PROSE_STATUS_RE =
   /(?:\bHTTP[ /]|\bstatus(?:\s+code)?\s*[:= ]\s*)(401|402|403|429)\b/i;
 
-function numericStatusOf(e: unknown): number | undefined {
+export function numericStatusOf(e: unknown): number | undefined {
   const anyErr = e as Record<string, unknown> | null | undefined;
   for (const key of ['status', 'statusCode', 'apiErrorStatus', 'api_error_status']) {
     const v = anyErr?.[key];
@@ -261,7 +348,7 @@ function numericStatusOf(e: unknown): number | undefined {
  * only, and the walk stops after `limit` layers or at a layer already seen,
  * so a self-referencing chain cannot loop.
  */
-function* wrappedErrorLayers(err: unknown, limit = 5): Generator<Record<string, unknown>> {
+export function* wrappedErrorLayers(err: unknown, limit = 5): Generator<Record<string, unknown>> {
   const seen = new Set<object>();
   let layer = err;
   while (layer !== null && typeof layer === 'object' && seen.size < limit && !seen.has(layer)) {
@@ -372,12 +459,12 @@ export function classifyGlobalLlmError(err: unknown): GlobalLlmErrorClass | null
   const rawIdx = message.indexOf('--- raw ---');
   const phraseText = rawIdx === -1 ? message : message.slice(0, rawIdx);
 
-  if (BILLING_MESSAGE_RE.test(phraseText)) return 'billing';
+  if ([...wrappedErrorLayers(err)].some(layer => billingErrorBody(layer.responseBody)) || BILLING_MESSAGE_RE.test(phraseText)) return 'billing';
+  if (MODEL_NOT_FOUND_MESSAGE_RE.test(phraseText)) return 'model_not_found';
   if (status !== undefined) {
     const byStatus = statusToClass(status);
     if (byStatus) return byStatus;
   }
-  if (MODEL_NOT_FOUND_MESSAGE_RE.test(phraseText)) return 'model_not_found';
   // Config-level errors are whole-run by construction — a missing/invalid
   // key or an unknown model id fails identically on every call. The gateway
   // throws AIConfigError directly for missing keys ("OpenAI chat requires

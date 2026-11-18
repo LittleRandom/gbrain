@@ -2,6 +2,16 @@
 // The ontology rides the `facts` table; these are the deterministic bits the
 // engine methods (mergeOntologyFact / getOntology / …) lean on.
 import { computeContentHash } from '../ingestion/types.ts';
+import { trustRankSql } from '../trust/tier.ts';
+import { CONVERSATION_FACTS_SOURCE_PREFIX } from '../facts/audit-sources.ts';
+
+/**
+ * GBRA-574 B2: conversation facts carry a slot on these columns but are never closed in storage (the facts block
+ * derives their windows at read time), so every move would read as a conflict. getOntology, discoverOntologyDimensions,
+ * findOntologyConflicts, mergeOntologyFact and the ontology-facts repair skip them; a re-key that collides one clears its slot (facts/ontology-rekey.ts).
+ */
+export const CONVERSATION_SLOT_SQL = `COALESCE(source, '') LIKE '${CONVERSATION_FACTS_SOURCE_PREFIX}%'`;
+export const NOT_CONVERSATION_SLOT_SQL = `COALESCE(source, '') NOT LIKE '${CONVERSATION_FACTS_SOURCE_PREFIX}%'`;
 
 /**
  * Deterministic dedup key for an ontology value. Normalized (trim + lowercase +
@@ -54,3 +64,11 @@ export function isBackdatedObservation(validFrom: string | null, currentValidFro
   return validFrom != null && currentValidFrom != null
     && new Date(validFrom).getTime() < new Date(currentValidFrom).getTime();
 }
+
+/**
+ * #5575 A5: a new observation closes the current open stint only when its
+ * writer is at least as trusted as that stint (the transaction's declared
+ * tier, `unknown` when undeclared). Appended to the closing UPDATE in both
+ * engines; a guarded stint stays open and the caller files a contested proposal.
+ */
+export const ONTOLOGY_SUPERSEDE_GUARD = ` AND ${trustRankSql('trust_tier')} <= ${trustRankSql(`COALESCE(NULLIF(current_setting('gbrain.write_trust_tier', true), ''), 'unknown')`)}`;

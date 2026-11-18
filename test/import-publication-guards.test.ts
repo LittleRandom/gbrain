@@ -66,23 +66,23 @@ for (const legacy of [false, true]) {
     for (const engine of engines) {
       const slug = `merge-import/path-${legacy}`;
       const body = content('Unchanged content.');
-      await importFromContent(engine, slug, body, { noEmbed: true, sourceId, sourcePath: 'old.md' });
+      await importFromContent(engine, slug, body, { noEmbed: true, sourceId, sourcePath: `old-${legacy}.md` });
       if (legacy) {
         const page = (await engine.getPage(slug, { sourceId }))!;
         await engine.executeRaw('UPDATE pages SET content_hash=$1 WHERE id=$2', [contentHashLegacy(page), page.id]);
       }
       const before = await state(engine, slug);
       await expect(importFromContent(engine, slug, body, {
-        noEmbed: true, sourceId, sourcePath: 'current.md',
+        noEmbed: true, sourceId, sourcePath: `current-${legacy}.md`,
         beforeCommit: async tx => {
-          expect((await tx.getPage(slug, { sourceId }))!.source_path).toBe('current.md');
+          expect((await tx.getPage(slug, { sourceId }))!.source_path).toBe(`current-${legacy}.md`);
           throw new Error('fixture path publication rejected');
         },
       })).rejects.toThrow('fixture path publication rejected');
       expect(await state(engine, slug)).toEqual(before);
-      expect((await importFromContent(engine, slug, body, { noEmbed: true, sourceId, sourcePath: 'current.md' })).status).toBe('skipped');
+      expect((await importFromContent(engine, slug, body, { noEmbed: true, sourceId, sourcePath: `current-${legacy}.md` })).status).toBe('skipped');
       const after = await state(engine, slug);
-      expect(after.snapshot!.page.source_path).toBe('current.md');
+      expect(after.snapshot!.page.source_path).toBe(`current-${legacy}.md`);
       expect(after.snapshot!.revision).toBe(before.snapshot!.revision);
       expect(after.chunks).toEqual(before.chunks);
       expect(after.versions).toEqual(before.versions);
@@ -96,15 +96,13 @@ test('optional legacy path repair rolls back its SQL error without aborting publ
     const body = content('A legacy path can be repaired later.');
     await importFromContent(engine, slug, body, { noEmbed: true, sourceId, sourcePath: 'old.md' });
     const before = await state(engine, slug);
-    const executeRaw = engine.executeRaw;
+    // The legacy path repair is the typed `refreshPageOrigin` call; make its SQL fail.
+    const refreshPageOrigin = engine.refreshPageOrigin;
     let rejected = false;
     let callbackRan = false;
-    engine.executeRaw = function<T>(sql: string, params?: unknown[]): Promise<T[]> {
-      if (sql.startsWith('UPDATE pages SET source_path = $1')) {
-        rejected = true;
-        return executeRaw.call(this, 'SELECT missing_fixture_column FROM pages') as Promise<T[]>;
-      }
-      return executeRaw.call(this, sql, params) as Promise<T[]>;
+    engine.refreshPageOrigin = async function (this: typeof engine): Promise<void> {
+      rejected = true;
+      await this.executeRaw('SELECT missing_fixture_column FROM pages');
     };
     try {
       const result = await importFromContent(engine, slug, body, {
@@ -119,7 +117,7 @@ test('optional legacy path repair rolls back its SQL error without aborting publ
       expect(callbackRan).toBe(true);
       expect(await state(engine, slug)).toEqual(before);
     } finally {
-      engine.executeRaw = executeRaw;
+      engine.refreshPageOrigin = refreshPageOrigin;
     }
   }
 });
@@ -166,7 +164,11 @@ for (const intervening of ['none', 'page', 'chunks', 'indexing-context'] as cons
         expect(after.snapshot!.page.compiled_truth).toBe(expected.snapshot!.page.compiled_truth);
         expect(after.chunks.map(chunk => [chunk.id, chunk.chunk_index, chunk.chunk_text])).toEqual(
           expected.chunks.map(chunk => [chunk.id, chunk.chunk_index, chunk.chunk_text]));
-        expect(after.chunks.every(chunk => chunk.embedding_is_null)).toBe(intervening !== 'none');
+        // A4: a chunk the page still holds with the same text and embedding input keeps the
+        // vector built for it; the late fragment, a changed body or a changed context gets none.
+        const kept = intervening === 'none' ? after.chunks : intervening === 'chunks' ? before.chunks : [];
+        expect(after.chunks.filter(chunk => !chunk.embedding_is_null).map(chunk => chunk.chunk_text))
+          .toEqual(kept.map(chunk => chunk.chunk_text));
       } finally {
         if (previousMode === null) await engine.executeRaw("DELETE FROM config WHERE key='contextual_retrieval.mode'");
         else await engine.setConfig('contextual_retrieval.mode', previousMode);

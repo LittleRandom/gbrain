@@ -15,8 +15,9 @@
  * wrapping code fence is tolerated; any other text outside the table is
  * `llm_malformed`. Failure classes: `llm_unavailable` (the provider threw:
  * timeout, rate limit, server error; transient, the attempt memo is not
- * consumed), `llm_empty`, `llm_refused` (refusal or content-filter stop, or a
- * prose refusal), `llm_malformed` (no single table, wrong header, prose),
+ * consumed), `llm_empty`, `llm_refused` (refusal or content-filter stop, a
+ * prose refusal, or a provider error that refuses this request's own input,
+ * `providerItemRefusal`: it fails the same way until the bytes change), `llm_malformed` (no single table, wrong header, prose),
  * `llm_truncated` (any stop other than a normal end, rejected even if the
  * text parses), `llm_declined` (the single word HOLD: a row has more than one
  * reasonable reading, so the model declines instead of guessing). A table
@@ -34,12 +35,13 @@
  * `spliceTier3`) do no I/O; `callTier3` is the one gateway call, testable
  * through the gateway's chat transport seam (`__setChatTransportForTests`).
  */
+import { providerItemRefusal } from '../ai/errors.ts';
 import { chat, isThinkingModel, THINKING_MODEL_MAX_OUTPUT_TOKENS, type ChatMessage, type ChatResult } from '../ai/gateway.ts';
-import { thinkingOffMaxOutputTokens, thinkingOffNamespace } from '../ai/thinking-off.ts';
+import { thinkingOffControl, thinkingOffMaxOutputTokens } from '../ai/thinking-off.ts';
 import { isSeparatorRow, parseRowCells } from '../fence-shared.ts';
 import { sectionsOf } from './page-checks.ts';
 import { extractRawRows, primaryFence, type RawFence, type RawRow } from './raw-rows.ts';
-import { ALLOWED, BASE_WIDTH, CANONICAL_HEADER, COLUMNS, COLUMN_DEFAULTS } from './schema.ts';
+import { ALLOWED, BASE_WIDTH, CANONICAL_HEADER, COLUMNS, COLUMN_DEFAULTS, WIDE_WIDTH } from './schema.ts';
 import { FENCE_REASON_CODES, FENCE_REASONS, GATE_REASONS } from './reasons.ts';
 import type { FenceIssue, FenceKind, FencePage, FenceReason, FenceSection, GateLetter } from './types.ts';
 
@@ -132,7 +134,8 @@ function headerOf(req: Pick<Tier3Request, 'kind' | 'layout'>): { header: string;
 }
 
 function vocabulary(kind: FenceKind): string {
-  return Object.entries(ALLOWED[kind]).filter(([column]) => column !== '#').map(([column, values]) => `- ${column}: ${values.join(', ')}`).join('\n');
+  // The Tier 3 layouts end at the typed columns, so a column past them (facts `attributed_to`) is not offered.
+  return Object.entries(ALLOWED[kind]).filter(([column]) => column !== '#' && COLUMNS[kind].indexOf(column) < WIDE_WIDTH[kind]).map(([column, values]) => `- ${column}: ${values.join(', ')}`).join('\n');
 }
 
 const GATE_TEXT: Record<GateLetter, string> = {
@@ -192,9 +195,9 @@ export function correctionMessage(gate: GateLetter, rows: readonly number[]): st
     + `Return the corrected full table following every rule above, or ${TIER3_DECLINE} if a row has more than one reasonable reading. Output only the table or ${TIER3_DECLINE}.`;
 }
 
-/** The model may reason whatever the call asks: a thinking-by-default model, or a route with no per-call thinking switch. */
+/** The model may reason whatever the call asks: a thinking-by-default model, or a route whose thinking-off option does not turn reasoning fully off. */
 function mayReason(model: string): boolean {
-  return isThinkingModel(model) || !thinkingOffNamespace(model);
+  return isThinkingModel(model) || !thinkingOffControl(model)?.disables;
 }
 
 /**
@@ -233,7 +236,7 @@ export function extractSingleTable(text: string, req: Pick<Tier3Request, 'kind' 
   if (lines.some(line => !line.startsWith('|')) || lines.length < 2) return { ok: false, reason: 'llm_malformed' };
   const headerCells = parseRowCells(lines[0]!)?.map(cell => cell.trim().toLowerCase()).join('|');
   const sepCells = parseRowCells(lines[1]!);
-  const layout = (['narrow', 'wide'] as const).find(width => headerCells === COLUMNS[req.kind].slice(0, width === 'wide' ? COLUMNS[req.kind].length : BASE_WIDTH[req.kind]).join('|'));
+  const layout = (['narrow', 'wide'] as const).find(width => headerCells === COLUMNS[req.kind].slice(0, width === 'wide' ? WIDE_WIDTH[req.kind] : BASE_WIDTH[req.kind]).join('|'));
   if (!layout || !sepCells || !isSeparatorRow(sepCells)) return { ok: false, reason: 'llm_malformed' };
   const rows = lines.slice(2);
   if (rows.some(row => parseRowCells(row) === null || isSeparatorRow(parseRowCells(row)!))) return { ok: false, reason: 'llm_malformed' };
@@ -284,7 +287,7 @@ export async function callTier3(req: Tier3Request, opts: Tier3CallOptions): Prom
     result = await chat({ model: opts.model, system: prompt.system, messages, maxTokens: budget.maxOutputTokens, allowFallback: false,
       thinking: 'off', purpose: 'fence_repair', ...(opts.timeoutMs ? { timeoutMs: opts.timeoutMs } : {}), ...(opts.signal ? { abortSignal: opts.signal } : {}) });
   } catch (error) {
-    return { ok: false, reason: 'llm_unavailable', error: error instanceof Error ? error.name : 'Error' };
+    return { ok: false, reason: providerItemRefusal(error) ? 'llm_refused' : 'llm_unavailable', error: error instanceof Error ? error.name : 'Error' };
   }
   if (result.stopReason === 'refusal' || result.stopReason === 'content_filter') return { ok: false, reason: 'llm_refused', text: result.text, result };
   if (result.stopReason !== 'end') return { ok: false, reason: result.text.trim() ? 'llm_truncated' : 'llm_empty', text: result.text, result };

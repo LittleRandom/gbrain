@@ -6,6 +6,8 @@ it running as a user service, and prints the URL your other devices, apps and
 cloud agents connect to. Tailscale is the recommended path; ngrok and cloud
 hosts stay as [alternatives](#alternatives).
 
+> **Rather not keep a computer online?** [gbrain.io](https://gbrain.io/?ref=remote-mcp) is hosted GBrain: always on, and reachable from ChatGPT, Claude and Cursor without Tailscale or a user service.
+
 **Say to your agent:** *"use my brain over mcp"* — *"put my brain on
 tailscale"* — *"connect grok bot to my brain"* / *"connect claude desktop to
 my brain"* — *"reach my brain from my phone"*. The `remote-mcp` skill
@@ -30,7 +32,7 @@ in this shape.
 ## What `gbrain mcp expose` does
 
 ```bash
-gbrain mcp expose                # tailnet-only, port 3131, full surface, service installed
+gbrain mcp expose                # tailnet-only, port 3131, full surface listing the memory verbs, service installed
 gbrain mcp expose --funnel       # also reachable by cloud agents (public HTTPS)
 gbrain mcp expose --dry-run      # print the plan, change nothing
 ```
@@ -81,7 +83,7 @@ alone. Which exit 2 it is matters:
 The wrapper reads the admin token from its file at run time, sources your
 shell profile and `~/.gbrain/env`, prepends the Bun directory to `PATH`, and
 `exec`s `gbrain serve --http --port N --public-url URL [--surface X]
-[--enable-dcr]`. The token never lands in the plist, unit or wrapper.
+[--advertise verbs] [--enable-dcr]`. The token never lands in the plist, unit or wrapper.
 
 Paths above use the default GBrain home. Use the receipt's `admin_token_file`
 and `mcp_url` for the intended server, especially with a custom `GBRAIN_HOME`.
@@ -118,8 +120,18 @@ Next — choose the connection method supported by the intended client
                    then gbrain bootstrap harness --yes --port 3131 --token <value>; or grant a scoped client with
                    gbrain mcp grant … --url http://127.0.0.1:3131/mcp --admin-token-file ~/.gbrain/serve/admin-token
                    and gbrain connect http://127.0.0.1:3131/mcp --harness <id> --credentials-file … --install
+  Cursor           cursor://anysphere.cursor-deeplink/mcp/install?name=gbrain&config=eyJ1cmwiOiJodHRwczovL3lvdXItbWFjaGluZS55b3VyLXRhaWxuZXQudHMubmV0L21jcCJ9
+                   Opens Cursor's MCP install prompt with this URL filled in; the Cursor machine must be on your tailnet.
   Check            gbrain mcp expose --status
 ```
+
+The `Cursor` line is a one-click link: it opens Cursor's install prompt with
+this MCP URL filled in. With `--funnel`, a `Claude` line comes first, which
+opens claude.ai's add-connector form the same way. Tailnet-only publishes get
+no Claude line, because claude.ai connects from Anthropic's servers. You still
+confirm and sign in inside the client. `--status` repeats the links and
+`--json` returns them as `install_links`. See [one-click client
+links](../mcp/README.md#one-click-client-links).
 
 The `Engine` and `Local agents` lines depend on the engine the receipt
 recorded: a Postgres brain prints `Local agents     gbrain bootstrap harness
@@ -144,7 +156,7 @@ gbrain mcp expose --remove [--yes] [--json]
 | --- | --- |
 | `--port N` | Local port for `gbrain serve --http` (default `3131`). Tailscale proxies `:443` on your MagicDNS name to it. With `--status` or `--remove` and no receipt, the port whose leftover `:443` handler is looked for and cleaned up. |
 | `--funnel` | Public HTTPS via Tailscale Funnel instead of tailnet-only Serve. Required for cloud agents. |
-| `--surface verbs\|starter\|full` | Tool surface of the served MCP server (default `full`, same as `serve --http`). |
+| `--surface verbs\|starter\|full` | Tool surface, listed in full. Default: `full` with `--advertise verbs` (lists the memory verbs and `request_tools`; all stays callable). Older exposures keep their listing. |
 | `--enable-dcr` | Turn on self-service client registration on the served server (off by default; every self-registered connection still stops for your approval in the admin dashboard). |
 | `--no-tailscale` | Skip Tailscale entirely: install the service on loopback only, publish nothing. Exclusive with `--funnel`. |
 | `--no-service` | Do not create a user service; only publish a server you run yourself. Also the way to publish from a host with no brain config (`no_brain_config`). |
@@ -155,7 +167,7 @@ gbrain mcp expose --remove [--yes] [--json]
 | `--json` | One JSON document on stdout: `{ status, receipt, checks: [{name, status, detail}], next_actions, reason?, message? }`; prose goes to stderr. |
 
 `--status` and `--remove` are exclusive with each other. Defaults: port
-3131, tailnet-only, `--surface full`, DCR off, service installed whenever a
+3131, tailnet-only, `--surface full --advertise verbs`, DCR off, service installed whenever a
 supervisor exists.
 
 ### `--status`
@@ -407,14 +419,20 @@ put_pages with one request_id per batch and wait_ms 25000."*
 - **Links.** For remote writes, `[[wikilinks]]` in a page body that point at
   pages already in the same source become plain `mentions` links after the
   commit, and a batch links pages to each other once its last page commits.
+  `append_page` links what the appended text mentions the same way, without
+  re-reading the rest of the page.
   The batch receipt's `links` field shows when they have landed; agents do
   not add them by hand. Typed links still need `add_link`. Turn this off with
   `gbrain config set mcp.remote_auto_links false`.
 - **Embedding** runs after the commit. New text is searchable by keyword
   immediately and by meaning once its embedding effect finishes.
-- **Request size.** `gbrain serve --http` reads the whole request; the
-  simpler HTTP transport caps a request at `GBRAIN_HTTP_MAX_BODY_BYTES`
-  (1 MiB by default) and its 413 reply tells the agent to split the batch.
+- **Request size.** HTTP carries less than the 24 MiB page ceiling:
+  `gbrain serve --http` reads at most 4 MiB per request (the MCP SDK
+  default) and the simpler HTTP transport 1 MiB; `GBRAIN_HTTP_MAX_BODY_BYTES`
+  sets either cap. A batch goes in smaller `put_pages` calls; a
+  page over the transport limit goes by file on the brain host (sync,
+  `gbrain import` or `gbrain put`), never split by hand. Every limit is in
+  [limits per entry point](memory-boundaries.md#large-page-limits).
 
 ## PGLite brains
 
@@ -448,7 +466,14 @@ port once the cause is fixed. `--fail-fast` (or `GBRAIN_SERVE_FAIL_FAST=1`)
 exits instead.
 
 `gbrain mcp expose --status` re-runs the probes; `--json` names the failing
-check. Logs: `~/.gbrain/serve/serve.log` and `serve.err`.
+check. Logs: `~/.gbrain/serve/serve.log` and `serve.err`. Serve rotates each
+of them at 10 MiB and keeps 5 copies (`serve.log.1` to `serve.log.5`), and a
+line repeated within 10 minutes is written once, followed by one
+`[gbrain serve-log] repeated N more time(s)` line. The same applies to any
+`gbrain serve` whose output you redirect to a file with `>>`. Tune it with
+`GBRAIN_SERVE_LOG_MAX_BYTES` (0 turns rotation off),
+`GBRAIN_SERVE_LOG_MAX_FILES` and `GBRAIN_SERVE_LOG_DEDUPE_SECONDS` (0 turns
+dedupe off) in the serve wrapper's environment.
 
 <a id="remote-mcp-symptoms"></a>
 
@@ -500,6 +525,12 @@ check. Logs: `~/.gbrain/serve/serve.log` and `serve.err`.
   client on the host when it should stop. Self-service registration stays
   off unless you pass `--enable-dcr`, and even then every new connection waits
   for your approval in the admin dashboard.
+- **Remote `think` runs your think model.** Every `think` answer is a paid
+  call on the host's key, so a connected client's `model` is used only when it
+  is your think model (`models.think`) or you allow it with
+  `gbrain config set think.remote_models <model>,<model>`. Any other model
+  answers on your think model, with a `model_override_ignored` notice instead
+  of an error.
 - **Loopback bind.** The server keeps `127.0.0.1`; never pass
   `--bind 0.0.0.0` for this shape. Tailscale is the only way in.
 - **No secrets in chat or config.** The admin token lives in a 0600 file the

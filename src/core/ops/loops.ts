@@ -20,16 +20,20 @@
  */
 
 import { opError, type Operation, type OperationContext, type OperationError } from './contract.ts';
-import type { Action } from '../agent-output.ts';
+import type { Action, Notice } from '../agent-output.ts';
 import { hostFix, invalidParam, opTransport, paramUse, readFix } from './op-fix.ts';
 import { resolveRequestedScope, sourceScopeOpts } from './context.ts';
 import { validateSourceId } from '../utils.ts';
+import { isGmailHoldKey } from '../google/types.ts';
 import { closedLoopWithActiveFact, retireLoopFact } from '../persistence/loop-fact-retirement.ts';
+import { readsButWritesOnly } from '../persistence/write-grant.ts';
 import {
   addSuppression,
+  closeMutedLoops,
   closeOpenLoop,
   listOpenLoops,
   removeSuppression,
+  requeueMutedLoops,
   type LoopStatus,
   type LoopType,
   type OpenLoopRow,
@@ -66,7 +70,7 @@ interface GoogleSourceFreshness {
 async function googleSourceFreshness(
   ctx: OperationContext,
   scope: { sourceId?: string; sourceIds?: string[] },
-): Promise<{ sources: GoogleSourceFreshness[]; stale: boolean; staleSources: string[] }> {
+): Promise<{ sources: GoogleSourceFreshness[]; stale: boolean; staleSources: string[]; failed?: true }> {
   try {
     const rows = await ctx.engine.executeRaw<{ id: string; last_sync_at: string | null; config: unknown }>(
       `SELECT id, last_sync_at, config FROM sources WHERE archived IS NOT TRUE`,
@@ -98,7 +102,7 @@ async function googleSourceFreshness(
     // Fail TOWARD stale: this surface's invariant is "stale-but-confident is
     // worse than nothing" — a DB error must not present confident output
     // with the stale warning suppressed.
-    return { sources: [], stale: true, staleSources: [] };
+    return { sources: [], stale: true, staleSources: [], failed: true };
   }
 }
 
@@ -122,7 +126,8 @@ async function heldCoverage(ctx: OperationContext, sources: GoogleSourceFreshnes
     const now = Date.now();
     const held: HeldItemView[] = [];
     for (const entry of await readAllSourceHolds(ctx.engine, { sourceIds: sources.map((s) => s.id) })) {
-      for (const record of entry.held) {
+      // Contacts and Calendar holds (GBRA-130 A-3) say nothing about mail coverage.
+      for (const record of entry.held.filter((held) => isGmailHoldKey(held.key))) {
         const at = record.meta.upstream_at ? Date.parse(record.meta.upstream_at) : NaN;
         if (Number.isFinite(at) && now - at > HELD_WINDOW_MS) continue;
         held.push({ source_id: entry.sourceId, key: record.key, sender: record.meta.sender, ...(trusted ? { subject: record.meta.subject } : {}),
@@ -133,6 +138,45 @@ async function heldCoverage(ctx: OperationContext, sources: GoogleSourceFreshnes
   } catch {
     // Fail toward partial: an unreadable hold state must not read as complete coverage.
     return { completeness: 'partial', held: [] };
+  }
+}
+
+interface WithheldNoiseSender { source_id: string; email: string; open_loops: number; reason: string; preview_command: string }
+
+/**
+ * #5012: open reply-owed loops from senders the detector now withholds (the
+ * `loop_withheld_senders` record in each google source's connector state):
+ * loops the automated-mail rule would not have opened. Null when there are
+ * none or the record cannot be read (advisory; never blocks the answer).
+ */
+async function withheldNoise(ctx: OperationContext, sources: GoogleSourceFreshness[]): Promise<{ loop_count: number; sender_count: number; senders: WithheldNoiseSender[] } | null> {
+  if (!sources.length) return null;
+  try {
+    const { managedBrain, readConnectorCursorState } = await import('../connectors/item-holds-store.ts');
+    const rows = await ctx.engine.executeRaw<{ id: string; incarnation: string; local_path: string | null; config: Record<string, unknown> }>(
+      `SELECT id, incarnation::text AS incarnation, local_path, config FROM sources WHERE id = ANY(string_to_array($1, E'\n'))`,
+      [sources.map((x) => x.id).join('\n')]);
+    const managed = await managedBrain(ctx.engine);
+    const senders: WithheldNoiseSender[] = [];
+    for (const row of rows) {
+      const record = ((await readConnectorCursorState(ctx.engine, row, managed))?.loop_withheld_senders ?? {}) as Record<string, { reason?: string }>;
+      const emails = Object.keys(record);
+      if (!emails.length) continue;
+      const counts = await ctx.engine.executeRaw<{ email: string; n: number }>(
+        `SELECT counterparty_email AS email, count(*)::int AS n FROM open_loops
+          WHERE source_id = $1 AND status = 'open' AND loop_type = 'unanswered_inbound'
+            AND counterparty_email = ANY(string_to_array($2, E'\n'))
+          GROUP BY counterparty_email`, [row.id, emails.join('\n')]);
+      for (const c of counts) {
+        senders.push({ source_id: row.id, email: c.email, open_loops: Number(c.n), reason: record[c.email]?.reason ?? 'automated_mail',
+          preview_command: `gbrain loops drop sender ${c.email} --source ${row.id} --dry-run` });
+      }
+    }
+    if (!senders.length) return null;
+    senders.sort((a, b) => b.open_loops - a.open_loops || a.email.localeCompare(b.email));
+    return { loop_count: senders.reduce((n, x) => n + x.open_loops, 0), sender_count: senders.length, senders };
+  } catch {
+    return null;
   }
 }
 
@@ -232,14 +276,37 @@ interface CounterpartyGroup {
   counterparty: string;
   counterparty_slug: string | null;
   counterparty_email: string | null;
-  /** The loops' home source — entity cards/aliases live THERE, not in the
-   *  caller's (often 'default') scope. */
+  /** The loops' home source. */
   source_id: string;
+  /** Where the counterparty page lives (#5504): entity cards/aliases live
+   *  THERE, not in the caller's (often 'default') scope and not always in
+   *  the loops' source. A pre-v236 row reads as its own source. */
+  counterparty_source_id: string;
   loop_count: number;
   oldest_opened_at: string;
   nearest_due_at: string | null;
   loops: LoopView[];
+  /** #5871: loops beyond the LOOPS_PER_GROUP shown; loop_count stays the total. */
+  loops_omitted: number;
   context?: unknown;
+}
+
+/** #5871: loops with neither a counterparty slug nor an email. Not a person, so never ranked. */
+interface NoCounterpartyLoops {
+  loop_count: number;
+  by_type: Partial<Record<LoopType, number>>;
+  loops: LoopView[];
+  loops_omitted: number;
+}
+
+/** Loops shown per group (and in the no-counterparty section); the rest are counted in loops_omitted. */
+const LOOPS_PER_GROUP = 5;
+
+/** Due-soonest first (undated last), then the most recently active; keeps the first LOOPS_PER_GROUP. */
+function capLoops(loops: LoopView[]): { loops: LoopView[]; loops_omitted: number } {
+  const time = (v: string | null) => v === null ? Infinity : Date.parse(v);
+  const sorted = [...loops].sort((a, b) => time(a.due_at) - time(b.due_at) || Date.parse(b.last_activity_at) - Date.parse(a.last_activity_at));
+  return { loops: sorted.slice(0, LOOPS_PER_GROUP), loops_omitted: Math.max(0, loops.length - LOOPS_PER_GROUP) };
 }
 
 function rankGroups(groups: CounterpartyGroup[], backlinks: Map<string, number>, nowMs: number): CounterpartyGroup[] {
@@ -257,24 +324,50 @@ function rankGroups(groups: CounterpartyGroup[], backlinks: Map<string, number>,
   return [...groups].sort((a, b) => score(b) - score(a) || a.counterparty.localeCompare(b.counterparty));
 }
 
-function renderText(groups: CounterpartyGroup[], stale: boolean, noGoogleSources: boolean,
+function renderLoopLine(lines: string[], l: LoopView, nowMs: number): void {
+  const due = l.due_at ? ` — due ${l.due_at.slice(0, 10)}` : '';
+  // Age renders at READ time from last_activity_at — stored summaries
+  // deliberately carry no age (it would freeze at detection time).
+  const ageDays = Math.max(0, Math.floor((nowMs - Date.parse(l.last_activity_at)) / 86_400_000));
+  const age = Number.isFinite(ageDays) ? ` (${ageDays}d)` : '';
+  lines.push(`- [${l.loop_type}] ${l.summary}${age}${due}`);
+  if (l.quote) lines.push(`  > "${l.quote}"`);
+  if (l.deep_link) lines.push(`  ${l.deep_link}`);
+}
+
+function renderNoCounterparty(lines: string[], none: NoCounterpartyLoops | null, nowMs: number): void {
+  if (!none) return;
+  const types = Object.entries(none.by_type).map(([type, n]) => `${type} ${n}`).join(', ');
+  lines.push('', `## No counterparty (${none.loop_count} open: ${types})`);
+  for (const l of none.loops) renderLoopLine(lines, l, nowMs);
+  if (none.loops_omitted > 0) lines.push(`+${none.loops_omitted} more`);
+}
+
+function renderText(groups: CounterpartyGroup[], none: NoCounterpartyLoops | null, stale: boolean, noGoogleSources: boolean | null,
   coverage: { completeness: 'complete' | 'partial'; held: HeldItemView[] }, nowMs: number,
   partialStaleSources: string[]): string {
   const lines: string[] = [];
   const { held } = coverage;
-  if (stale) lines.push('⚠ google sources have not synced recently — this may be out of date.');
+  if (noGoogleSources === null) lines.push('⚠ the sources could not be read — whether a google source exists and when it last synced are unknown.');
+  else if (stale) lines.push('⚠ google sources have not synced recently — this may be out of date.');
   else if (partialStaleSources.length > 0) {
     lines.push(
       `⚠ some google sources have not synced recently — this may be out of date: ${partialStaleSources.join(', ')}.`,
     );
   }
   const partial = coverage.completeness === 'partial';
-  const what = held.length ? `${held.length} held item(s) could not be imported:` : 'the held-item state could not be read.';
-  if (partial && groups.length === 0) {
+  const what = noGoogleSources === null ? 'the sources could not be read, so held mail is unknown.'
+    : held.length ? `${held.length} held item(s) could not be imported:` : 'the held-item state could not be read.';
+  if (partial && groups.length === 0 && !none) {
     lines.push(`No open loops found, but coverage is partial: ${what}`, ...partialLines(held));
     return lines.join('\n');
   }
   if (partial) lines.push(`⚠ Coverage is partial: ${what}`, ...partialLines(held), '');
+  if (groups.length === 0 && none) {
+    lines.push('No person is waiting on you; these open loops name no counterparty:');
+    renderNoCounterparty(lines, none, nowMs);
+    return lines.join('\n');
+  }
   if (groups.length === 0) {
     if (noGoogleSources) {
       // Trust-critical copy: on a brain whose email arrives some other way
@@ -293,19 +386,14 @@ function renderText(groups: CounterpartyGroup[], stale: boolean, noGoogleSources
   lines.push(`${groups.length} ${groups.length === 1 ? 'person is' : 'people are'} waiting on you:`);
   for (const g of groups) {
     lines.push('', `## ${g.counterparty} (${g.loop_count} open)`);
-    for (const l of g.loops) {
-      const due = l.due_at ? ` — due ${l.due_at.slice(0, 10)}` : '';
-      // Age renders at READ time from last_activity_at — stored summaries
-      // deliberately carry no age (it would freeze at detection time).
-      const ageDays = Math.max(0, Math.floor((nowMs - Date.parse(l.last_activity_at)) / 86_400_000));
-      const age = Number.isFinite(ageDays) ? ` (${ageDays}d)` : '';
-      lines.push(`- [${l.loop_type}] ${l.summary}${age}${due}`);
-      if (l.quote) lines.push(`  > "${l.quote}"`);
-      if (l.deep_link) lines.push(`  ${l.deep_link}`);
-    }
+    for (const l of g.loops) renderLoopLine(lines, l, nowMs);
+    if (g.loops_omitted > 0) lines.push(`+${g.loops_omitted} more`);
   }
+  renderNoCounterparty(lines, none, nowMs);
   return lines.join('\n');
 }
+
+const OPEN_LOOPS_ROW_CAP = 500;
 
 const open_loops: Operation = {
   name: 'open_loops',
@@ -314,19 +402,24 @@ const open_loops: Operation = {
   outputRedaction: 'retrieval',
   description:
     'The open-loop engine\'s killer output: who is waiting on you, what you promised, and the context ' +
-    'needed to respond. Grouped by counterparty (default, ranked) or flat. Loops come from the ' +
+    'needed to respond. Grouped by counterparty (default, ranked; each group shows at most 5 loops, the rest counted in ' +
+    'loops_omitted) or flat. Loops that name no counterparty are never ranked as a person: they come back in ' +
+    'no_counterparty (null when none). Loops come from the ' +
     'deterministic Gmail thread-state detector and the LLM commitment extractor. Remote callers get ' +
     'redacted evidence (no verbatim quotes); trusted local callers also get quotes, Gmail deep links, ' +
     'entity-card context, and a pre-rendered text digest. Carries google-source freshness (stale flag) and ' +
-    'completeness: when it is "partial", some mail in the window is held after repeated import failures; present the ' +
-    'answer as partial and name the held items and their retry command.',
+    'completeness: when it is "partial", some mail in the window is held after repeated import failures (or, with ' +
+    'no_google_sources: null, the sources could not be read); present the ' +
+    'answer as partial and name the held items and their retry command. The grouped view also returns withheld_noise ' +
+    '(null when none): open reply-owed loops from senders whose mail the detector now treats as automated, with a ' +
+    'per-sender preview_command for closing them.',
   params: {
     group_by: { type: 'string', enum: ['counterparty', 'none'], description: "Default 'counterparty' (ranked groups)." },
     status: { type: 'string', enum: ['open', 'done', 'dropped', 'stale'], description: "Default 'open', except with `id`, where any status matches." },
-    id: { type: 'number', description: 'Fetch the single loop with this id (ids come from earlier open_loops results). Matches any status unless `status` is passed; the source scope still applies, and the grouped view omits `text`.' },
+    id: { type: 'number', minimum: 1, description: 'Fetch the single loop with this id (ids come from earlier open_loops results). Matches any status unless `status` is passed; the source scope still applies, and the grouped view omits `text`.' },
     loop_type: { type: 'string', enum: ['commitment_owed_by_me', 'commitment_owed_to_me', 'unanswered_inbound', 'unanswered_outbound', 'decision_pending'], description: 'Filter to one loop type.' },
     counterparty: { type: 'string', description: 'Filter to one counterparty (slug or email).' },
-    limit: { type: 'number', description: 'Grouped: max groups (default 3). Flat: max loops (default 50). The internal fetch is capped at 500 rows; `truncated: true` marks a hit.' },
+    limit: { type: 'number', description: 'Grouped: max groups (default 3). Flat: max loops (default 50); `count` is the number matched (at most 500) and `truncated: true` marks a list cut by this limit or by the 500-row internal cap (then `count` is a lower bound).' },
     include_context: { type: 'boolean', description: 'Attach the counterparty entity card per group (trusted local only). Default true.' },
     source_id: { type: 'string', description: "Scope to one source (e.g. the google source, when the caller's transport is bound elsewhere). Remote callers must hold a grant covering it." },
     all_sources: { type: 'boolean', description: 'Trusted local: span every source in the brain. Remote callers stay inside their grant.' },
@@ -394,21 +487,25 @@ const open_loops: Operation = {
       ...(p.loop_type ? { loopType: p.loop_type as LoopType } : {}),
       ...(p.counterparty ? { counterparty: p.counterparty as string } : {}),
       ...(loopId === undefined ? {} : { loopId }),
-      limit: 500,
+      limit: OPEN_LOOPS_ROW_CAP + 1,
     });
+    const capped = loops.length > OPEN_LOOPS_ROW_CAP;
+    if (capped) loops.length = OPEN_LOOPS_ROW_CAP;
     const freshness = await googleSourceFreshness(ctx, scope);
-    const noGoogleSources = freshness.sources.length === 0;
+    // #8452: a failed sources read proves neither that no google source exists nor that coverage is complete.
+    const noGoogleSources = freshness.failed ? null : freshness.sources.length === 0;
+    if (freshness.failed) ctx.emitNotice?.(SOURCES_UNREADABLE_NOTICE);
+    else if (!trusted && noGoogleSources && loops.length === 0) ctx.emitNotice?.(noGoogleInScopeNotice(scope.sourceIds ?? (scope.sourceId ? [scope.sourceId] : [])));
     const partialStaleSources = freshness.stale ? [] : freshness.staleSources;
-    const coverage = await heldCoverage(ctx, freshness.sources, trusted);
+    const coverage = freshness.failed ? { completeness: 'partial' as const, held: [] } : await heldCoverage(ctx, freshness.sources, trusted);
     const deepLinks = trusted ? await deepLinksFor(ctx, loops) : new Map<string, string>();
 
-    const truncated = loops.length >= 500;
     if (groupBy === 'none') {
       const limit = Math.min(Math.max((p.limit as number | undefined) ?? 50, 1), 500);
       return {
         loops: loops.slice(0, limit).map((l) => loopView(l, trusted, deepLinks)),
         count: loops.length,
-        truncated,
+        truncated: capped || loops.length > limit,
         stale: freshness.stale,
         sources: freshness.sources,
         ...(partialStaleSources.length > 0 ? { stale_sources: partialStaleSources } : {}),
@@ -420,19 +517,30 @@ const open_loops: Operation = {
     }
 
     const byKey = new Map<string, CounterpartyGroup>();
+    const unattributed: LoopView[] = [];
+    const byType: NoCounterpartyLoops['by_type'] = {};
     for (const l of loops) {
-      const key = l.counterparty_slug ?? l.counterparty_email ?? 'unknown';
+      const counterpartySource = l.counterparty_source_id ?? l.source_id;
+      // Two people with the same slug in different sources are two groups.
+      const key = l.counterparty_slug ? `${counterpartySource}:${l.counterparty_slug}` : l.counterparty_email;
+      if (key === null) {
+        unattributed.push(loopView(l, trusted, deepLinks));
+        byType[l.loop_type] = (byType[l.loop_type] ?? 0) + 1;
+        continue;
+      }
       let g = byKey.get(key);
       if (!g) {
         g = {
-          counterparty: key,
+          counterparty: l.counterparty_slug ?? key,
           counterparty_slug: l.counterparty_slug,
           counterparty_email: l.counterparty_email,
           source_id: l.source_id,
+          counterparty_source_id: counterpartySource,
           loop_count: 0,
           oldest_opened_at: l.opened_at,
           nearest_due_at: null,
           loops: [],
+          loops_omitted: 0,
         };
         byKey.set(key, g);
       }
@@ -444,14 +552,16 @@ const open_loops: Operation = {
 
     const backlinks = new Map<string, number>();
     try {
-      const slugs = [...byKey.values()]
+      // Backlink counts span every source, so they rank trusted-local reads
+      // only: an untrusted caller's order must not depend on pages outside its grant.
+      const slugs = !trusted ? [] : [...byKey.values()]
         .map((g) => g.counterparty_slug)
         .filter((s): s is string => s !== null);
       if (slugs.length > 0) {
         // getBacklinkCounts takes numeric page ids (v0.46.35) — resolve the
-        // counterparty slugs within the loops' home sources first (same
-        // composite-key discipline as deepLinksFor), then fold back to slugs.
-        const srcIds = [...new Set([...byKey.values()].map((g) => g.source_id))];
+        // counterparty slugs within the counterparty pages' sources first
+        // (same composite-key discipline as deepLinksFor), then fold back to slugs.
+        const srcIds = [...new Set([...byKey.values()].map((g) => g.counterparty_source_id))];
         const rows = await ctx.engine.executeRaw<{ id: number; slug: string }>(
           `SELECT id, slug FROM pages
            WHERE source_id = ANY(string_to_array($2, E'\\n'))
@@ -469,7 +579,10 @@ const open_loops: Operation = {
     } catch { /* rank without backlinks */ }
 
     const limit = Math.min(Math.max((p.limit as number | undefined) ?? 3, 1), 50);
-    const groups = rankGroups([...byKey.values()], backlinks, nowMs).slice(0, limit);
+    const groups = rankGroups([...byKey.values()], backlinks, nowMs).slice(0, limit)
+      .map((g) => ({ ...g, ...capLoops(g.loops) }));
+    const noCounterparty: NoCounterpartyLoops | null = unattributed.length === 0 ? null
+      : { loop_count: unattributed.length, by_type: byType, ...capLoops(unattributed) };
 
     // Entity-card context (zero-LLM, trusted local only).
     if (trusted && (p.include_context as boolean | undefined) !== false) {
@@ -477,11 +590,13 @@ const open_loops: Operation = {
       for (const g of groups) {
         if (!g.counterparty_slug) continue;
         try {
-          // The card resolves in the LOOP's source (where the person page +
-          // alias rows live), never the caller's scope — an unqualified
-          // `gbrain waiting` would otherwise look in 'default' and silently
-          // never attach context (same bug class as deepLinksFor's fix).
-          const card = await buildEntityCard(ctx.engine, g.source_id, g.counterparty_slug, { remote: false });
+          // The card resolves in the COUNTERPARTY PAGE's source (where the
+          // person page + alias rows live), never the caller's scope — an
+          // unqualified `gbrain waiting` would otherwise look in 'default'
+          // and silently never attach context (same bug class as
+          // deepLinksFor's fix); since #5504 that source can differ from the
+          // loop's.
+          const card = await buildEntityCard(ctx.engine, g.counterparty_source_id, g.counterparty_slug, { remote: false });
           if (card.found) g.context = card.card;
         } catch { /* context is best-effort */ }
       }
@@ -489,8 +604,10 @@ const open_loops: Operation = {
 
     return {
       groups,
+      no_counterparty: noCounterparty,
+      ...(loopId === undefined ? { withheld_noise: await withheldNoise(ctx, freshness.sources) } : {}),
       count: loops.length,
-      truncated,
+      truncated: capped,
       stale: freshness.stale,
       sources: freshness.sources,
       ...(partialStaleSources.length > 0 ? { stale_sources: partialStaleSources } : {}),
@@ -500,14 +617,15 @@ const open_loops: Operation = {
       redacted: !trusted,
       as_of: new Date(nowMs).toISOString(),
       ...(trusted && loopId === undefined
-        ? { text: renderText(groups, freshness.stale, noGoogleSources, coverage, nowMs, partialStaleSources) }
+        ? { text: renderText(groups, noCounterparty, freshness.stale, noGoogleSources, coverage, nowMs, partialStaleSources) }
         : {}),
     };
   },
 };
 
 /**
- * open_loops `id`: absent or null means a list read. Anything else must be a
+ * open_loops `id`: absent or null means a list read (over the tool paths, 0
+ * reads as absent too: `minimum: 1`, GST-927). Anything else must be a
  * positive safe integer. The refusal never echoes the raw value. The digest
  * stays off for a lookup because it describes the open list ("waiting on
  * you", "You are clean"), which is false for a closed or missing loop.
@@ -529,6 +647,26 @@ function sourcesFix(why: string): Action {
   return readFix(why, { argv: ['gbrain', 'sources', 'list', '--json'], mcp: { tool: 'sources_list', arguments: {} } });
 }
 
+/** #8452: carries no database error text; the answer is partial until a read succeeds. */
+const SOURCES_UNREADABLE_NOTICE: Notice = {
+  code: 'loops_source_read_failed',
+  kind: 'degraded',
+  why: 'open_loops could not read the sources table, so whether a google source is in scope, when it last synced and which mail is held ' +
+    'are unknown (no_google_sources: null, completeness: "partial"). An empty answer is not "inbox clean"; repeat the call.',
+};
+
+/** #7286: names only the sources this read covered, all inside the grant, so the text is the same whether or not a google source exists outside it. */
+function noGoogleInScopeNotice(readSources: string[]): Notice {
+  return {
+    code: 'loops_no_google_in_scope',
+    kind: 'info',
+    why: `open_loops read only ${readSources.join(', ') || 'none'}, inside this connection's grant, and none of them is a google source, ` +
+      'so it had nothing to read: this is not "inbox clean", and it says nothing about sources outside the grant. ' +
+      "Pass source_id naming a google source this connection is granted, or ask the brain's owner to grant one.",
+    fix: sourcesFix('Lists the sources this connection can read; pass a google one as source_id.'),
+  };
+}
+
 function closeFix(ctx: OperationContext, p: Record<string, unknown>): { fix?: Action } {
   if (typeof p.id !== 'number' || !Number.isSafeInteger(p.id)) return {};
   return { fix: hostFix(ctx, ['gbrain', 'loops', p.status === 'dropped' ? 'drop' : 'done', String(p.id)],
@@ -543,7 +681,7 @@ function muteScopeError(ctx: OperationContext, verb: 'mute' | 'unmute', p: Recor
   const value = typeof p.value === 'string' && MUTE_VALUE.test(p.value) ? p.value : undefined;
   return opError('permission_denied', `loops_${verb}: source "${sourceId}" is outside the caller's write scope`,
     writeSource
-      ? `Nothing changed. This connection writes only to source '${writeSource}': pass source_id '${writeSource}', or have the user run the ${verb} from the trusted local CLI (command in fix).`
+      ? `Nothing changed. ${readsButWritesOnly(ctx, sourceId, writeSource)}This connection writes only to source '${writeSource}': pass source_id '${writeSource}', or have the user run the ${verb} from the trusted local CLI (command in fix).`
       : `Nothing changed. This connection has no bound write source; the user can run the ${verb} from the trusted local CLI (command in fix).`,
     kind && value ? { fix: hostFix(ctx, ['gbrain', 'loops', verb, kind, value, '--source', sourceId],
       'A suppression is a write; remote callers write only inside their bound source.') } : {});
@@ -603,7 +741,7 @@ const loops_close: Operation = {
         throw opError(
           'permission_denied',
           `loops_close: source "${requested}" is outside the caller's write scope`,
-          `Nothing was closed. This connection writes only to source '${writeSource}': omit source_id to close there, or have the user close it from the trusted local CLI (command in fix).`,
+          `Nothing was closed. ${readsButWritesOnly(ctx, requested, writeSource)}This connection writes only to source '${writeSource}': omit source_id to close there, or have the user close it from the trusted local CLI (command in fix).`,
           closeFix(ctx, p),
         );
       }
@@ -634,13 +772,20 @@ const loops_close: Operation = {
   },
 };
 
+/** #5012: the CLI command that reverses a mute or unmute. */
+function undoCommand(verb: 'mute' | 'unmute', kind: unknown, value: string, sourceId: string): string {
+  return `gbrain loops ${verb} ${String(kind)} ${value} --source ${sourceId}`;
+}
+
 const loops_mute: Operation = {
   name: 'loops_mute',
   idempotent: true,
   outputRedaction: 'no_stored_text',
   description:
     'Suppress a sender (email address) or thread id from opening NEW loops — the detector feedback ' +
-    'primitive behind "never track this sender". Existing loops keep their state.',
+    'primitive behind "never track this sender". It also closes that sender\'s (or thread\'s) open reply-owed ' +
+    '(unanswered_inbound) loops as dropped with closed_by "muted" and lists their ids in `closed`; other loop types ' +
+    'keep their state. dry_run lists `would_close` and changes nothing. loops_unmute re-checks the closed loops.',
   params: {
     kind: { type: 'string', required: true, enum: ['sender', 'thread'], description: 'What to mute.' },
     value: { type: 'string', required: true, description: 'The sender email or Gmail thread id.' },
@@ -669,9 +814,17 @@ const loops_mute: Operation = {
     if (p.source_id === undefined && !(await sourceHasGoogleContent(ctx, sourceId))) {
       throw noGoogleContent(ctx, `loops_mute: source "${sourceId}" holds no Google content — a suppression there can never match; pass source_id naming the google source`);
     }
-    if (ctx.dryRun) return { dry_run: true, action: 'loops_mute', kind: p.kind, value: p.value };
-    await addSuppression(ctx.engine, sourceId, p.kind as 'sender' | 'thread', p.value as string);
-    return { muted: true, kind: p.kind, value: (p.value as string).toLowerCase(), source_id: sourceId };
+    const kind = p.kind as 'sender' | 'thread';
+    const value = (p.value as string).toLowerCase();
+    const undo = undoCommand('unmute', kind, value, sourceId);
+    if (ctx.dryRun) {
+      const wouldClose = await closeMutedLoops(ctx.engine, sourceId, kind, value, false);
+      return { dry_run: true, action: 'loops_mute', kind, value, source_id: sourceId, would_close: wouldClose, count: wouldClose.length, undo_command: undo };
+    }
+    await addSuppression(ctx.engine, sourceId, kind, value);
+    const closed = await closeMutedLoops(ctx.engine, sourceId, kind, value, true);
+    (await import('../google/loop-detect.ts')).invalidateSuppressionCache(ctx.engine);
+    return { muted: true, kind, value, source_id: sourceId, closed, count: closed.length, undo_command: undo };
   },
 };
 
@@ -681,7 +834,11 @@ const loops_unmute: Operation = {
   outputRedaction: 'no_stored_text',
   description:
     'Remove a sender/thread suppression added by loops_mute, so the detector can open NEW loops for ' +
-    'it again. Exact-match only. Does not reopen loops closed while the mute was in place.',
+    'it again. Exact-match only. The reply-owed loops the mute closed (unless another mute still covers them) are queued ' +
+    'for re-check on the next Gmail sync and listed in `requeued`: a loop reopens only when nothing answered its thread ' +
+    'since the mute. `unverifiable` lists closed loops with no thread to re-check (they stay closed); `stale_source` ' +
+    'means the re-check waits on a sync that has not run in 24h. Manually closed loops are never touched. dry_run lists ' +
+    '`would_requeue` and changes nothing.',
   params: {
     kind: { type: 'string', required: true, enum: ['sender', 'thread'], description: 'What to unmute.' },
     value: { type: 'string', required: true, description: 'The sender email or Gmail thread id.' },
@@ -708,20 +865,31 @@ const loops_unmute: Operation = {
     if (p.source_id === undefined && !(await sourceHasGoogleContent(ctx, sourceId))) {
       throw noGoogleContent(ctx, `loops_unmute: source "${sourceId}" holds no Google content — pass source_id naming the google source`);
     }
-    if (ctx.dryRun) return { dry_run: true, action: 'loops_unmute', kind: p.kind, value: p.value };
-    const removed = await removeSuppression(
-      ctx.engine,
-      sourceId,
-      p.kind as 'sender' | 'thread',
-      p.value as string,
-    );
+    const kind = p.kind as 'sender' | 'thread';
+    const value = (p.value as string).toLowerCase();
+    const undo = undoCommand('mute', kind, value, sourceId);
+    if (ctx.dryRun) {
+      const preview = await requeueMutedLoops(ctx.engine, sourceId, kind, value, false);
+      return { dry_run: true, action: 'loops_unmute', kind, value, source_id: sourceId, would_requeue: preview.requeued,
+        unverifiable: preview.unverifiable, count: preview.requeued.length, undo_command: undo };
+    }
+    const removed = await removeSuppression(ctx.engine, sourceId, kind, value);
+    const { requeued, unverifiable } = await requeueMutedLoops(ctx.engine, sourceId, kind, value, true);
+    (await import('../google/loop-detect.ts')).invalidateSuppressionCache(ctx.engine);
+    const fresh = (await googleSourceFreshness(ctx, { sourceId })).sources[0];
+    const stale = requeued.length > 0 && (fresh?.stale ?? true);
     // removed:false is the ordinary "was not muted" answer, never an error —
     // a retried unmute must be safe.
     return {
       removed: removed > 0,
-      kind: p.kind,
-      value: (p.value as string).toLowerCase(),
+      kind,
+      value,
       source_id: sourceId,
+      requeued,
+      unverifiable,
+      count: requeued.length,
+      ...(stale ? { stale_source: true, recheck_command: `gbrain sync --source ${sourceId}` } : {}),
+      undo_command: undo,
       ...(removed > 0 ? {} : { reason: 'no matching suppression' }),
     };
   },

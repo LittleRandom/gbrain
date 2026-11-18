@@ -48,6 +48,16 @@ response: a repair PR whose body says `Fixes #<issue>`.
   by hand with a comment naming the replacement, or replay E2E files:
   `gh workflow run e2e.yml --ref master -f full_corpus=true`, then
   `gh workflow run nightly-watch.yml -f run_id=<that run id> -f replay_issue=<issue>`.
+- **Reused full-suite runs:** a push run that reused an identical-tree full
+  run (a succeeded `reused-full-suite` job) is judged by the run its
+  `reuse.json` names, at the recorded attempt: its jobs and its complete
+  `ci-manifest` clear or confirm failures as if the push had run them. An
+  unreadable or mismatched record, a different tree, or a missing or
+  incomplete source manifest is incomplete evidence and clears nothing.
+- **Closed by hand:** a closed issue whose JSON block is still red ends that
+  incident. The watch records later runs on it as green (its body says it was
+  closed by hand) and never reopens it or opens a new issue for its failures;
+  only a new red push run opens a new incident.
 - **Serialization:** each watch queues on one group per repository, target
   workflow and track (`schedule` or `push`; a replay writes `push`). Before the
   first write it re-reads the issue and re-plans when the issue moved. When two
@@ -74,6 +84,18 @@ find the race, and open a repair PR with `Fixes #<issue>`. Never widen a
 timeout or weaken an assertion. When the signature names a runner, disk or
 secret problem, ask the repository owner for that fix instead of a code PR.
 
+## Order hunt
+
+The nightly E2E workflow's `order-hunt` job (also `gh workflow run e2e.yml -f order_hunt=true`, optionally `-f order_seed=N`) runs every E2E file in a seeded random order, sequentially, on one shared Postgres database per shard. It catches a file that leaves state behind (a config row, a session setting, leftover rows) that breaks the next file, which the stress gate and race hunt cannot see because each of their iterations gets a fresh database.
+
+- **Seed:** the UTC day number by default, so each night tries a different order; the seed and shard are in the step summary.
+- **A failure** is rerun alone. A file that passes alone is reported as `order-dependent test` with `bash scripts/run-e2e.sh <the files before it, in order> <file>` to replay it; bisect the files before it to find the one that leaks, and fix that file's teardown. A file that also fails alone is only a warning here, since the full E2E lanes report it.
+- The job is keyless and outside `e2e-status`, so it never blocks a PR; a red order hunt turns the E2E nightly red.
+
+## Paid lanes switch
+
+The repository variable `GBRAIN_PAID_LANES=0` switches every paid lane off: Tier 2 (LLM Skills) in `e2e.yml`, the hermes door's paid leg and the OpenCode credentialed lane in `heavy-tests.yml` (#5903). Use it on a fork or during a spend freeze; unset (or any other value) keeps the lanes on. Each lane writes a visible "paid lanes disabled" step summary, and `e2e-status` accepts Tier 2 as `skipped` only under that exact value, saying so in its own summary; any other skip, failure or cancellation still fails the aggregate (`test/paid-lanes-switch-5903.test.ts` runs the aggregate script with every combination). A run with the variable set is not green coverage of the paid lanes. Tier 2 runs keyed only on the nightly E2E schedule (and a `full_corpus` dispatch); elsewhere `e2e-status` accepts its skip with a "not run: keys withheld" notice, and a nightly run in which any Tier 2 test skipped fails (`scripts/require-executed-tests.ts`).
+
 ## CI failure manifest
 
 The `executed-receipts` job of test.yml and e2e.yml runs `scripts/ci-manifest.ts`
@@ -81,15 +103,17 @@ and uploads the `ci-manifest` artifact: a versioned JSON file
 (`gbrain-ci-manifest/v1`) bound to the workflow, event, SHA, run id and run
 attempt. It lists every failing test identity (lane, file, test, arm) and, per
 file, how many tests executed, failed and were skipped. It is `complete` only
-when every lane's receipts are valid (no killed shard, truncated report, older
-attempt, or lane that executed nothing without a declared skip row).
+when every lane's receipts are valid (no killed shard, truncated report, receipt
+from a later attempt than the manifest's own, or lane that executed nothing without a declared skip row).
 
 nightly-watch also reads the failing jobs' annotations. A manifest or annotation
 that cannot be read, or a manifest from another SHA or attempt, is incomplete
 evidence. It is reported, never read as zero failures, and never clears a
 failure, closes an issue or grants an exemption. After a partial re-run
-("re-run failed jobs") the manifest is incomplete. Wait for the next push run,
-or replay E2E files as above.
+("re-run failed jobs") the manifest takes each job at its newest attempt, so it
+still covers every file, and marks each file whose newest receipt came from the
+re-run as `rerun`. Such a run never clears a failure: nightly-watch reports it
+as incomplete evidence. Wait for the next push run, or replay E2E files as above.
 
 ## CI health report
 

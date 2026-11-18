@@ -21,11 +21,16 @@ import type { BrainEngine } from '../engine.ts';
 import type { RemediationStep } from '../remediation-step.ts';
 import { makeRemediationStep } from '../remediation-step.ts';
 import { QUARANTINE_FILTER_FRAGMENT } from '../quarantine.ts';
+import { renderFragment, sqlFragment, trustedSql, type SqlFragment } from '../engine-sql/fragment.ts';
+import { entityTypePredicateSql, resolveEntityTypes, type EntityTypeFilter, type EntityTypeResolution } from '../schema-pack/entity-types.ts';
 import type { Action } from '../agent-output.ts';
 import { embeddingEnablement, type ReadinessState } from '../readiness.ts';
 import { embeddingsDisabled } from '../embedding-disabled.ts';
 import { loadConfig } from '../config.ts';
 import { MIN_ENTITY_PAGES_FOR_COVERAGE } from '../types.ts';
+import { ORPHANED_ALIAS_COUNTS_SQL, SOFT_DELETED_ALIAS_COUNT_SQL } from '../repair/aliases.ts';
+import { repairPreviewCommand } from '../repair/registry.ts';
+import { isMissingSchemaObject } from '../utils.ts';
 
 /** Shared shape returned by all four checks. */
 export interface OnboardCheckResult {
@@ -58,9 +63,35 @@ async function safeCount(engine: BrainEngine, sql: string, params: unknown[] = [
   }
 }
 
-const VISIBLE_ENTITY_PREDICATE = `p.type IN ('person', 'company', 'organization', 'entity')
-  AND p.deleted_at IS NULL
-  AND ${QUARANTINE_FILTER_FRAGMENT}`;
+/** #4772: a live, visible page whose type the active pack(s) declare as an entity, per source (the get_health predicate). */
+function visibleEntityPredicate(filter: EntityTypeFilter): SqlFragment {
+  return sqlFragment`${entityTypePredicateSql('p', filter)} AND p.deleted_at IS NULL AND ${trustedSql(QUARANTINE_FILTER_FRAGMENT)}`;
+}
+
+/**
+ * A pack in scope did not load, so the entity population is unknown: a warn
+ * with `entity_types_unavailable`, never a coverage read over an empty or
+ * legacy list.
+ */
+function entityTypesUnavailableResult(name: string, resolution: Extract<EntityTypeResolution, { status: 'pack_unavailable' }>): OnboardCheckResult {
+  const where = resolution.unresolved.filter(Boolean);
+  return {
+    check: {
+      name, status: 'warn',
+      message: `Entity types unknown: could not resolve the active schema pack${where.length ? ` for source${where.length > 1 ? 's' : ''} ${where.map((id) => `'${id}'`).join(', ')}` : ''}, so ${name} cannot be graded. Run \`gbrain schema active --json\` to debug.`,
+      details: { code: 'entity_types_unavailable', entity_types_status: 'pack_unavailable', unresolved_sources: where },
+      fix: { argv: ['gbrain', 'schema', 'active', '--json', ...(where.length ? ['--source', where[0]!] : [])], consent: [], actor: 'agent', requires_exclusive: false,
+        why: 'Read-only: shows which pack is active, the tier it comes from and why it did not load.', verify: { argv: ['gbrain', 'doctor', '--only', name, '--json'] } },
+    },
+    remediations: [],
+  };
+}
+
+/** Count the visible entity pages under `filter`. */
+async function countVisibleEntities(engine: BrainEngine, filter: EntityTypeFilter): Promise<number> {
+  const sql = renderFragment(sqlFragment`SELECT COUNT(*) AS count FROM pages p WHERE ${visibleEntityPredicate(filter)}`);
+  return safeCount(engine, sql.text, sql.params);
+}
 
 /**
  * Coverage is a ratio over the visible entity population, and below
@@ -91,22 +122,22 @@ export const TIMELINE_COVERAGE_FEATURE: CoverageFeature = { table: 'timeline_ent
  * remediation impact capture both read coverage through this query, so a
  * `gbrain onboard --history` row measures the population the check grades.
  */
-export function visibleEntityCoverageSql(feature: CoverageFeature, sampleClause = ''): string {
-  return `WITH sampled_entities AS (
+export function visibleEntityCoverageSql(feature: CoverageFeature, filter: EntityTypeFilter, sampleClause = ''): { text: string; params: unknown[] } {
+  return renderFragment(sqlFragment`WITH sampled_entities AS (
          SELECT p.id
-           FROM pages p ${sampleClause}
-          WHERE ${VISIBLE_ENTITY_PREDICATE}
+           FROM pages p ${trustedSql(sampleClause)}
+          WHERE ${visibleEntityPredicate(filter)}
        )
        SELECT
          COUNT(*)::int AS sample_size,
          COUNT(*) FILTER (
            WHERE EXISTS (
              SELECT 1
-               FROM ${feature.table} f
-              WHERE f.${feature.pageIdColumn} = s.id
+               FROM ${trustedSql(feature.table)} f
+              WHERE f.${trustedSql(feature.pageIdColumn)} = s.id
            )
          )::int AS matched
-         FROM sampled_entities s`;
+         FROM sampled_entities s`);
 }
 
 interface EntityCoverageSample {
@@ -130,9 +161,11 @@ async function sampleVisibleEntityCoverage(
   engine: BrainEngine,
   sampleClause: string,
   feature: CoverageFeature,
-): Promise<EntityCoverageSample> {
+  filter: EntityTypeFilter,
+): Promise<EntityCoverageSample | { error: string }> {
   try {
-    const result = await engine.executeRaw(visibleEntityCoverageSql(feature, sampleClause));
+    const sql = visibleEntityCoverageSql(feature, filter, sampleClause);
+    const result = await engine.executeRaw(sql.text, sql.params);
     const rows = (result as { rows?: Array<Record<string, unknown>> } | undefined)?.rows
       ?? (result as Array<Record<string, unknown>> | undefined)
       ?? [];
@@ -143,9 +176,15 @@ async function sampleVisibleEntityCoverage(
     // impossible percentages or feed a negative value into sqrt().
     const matched = Math.min(sampleSize, finiteCount(row.matched));
     return { matched, sampleSize };
-  } catch {
-    return { matched: 0, sampleSize: 0 };
+  } catch (error) {
+    return { error: redactConnectionInfo(error instanceof Error ? error.message : String(error)) };
   }
+}
+
+/** #7145: a coverage read that failed or sampled no row measured nothing, so it is not "0% coverage". */
+function unmeasuredCoverage(name: string, sample: EntityCoverageSample | { error: string }): OnboardCheckResult {
+  const why = 'error' in sample ? `the coverage read failed (${sample.error})` : 'the sampled read returned no entity page';
+  return { check: { name, status: 'warn', message: `Coverage unknown: ${why}; rerun doctor.`, details: { health: 'unknown', reason: 'error' in sample ? 'error' : 'empty_sample' } }, remediations: [] };
 }
 
 function coverageWithConfidence(sample: EntityCoverageSample): { coverage: number; ci: number } {
@@ -289,11 +328,9 @@ export async function checkEntityLinkCoverage(
 ): Promise<OnboardCheckResult> {
   // Total visible entity pages. Quarantined pages are hidden from the brain,
   // so they are outside both the coverage numerator and denominator.
-  const totalEntities = await safeCount(
-    engine,
-    `SELECT COUNT(*) AS count FROM pages p
-       WHERE ${VISIBLE_ENTITY_PREDICATE}`,
-  );
+  const entityTypes = await resolveEntityTypes(engine, null);
+  if (entityTypes.status === 'pack_unavailable') return entityTypesUnavailableResult('entity_link_coverage', entityTypes);
+  const totalEntities = await countVisibleEntities(engine, entityTypes.filter);
 
   const ungraded = ungradedCoverageResult('entity_link_coverage', totalEntities);
   if (ungraded) return ungraded;
@@ -309,7 +346,9 @@ export async function checkEntityLinkCoverage(
     engine,
     sampleClause,
     LINK_COVERAGE_FEATURE,
+    entityTypes.filter,
   );
+  if ('error' in sample || sample.sampleSize === 0) return unmeasuredCoverage('entity_link_coverage', sample);
   const { coverage, ci } = coverageWithConfidence(sample);
 
   const pct = Math.round(coverage * 100);
@@ -372,11 +411,9 @@ export async function checkEntityLinkCoverage(
 export async function checkTimelineCoverage(
   engine: BrainEngine,
 ): Promise<OnboardCheckResult> {
-  const totalEntities = await safeCount(
-    engine,
-    `SELECT COUNT(*) AS count FROM pages p
-       WHERE ${VISIBLE_ENTITY_PREDICATE}`,
-  );
+  const entityTypes = await resolveEntityTypes(engine, null);
+  if (entityTypes.status === 'pack_unavailable') return entityTypesUnavailableResult('timeline_coverage', entityTypes);
+  const totalEntities = await countVisibleEntities(engine, entityTypes.filter);
 
   const ungraded = ungradedCoverageResult('timeline_coverage', totalEntities);
   if (ungraded) return ungraded;
@@ -391,7 +428,9 @@ export async function checkTimelineCoverage(
     engine,
     sampleClause,
     TIMELINE_COVERAGE_FEATURE,
+    entityTypes.filter,
   );
+  if ('error' in sample || sample.sampleSize === 0) return unmeasuredCoverage('timeline_coverage', sample);
   const { coverage, ci } = coverageWithConfidence(sample);
   const pct = Math.round(coverage * 100);
   const ciPct = (ci * 100).toFixed(1);
@@ -572,6 +611,19 @@ export async function checkPackUpgradeAvailable(
       };
     }
     const successor = successors[0];
+    const { managedPersistenceEnabled } = await import('../persistence/ownership.ts');
+    if (await managedPersistenceEnabled(engine)) {
+      // #6196: retype runs outside the persistence coordinator, so a managed brain cannot run the apply job.
+      return {
+        check: {
+          name: 'pack_upgrade_available', status: 'ok', severity: 'info', readiness_state: 'degraded',
+          message: `Active pack: ${active.identity}. Successor available: ${successor.identity}. On a managed brain unify-types switches the pack only when no page needs retyping, linking or aliasing; coordinated retype is not available yet, so do not submit the apply job while the preview shows pages to change. Preview: \`gbrain onboard --check --explain\``,
+          fix: { argv: ['gbrain', 'onboard', '--check', '--explain'], consent: [], actor: 'agent', requires_exclusive: false,
+            why: 'Previews the pack upgrade read-only. Applying it on a managed brain waits for coordinated retype unless the preview shows nothing to change.' },
+        },
+        remediations: [],
+      };
+    }
     return {
       check: {
         name: 'pack_upgrade_available',
@@ -590,7 +642,7 @@ export async function checkPackUpgradeAvailable(
           severity: 'medium',
           est_seconds: 600,  // ~10min on 186K-page brain (production proxy)
           est_usd_cost: 0,   // pure SQL; no LLM spend
-          protected: true,   // PROTECTED handler + manual_only via render allowlist
+          protected: true,   // PROTECTED handler; manual-only by job name (remediation/manual-only.ts)
           rationale:
             `Pack upgrade ${active.manifest.name} → ${successor.manifest.name}; ` +
             `collapses redundant page types into the new canonical taxonomy. ` +
@@ -612,123 +664,145 @@ export async function checkPackUpgradeAvailable(
   }
 }
 
+const PAGE_TYPE_PAIRS_SQL = `WITH RECURSIVE pairs AS (
+  (SELECT source_id, type FROM pages WHERE deleted_at IS NULL AND type IS NOT NULL ORDER BY source_id, type LIMIT 1)
+  UNION ALL
+  SELECT n.source_id, n.type FROM pairs, LATERAL (
+    SELECT p.source_id, p.type FROM pages p
+     WHERE p.deleted_at IS NULL AND p.type IS NOT NULL AND (p.source_id, p.type) > (pairs.source_id, pairs.type)
+     ORDER BY p.source_id, p.type LIMIT 1) n
+)
+SELECT source_id, type FROM pairs`;
+
 /**
  * type_proliferation (D16): pack-aware ratio. Warns when distinct typed
  * pages exceed pack-declared types + 5; fails at declared × 2. No false
  * positives on custom packs (compares to actual pack declaration count,
  * not a hardcoded threshold).
+ *
+ * #6289: each source is graded against its own resolved pack (per-source
+ * DB config included); sources sharing a pack pool their labels, and an
+ * alias counts as its canonical type. A source whose pack does not resolve,
+ * or a failed query, is "not verified" (warn), never ok.
+ *
+ * The (source, type) pairs are read by a skip scan over idx_pages_source_type
+ * (v316): one index probe per distinct pair, never a pass over every page.
  */
 export async function checkTypeProliferation(
   engine: BrainEngine,
 ): Promise<OnboardCheckResult> {
-  let declared = 15;  // fallback to gbrain-base-v2 default if pack unavailable
+  const result = (status: 'ok' | 'warn' | 'fail', message: string): OnboardCheckResult =>
+    ({ check: { name: 'type_proliferation', status, message }, remediations: [] });
+  let rows: Array<{ source_id: string; type: string }>;
   try {
-    const { loadActivePack } = await import('../schema-pack/load-active.ts');
-    const { loadConfigFileOnly } = await import('../config.ts');
-    let dbConfig: string | undefined;
-    try {
-      dbConfig = (await engine.getConfig('schema_pack')) ?? undefined;
-    } catch { /* tolerate pre-config brains */ }
-    const active = await loadActivePack({ cfg: loadConfigFileOnly(), remote: false, dbConfig })
-      .catch(() => null);
-    if (active) declared = active.manifest.page_types.length;
-  } catch {
-    // Use fallback.
+    rows = await engine.executeRaw<{ source_id: string; type: string }>(PAGE_TYPE_PAIRS_SQL);
+  } catch (e) {
+    return result('warn', `type_proliferation not verified: the page type query failed (${(e as Error).message}).`);
   }
-  const n = await safeCount(
-    engine,
-    `SELECT COUNT(DISTINCT type) AS count FROM pages WHERE deleted_at IS NULL AND type IS NOT NULL`,
-  );
-  const warn = declared + 5;
-  const fail = declared * 2;
-  if (n > fail) {
-    return {
-      check: {
-        name: 'type_proliferation',
-        status: 'fail',
-        message:
-          `${n} distinct page types (pack declares ${declared}). ` +
-          `Run \`gbrain onboard --check --explain\` to preview a pack upgrade ` +
-          `or define a custom pack with mapping_rules.`,
-      },
-      remediations: [],  // pack_upgrade_available check emits the actionable step
-    };
+  const { loadActivePackForLocalEngine } = await import('../schema-pack/best-effort.ts');
+  const { classifyStoredType } = await import('../schema-pack/type-usage.ts');
+  const pools = new Map<string, { pack: NonNullable<Awaited<ReturnType<typeof loadActivePackForLocalEngine>>>; sources: Set<string>; labels: Set<string>; undeclared: Set<string> }>();
+  const unresolved = new Set<string>();
+  for (const sourceId of new Set(rows.map(r => r.source_id))) {
+    const pack = await loadActivePackForLocalEngine(engine, { sourceId });
+    if (!pack) { unresolved.add(sourceId); continue; }
+    const pool = pools.get(pack.identity) ?? { pack, sources: new Set<string>(), labels: new Set<string>(), undeclared: new Set<string>() };
+    pool.sources.add(sourceId);
+    for (const { type } of rows.filter(r => r.source_id === sourceId)) {
+      const cls = classifyStoredType(type, pack.manifest);
+      pool.labels.add(cls.kind === 'alias_of' ? cls.canonical : type);
+      if (cls.kind === 'undeclared') pool.undeclared.add(type);
+    }
+    pools.set(pack.identity, pool);
   }
-  if (n > warn) {
-    return {
-      check: {
-        name: 'type_proliferation',
-        status: 'warn',
-        message: `${n} distinct page types vs ${declared} declared in pack — consider unification.`,
-      },
-      remediations: [],
-    };
-  }
-  return {
-    check: {
-      name: 'type_proliferation',
-      status: 'ok',
-      message: `${n} distinct typed values (pack declares ${declared})`,
-    },
-    remediations: [],
+  const graded = [...pools.values()].map(pool => {
+    const declared = pool.pack.manifest.page_types.length;
+    const n = pool.labels.size;
+    return { pool, declared, n, status: n > declared * 2 ? 'fail' as const : n > declared + 5 ? 'warn' as const : 'ok' as const };
+  });
+  const rank = { ok: 0, warn: 1, fail: 2 };
+  const worst = graded.sort((a, b) => rank[b.status] - rank[a.status] || b.n - b.declared - (a.n - a.declared))[0];
+  const where = (g: typeof graded[number]) => {
+    const undeclared = [...g.pool.undeclared].sort();
+    const names = undeclared.slice(0, 5).join(', ') + (undeclared.length > 5 ? `, +${undeclared.length - 5} more` : '');
+    return ` (source${g.pool.sources.size > 1 ? 's' : ''} ${[...g.pool.sources].sort().join(', ')}, pack ${g.pool.pack.manifest.name}${names ? `; undeclared: ${names}` : ''})`;
   };
+  const notVerified = unresolved.size
+    ? ` Not verified: the schema pack for source${unresolved.size > 1 ? 's' : ''} ${[...unresolved].sort().join(', ')} does not resolve (run \`gbrain schema active --source <id>\`).`
+    : '';
+  if (worst?.status === 'fail') {
+    return result('fail',
+      `${worst.n} distinct page types (pack declares ${worst.declared})${where(worst)}. ` +
+      `Run \`gbrain onboard --check --explain\` to preview a pack upgrade ` +
+      `or define a custom pack with mapping_rules.${notVerified}`);
+  }
+  if (worst?.status === 'warn') {
+    return result('warn', `${worst.n} distinct page types vs ${worst.declared} declared in pack — consider unification${where(worst)}.${notVerified}`);
+  }
+  if (notVerified) return result('warn', `type_proliferation${notVerified.trimEnd()}`);
+  if (!worst) return result('ok', 'no typed pages');
+  return result('ok', graded.map(g => `${g.n} distinct typed values (pack ${g.pool.pack.manifest.name} declares ${g.declared})`).join('; '));
 }
 
 /**
  * dangling_aliases (F12): surfaces both slug_aliases redirects and
- * page_aliases free-text names whose target page no longer exists.
- * Source-scoped JOINs prevent cross-source false-positive deletion.
+ * page_aliases free-text names whose target page is gone or soft-deleted.
+ * Source-scoped JOINs prevent cross-source false positives.
  *
- * v0.42 ships surface-only (no auto-GC RemediationStep). v0.43+ may add
- * `cleanup-dangling-aliases` as an auto_apply handler once detection is
- * confirmed clean in production.
+ * #6619: the two cases are reported apart. Aliases whose target has no page
+ * row (purged or hard-deleted) are cleared by `gbrain repair aliases`, named
+ * per source; aliases of a soft-deleted page are kept for `gbrain restore`
+ * and removed when that page is purged, so nothing is offered for them. The
+ * alias tables carry the managed writer guard, so raw SQL is never offered.
  *
- * Defensive: pre-v105 brains don't have slug_aliases yet — returns ok
- * via the `isUndefinedTableError` fallthrough inherent in safeCount's
- * catch-all (returns 0 on any SQL error).
+ * Defensive: pre-v105 brains don't have slug_aliases yet; a failed read
+ * counts nothing (ok).
  */
 export async function checkDanglingAliases(
   engine: BrainEngine,
 ): Promise<OnboardCheckResult> {
-  const slugAliases = await safeCount(
-    engine,
-    `SELECT COUNT(*) AS count FROM slug_aliases sa
-     LEFT JOIN pages p
-       ON p.slug = sa.canonical_slug
-      AND p.source_id = sa.source_id
-      AND p.deleted_at IS NULL
-     WHERE p.id IS NULL`,
-  );
-  const pageAliases = await safeCount(
-    engine,
-    `SELECT COUNT(*) AS count FROM page_aliases pa
-     LEFT JOIN pages p
-       ON p.slug = pa.slug
-      AND p.source_id = pa.source_id
-      AND p.deleted_at IS NULL
-     WHERE p.id IS NULL`,
-  );
+  let orphaned: Array<{ source_id: string; slug_redirects: number; page_aliases: number }> = [];
+  let soft = { slug_redirects: 0, page_aliases: 0 };
+  try {
+    orphaned = await engine.executeRaw(ORPHANED_ALIAS_COUNTS_SQL);
+    const [row] = await engine.executeRaw<typeof soft>(SOFT_DELETED_ALIAS_COUNT_SQL);
+    if (row) soft = row;
+  } catch (error) {
+    // #7145: only a pre-v105 brain (no alias tables) has nothing to report; any other failure is unknown, not clear.
+    if (!isMissingSchemaObject(error, 'table', ['slug_aliases', 'page_aliases'])) {
+      return { check: { name: 'dangling_aliases', status: 'warn', details: { health: 'unknown' },
+        message: `Dangling aliases unknown: the alias read failed (${redactConnectionInfo(error instanceof Error ? error.message : String(error))}); rerun doctor.` }, remediations: [] };
+    }
+  }
+  const slugAliases = orphaned.reduce((sum, row) => sum + Number(row.slug_redirects), 0) + Number(soft.slug_redirects);
+  const pageAliases = orphaned.reduce((sum, row) => sum + Number(row.page_aliases), 0) + Number(soft.page_aliases);
   const n = slugAliases + pageAliases;
-  if (n > 0) {
+  if (n === 0) {
     return {
-      check: {
-        name: 'dangling_aliases',
-        status: 'warn',
-        message:
-          `${n} alias rows point at missing/deleted pages ` +
-          `(${slugAliases} slug redirects; ${pageAliases} free-text page aliases). ` +
-          `Safe GC (source-scoped): ` +
-          `\`DELETE FROM slug_aliases sa WHERE NOT EXISTS (SELECT 1 FROM pages p ` +
-          `WHERE p.slug = sa.canonical_slug AND p.source_id = sa.source_id ` +
-          `AND p.deleted_at IS NULL); DELETE FROM page_aliases pa WHERE NOT EXISTS ` +
-          `(SELECT 1 FROM pages p WHERE p.slug = pa.slug ` +
-          `AND p.source_id = pa.source_id AND p.deleted_at IS NULL);\``,
-      },
-      remediations: [],  // v0.42: surface-only; auto-GC v0.43+
+      check: { name: 'dangling_aliases', status: 'ok', message: 'No dangling aliases' },
+      remediations: [],
     };
   }
+  const commands = orphaned.map(row => repairPreviewCommand('aliases', { source: row.source_id }));
+  const softTotal = Number(soft.slug_redirects) + Number(soft.page_aliases);
+  const orphanedText = orphaned.length
+    ? `${n - softTotal} point at pages that no longer exist (${orphaned.map(row => `${row.source_id}: ${Number(row.slug_redirects) + Number(row.page_aliases)}`).join(', ')}); `
+      + `preview their cleanup with ${commands.join('; ')}, then run the --apply command it prints. `
+    : '';
+  const softText = softTotal
+    ? `${softTotal} belong to soft-deleted pages and are kept for gbrain restore; purging the page removes them, so nothing needs running for those.`
+    : '';
   return {
-    check: { name: 'dangling_aliases', status: 'ok', message: 'No dangling aliases' },
+    check: {
+      name: 'dangling_aliases',
+      status: 'warn',
+      message:
+        `${n} alias rows point at missing/deleted pages ` +
+        `(${slugAliases} slug redirects; ${pageAliases} free-text page aliases). ${orphanedText}${softText}`.trimEnd(),
+      details: { orphaned, soft_deleted: soft },
+      ...(orphaned.length ? { fix: { argv: commands[0]!.split(' '), consent: [], actor: 'agent' as const, requires_exclusive: false,
+        why: 'Lists the orphaned alias rows of that source without changing anything; its output prints the apply command.' } } : {}),
+    },
     remediations: [],
   };
 }

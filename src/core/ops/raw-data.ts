@@ -6,8 +6,10 @@
  */
 
 import type { Operation } from './contract.ts';
-import { readPolicyOpts } from './context.ts';
+import { readPolicyOpts, requireWritablePage } from './context.ts';
 import { enforceClientSlugFence } from './context.ts';
+import { refuseGuestSourceWrite } from '../guests/admission.ts';
+import { requestPrincipalForContext } from '../persistence/page-mutations.ts';
 
 // --- Raw Data ---
 
@@ -28,6 +30,9 @@ const put_raw_data: Operation = {
     if (ctx.dryRun) return { dry_run: true, action: 'put_raw_data', slug: p.slug, source: p.source };
     // v0.31.8 (D7 + D21): thread ctx.sourceId.
     const sourceOpts = ctx.sourceId ? { sourceId: ctx.sourceId } : {};
+    // GBRA-218: a remote caller's missing and member-hidden targets get the same page_not_found (no existence oracle).
+    if (ctx.remote !== false) await requireWritablePage(ctx, p.slug as string, 'put_raw_data', 'page');
+    await refuseGuestSourceWrite(ctx.engine, ctx.sourceId || 'default', () => requestPrincipalForContext(ctx), 'put_raw_data');
     await ctx.engine.putRawData(p.slug as string, p.source as string, p.data as object, sourceOpts);
     return { status: 'ok' };
   },

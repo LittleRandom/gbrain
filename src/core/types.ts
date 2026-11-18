@@ -64,6 +64,8 @@ export const ALL_PAGE_TYPES: readonly string[] = [
   // extractable:false (events are one-line atoms; diary is private interiority
   // never mined into the facts table). Pack entries in gbrain-base.yaml.
   'event', 'diary',
+  'question', // C4 pinned-question page (question + owner notes; owner-private, never evidence; src/core/questions/pages.ts)
+  'facts', // GST-2731 quotable facts page (me/facts, company/facts): one dated line per fact; doctor facts_undated_lines
 ] as const;
 
 /**
@@ -91,6 +93,10 @@ export interface Page {
   timeline: string;
   frontmatter: Record<string, unknown>;
   content_hash?: string;
+  /** Wave B: on a `segmented` page `compiled_truth`/`timeline` throw `page_body_segmented` (page-body/page-shape.ts); absent = inline. */
+  body_storage?: import('./page-body/types.ts').BodyStorage;
+  /** Wave B: UTF-8 bytes of truth + timeline; always set on a segmented page (`pageBodyBytes`). */
+  body_bytes?: number | null;
   /** Source-relative canonical file identity; snapshot reads expose it for guarded import comparisons. */
   source_path?: string | null;
   /** Opaque canonical state; independent of indexing and telemetry updates. */
@@ -168,6 +174,8 @@ export interface Page {
   source_kind?: string | null;
   /** Original URI/path/message-id the ingestion event carried. */
   source_uri?: string | null;
+  /** G7a: the file a strict page had before it turned private (its origin is cleared); it writes there when it turns world. */
+  withheld_source_path?: string | null;
   /** Richer label paired with source_kind (often same value; indexable separately). */
   ingested_via?: string | null;
   /** Server-stamped first-write audit timestamp; CV12 COALESCE-preserved across edits. */
@@ -329,6 +337,14 @@ export interface PageFilters {
    */
   updatedAfterKeyset?: { updatedAt: string; slug: string };
   /**
+   * Slug keyset cursor: `WHERE p.slug > slugAfter`, paired with `sort: 'slug'`.
+   * Single-source contract (#6500): slug is a total order only inside one
+   * `sourceId`, so a federated listing (`sourceIds`) keeps offset paging.
+   * Resume from the last row's slug; rows touched or deleted mid-walk shift
+   * nothing, unlike OFFSET over a tie cluster.
+   */
+  slugAfter?: string;
+  /**
    * Prefix-match filter on slug. Implemented as `WHERE slug LIKE prefix || '%'`
    * in both engines so it uses the (source_id, slug) UNIQUE constraint's btree
    * index for efficient range scans on large brains. Used by storage-tiering
@@ -336,6 +352,8 @@ export interface PageFilters {
    * queries to a tier directory without loading every page into memory.
    */
   slugPrefix?: string;
+  /** Literal slug prefixes to omit before ordering/pagination. Opt-in: ordinary listings remain unrestricted. */
+  excludeSlugPrefixes?: string[];
   /**
    * v0.26.5: include soft-deleted pages (rows with `deleted_at IS NOT NULL`).
    * Default false: hides soft-deleted pages from `list_pages` so agents see the
@@ -383,6 +401,8 @@ export interface PageFilters {
    * read none of those fields (list_pages).
    */
   listColumnsOnly?: boolean;
+  /** #7159: frontmatter equality (search/frontmatter-where.ts). */
+  where?: import('./search/frontmatter-where.ts').FrontmatterWhere;
 }
 
 /** v0.26.5 — opts for getPage / softDeletePage / restorePage. */
@@ -393,6 +413,10 @@ export interface PageReadScope {
   excludePrivate?: boolean;
   /** Untrusted chunk reads require a verified protected-body index, even with visibility opt-outs. */
   requireSafeChunks?: boolean;
+  /** #5575 read floor (eligibility/policy.ts): only pages at or above this tier; a chunk's tier is its page's. */
+  minTrust?: import('./trust/tier.ts').TrustTier;
+  /** #5575 CEO-20, proactive reads only: hide unconfirmed agent-written pages with an instruction-family gate flag. */
+  suppressFlagged?: boolean;
 }
 
 export interface PageReadPolicy extends PageReadScope {
@@ -415,7 +439,11 @@ export interface GetPageOpts extends PageReadScope {
 
 /** v0.29: literal ORDER BY fragments for the PageFilters.sort enum. Whitelisted. */
 export const PAGE_SORT_SQL: Record<NonNullable<PageFilters['sort']>, string> = {
-  updated_desc: 'p.updated_at DESC',
+  // #6500: the same tiebreakers as updated_asc, so a tie cluster (bulk
+  // imports stamp one now() across a transaction) lists deterministically.
+  // OFFSET over it is still unstable under timestamp-changing writes; walk
+  // a source by `sort: 'slug'` + `slugAfter` when every page must be seen once.
+  updated_desc: 'p.updated_at DESC, p.slug DESC, p.source_id DESC, p.id DESC',
   // v0.45.7: slug tiebreaker makes updated_asc a TOTAL order, so keyset
   // pagination (updatedAfterKeyset) can page deterministically through a
   // cluster of pages sharing one updated_at (bulk syncs stamp identical
@@ -670,13 +698,14 @@ export interface Chunk {
   parent_symbol_path?: string[] | null;
   doc_comment?: string | null;
   symbol_name_qualified?: string | null;
-  /**
-   * v0.27.1 multimodal. Read side of ChunkInput.modality — must round-trip
-   * through getChunks → embed-stale merge → upsertChunks or image rows get
-   * reset to 'text' (EXCLUDED.modality on the upsert) and vanish from the
-   * image search arm.
-   */
+  /** v0.27.1 multimodal. Read side of ChunkInput.modality — must round-trip through getChunks → embed-stale
+   * merge → upsertChunks or image rows get reset to 'text' (EXCLUDED.modality) and vanish from the image arm. */
   modality?: 'text' | 'image';
+  /** #6871: the image vector; only getChunksWithEmbeddings reads it, so `gbrain migrate` carries it. */
+  embedding_image?: Float32Array | null;
+  /** v244: UTF-8 byte span in the chunk_source's projected text (see ChunkInput); null when unrecorded. */
+  projected_byte_start?: number | null;
+  projected_byte_end?: number | null;
   /**
    * True when the stored vector is NULL. Cheap boolean (no vector egress) so
    * non-embedding readers can tell "vector missing" apart from `embedded_at`,
@@ -726,6 +755,19 @@ export interface ChunklessPageRow {
   source_id: string;
   compiled_truth: string;
   timeline: string;
+}
+
+/**
+ * One stored chunk of a page as the import's vector-reuse planner sees it:
+ * its index, the recorded embedding input, the page's contextual-retrieval
+ * mode, and whether it holds a text-only embedding or no embedding at all.
+ */
+export interface ChunkReuseRow {
+  chunk_index: number;
+  embedding_input_hash: string | null;
+  contextual_retrieval_mode: string | null;
+  text_only: boolean;
+  unembedded: boolean;
 }
 
 /**
@@ -796,6 +838,14 @@ export interface ChunkInput {
   parent_symbol_path?: string[];
   doc_comment?: string;
   symbol_name_qualified?: string;
+  /**
+   * v244: where a prose chunk sits in the projected text of its chunk_source
+   * (credentialSafeProjection(sanitizeRemoteBody(<fence-overlaid compiled_truth
+   * or timeline>))), as UTF-8 byte offsets, end exclusive. Absent for code,
+   * image and low-tier fence chunks. Windowed reads center on it.
+   */
+  projected_byte_start?: number;
+  projected_byte_end?: number;
 }
 
 // Search
@@ -828,6 +878,13 @@ export interface SearchResult {
    * Absent when the page is clean.
    */
   content_flag?: { reason: string; detail: string };
+  /** #5575 A6: the page's trust tier and short write origin (eligibility/stamp.ts), stamped after ranking. */
+  trust_tier?: import('./trust/tier.ts').TrustTier;
+  origin?: string;
+  /** GBRA-504: an outside guest's note (origin `guest`); its mark from guest_marks (guests/marker.ts). */
+  guest?: import('./guests/marker.ts').GuestStamp;
+  /** #5575 CEO-20: unconfirmed agent-written content with an instruction-family gate flag (explicit reads only). */
+  unconfirmed?: true;
   /**
    * 2026-09 fix wave (#3617 follow-up): true when this row came from the
    * keyword/title arm's AND→OR zero-strict-recall fallback rather than a
@@ -844,6 +901,14 @@ export interface SearchResult {
    * strict-match rows.
    */
   keyword_relaxed?: boolean;
+  /** GST-2762: a keyword_relaxed row the keyless any-word fill added (SearchOpts.orFill); it only adds pages, after the rest. */
+  keyword_fill?: true;
+  /** Set on rows search's alias fan-out spliced in: the entity's other name that found this page (search/alias-fanout.ts). */
+  matched_alias?: string;
+  /** `search` `match: "keyword"`: an enumerated page whose text did not fit the evidence budget keeps its row, without text. */
+  evidence_omitted?: boolean;
+  /** `generated` on pages gbrain wrote (dream_generated, extract_receipt); `generated_demotion` when ranked below a primary record (search/provenance-demotion.ts). */
+  provenance?: 'generated'; generated_demotion?: number;
   /**
    * Extraction quarantine lane (issue #160): true when the result's page is
    * an unverified auto-extracted entity stub (frontmatter
@@ -1042,6 +1107,8 @@ export interface SearchResult {
    * keys off base_score / evidence, not the boosted score).
    */
   title_match_boost?: number;
+  /** Multiplier from the opt-in qualified title boost (`search.title_qualified`); evidence never reads it as an exact title match. */
+  title_mention_boost?: number;
   /**
    * T3 (retrieval-maxpool incident) — set when this result was surfaced or
    * boosted by the free-text alias hop (the query exactly matched a page's
@@ -1051,6 +1118,8 @@ export interface SearchResult {
    * decision keys off (T4).
    */
   alias_hit?: boolean;
+  /** Opt-in qualified alias hop (`search.qualified_aliases`) led this page; autocut and the remote page cap keep it, evidence ignores it. */
+  qualified_alias_hit?: boolean;
   /**
    * #3783 — set when this result was surfaced by a LEXICAL arm (chunk-grain
    * keyword FTS or the page-grain title arm). Stamped pre-fusion by
@@ -1063,12 +1132,26 @@ export interface SearchResult {
   keyword_hit?: boolean;
   /**
    * #1663 — set when the structural exact-lookup tier promoted/injected this
-   * result (query was the page's slug or exact normalized title). Drives the
+   * result (the page's slug or exact title, or #7163 an identifier its text holds). Drives the
    * autocut preserve predicate (tier hits carry no rerank_score) and
    * `--explain` telemetry; evidence still reads via alias_hit /
    * title_match_boost so the frozen EVIDENCE_ENUM is untouched.
    */
-  exact_lookup?: 'slug' | 'title';
+  exact_lookup?: 'slug' | 'title' | 'identifier';
+  /**
+   * Set when `search.entity_anchoring` moved or added this row for an
+   * entity-scoped current-state query (search/entity-anchor.ts): the named
+   * entity's page, or a page that links to it or names it (newest first).
+   */
+  entity_anchored?: 'entity' | 'linked';
+  /** Set on a saved-fact row the `search.query_facts_arm` arm added (search/facts-arm.ts); page_id is 0. `observed`: when it was said; `observed_unavailable`: that read failed; `contested_unavailable`: the facts block's contested lookup failed; `history_unavailable`: its slot-history read failed. */
+  fact_row?: { id: number; valid_from: string; valid_until: string | null; source?: string; from_quoted_page?: true; observed?: string; observed_unavailable?: true; contested_unavailable?: true; history_unavailable?: true };
+  /** Fact rows only, and what callers see of them: never a page (no slug or id); follow with `follow_up`, read `page_slug` when the entity page exists. */
+  result_type?: 'fact'; fact_id?: string; page_slug?: string; follow_up?: { op: 'recall'; args: Record<string, string> };
+  /** #7600, #8042: a row of third-party text (a chat page or a fact saved from one), returned fenced as quoted source material with its tool-call blocks summarized (search/transcript-quote.ts). */
+  quoted?: 'transcript';
+  /** A newer active fact covers the same entity and typed claim slot as a fact taken from this page. */
+  superseded_claim?: { fact_id: number; valid_from: string };
   /**
    * T4 — the strongest signal that surfaced this page (alias_hit >
    * exact_title_match > high_vector_match > keyword_exact > weak_semantic).
@@ -1085,6 +1168,18 @@ export interface SearchResult {
   create_safety?: import('./search/evidence.ts').CreateSafety;
   /** Evidence delivery (`return_unit`): present only when a non-chunk unit applied. */
   delivered?: import('./search/evidence-delivery.ts').DeliveredEvidence;
+  /** Pages folded into this row at result time (search/collapse.ts): a same-slug twin in another source, a redirect stub that points here, or another copy of the same document. */
+  collapsed?: import('./search/collapse.ts').CollapsedRef[];
+  /** A redirect stub whose target could not be returned in its place: the slug it points to (search/collapse.ts). */
+  redirect_to?: string;
+  /** A text row of an image page (its caption or OCR text), so an agent can discount a one-word match (search/rank-priors.ts). */
+  image_page?: true;
+  /** Multiplier the rank priors applied to this row's ordering score (search/rank-priors.ts); absent = 1. */
+  rank_prior?: number;
+  /** The value a reranked list is ordered by: rerank_score times rank_prior (search/rank-priors.ts). */
+  rank_score?: number;
+  /** The fused score when the returned `score` was rewritten to follow rank order (search/score-contract.ts). */
+  fused_score?: number;
 }
 
 /**
@@ -1176,6 +1271,12 @@ export interface SearchOpts extends PageReadPolicy {
   onVectorPoolMeta?: (m: VectorPoolMeta) => void;
   /** #5824 rollback: keep the freshness guard inside the HNSW candidate CTE. Latched by the caller (search/vector-legacy-guard.ts). */
   vectorLegacyGuard?: boolean;
+  /** #6132: pgvector `hnsw.iterative_scan` mode (default relaxed_order), latched by the caller (search/hnsw-iterative-scan.ts). */
+  hnswIterativeScan?: import('./search/hnsw-iterative-scan.ts').HnswIterativeScanMode;
+  /** #5989: bounded CJK keyword arm (deadline + meta sink); set by hybrid only (engine-sql/cjk-search.ts). */
+  cjkKeyword?: import('./engine-sql/cjk-search.ts').CjkKeywordRun;
+  /** GBRA-156: the Postgres keyword arm ranked a bounded sample of its matches, or its OR retry dropped common terms (search/keyword-chunk-match.ts, search/keyword-or-narrow.ts). */
+  onKeywordIncomplete?: (reason: 'candidate_budget' | 'timeout' | 'provider_error') => void;
   /**
    * v0.42 — intent-aware adaptive return-sizing. `true` enables with config/
    * default caps; an object overrides caps per-call; omitted/`false` = off
@@ -1202,6 +1303,8 @@ export interface SearchOpts extends PageReadPolicy {
    * entity-only search reuses the parameter.
    */
   types?: PageType[];
+  /** #7159: frontmatter equality, pushed into every SQL leg (search/frontmatter-where.ts). */
+  where?: import('./search/frontmatter-where.ts').FrontmatterWhere;
   exclude_slugs?: string[];
   /**
    * Slug-prefix excludes — additive over DEFAULT_HARD_EXCLUDES (test/,
@@ -1266,18 +1369,21 @@ export interface SearchOpts extends PageReadPolicy {
    */
   sourceIds?: string[];
   /**
-   * fix/title-retrieval-arm (D2, Reviewer F1): opt-in AND→OR keyword-recall
-   * fallback. When true, `searchKeyword` retries ONCE with OR-of-terms after
-   * the strict websearch AND query returns zero rows (strict results always
-   * win when non-empty). Default false/undefined = strict-AND only — the
-   * pre-fix contract. hybridSearch opts in for its keyword arm; precision
-   * consumers (enrichment countMentions, link-extraction resolution, eval
-   * paths) MUST NOT set this: OR-matches would inflate mention counts and
-   * relax link-candidate resolution ("John Smith" matching every John and
-   * every Smith). `searchTitles` has its own page-grain fallback and
-   * ignores this flag.
+   * fix/title-retrieval-arm (D2, Reviewer F1): opt-in AND→OR keyword-recall fallback. When true, `searchKeyword`
+   * retries ONCE with OR-of-terms after the strict websearch AND query returns zero rows (strict rows win when
+   * non-empty); unset = strict-AND only. hybridSearch opts in for its keyword arm; precision consumers
+   * (countMentions, link-extraction resolution, eval paths) MUST NOT: OR-matches inflate mention counts and relax
+   * link resolution ("John Smith" matching every John and every Smith). `searchTitles` ignores this flag.
    */
   orFallback?: boolean;
+  /** GST-2762: with orFallback, run only the OR retry, on the first page, and tag its rows `keyword_relaxed` and `keyword_fill`; the keyless any-word fill's own call, which already holds the strict rows. */
+  orFill?: boolean;
+  /** #6495: hybrid's keyword arm opts in to the Postgres keyword timeout negative cache (postgres-engine/keyword-timeout-cache.ts); PGLite ignores it. */
+  keywordTimeoutCache?: boolean;
+  /** Keyword `score` query (websearch syntax) while `query` decides the matches (alias fan-out); ignored on the CJK path. */
+  rankQuery?: string;
+  /** #7175: true applies the opt-in keyword phrase factor (`search.keyword_phrase true`); unset or false leaves it off. */
+  keywordPhrase?: boolean;
   /**
    * v0.27.1 / v0.36 (D11): target column for vector search. Two shapes:
    *
@@ -1367,6 +1473,7 @@ export interface SearchOpts extends PageReadPolicy {
    * call. When undefined, the cache decision falls back to global config
    * (search.cache.enabled, default true). Set to `false` to force a fresh
    * search; set to `true` to opt in even when global config has it off.
+   * `false` also bypasses the keyword timeout negative cache (#6495).
    */
   useCache?: boolean;
   /**
@@ -1661,6 +1768,8 @@ export interface TimelineInput {
 
 export interface TimelineOpts extends PageReadScope {
   limit?: number;
+  /** #5575 read eligibility (eligibility/sql.ts) for read ops. */
+  eligibility?: import('./eligibility/policy.ts').ReadEligibility;
   after?: string;
   before?: string;
   /**
@@ -1693,6 +1802,7 @@ export interface ChronicleTimelineRow {
   event_slug: string | null;  // the type:event page, when this is an event projection
   effective_date: string | null; // event page effective_date — drives intra-day order
   kind: string | null;        // event.kind from the event page frontmatter
+  trust_tier: string | null;  // the row's stored tier (GST-687: below the owner's, quoted for an agent reader)
 }
 
 export interface ChronicleTimelineOpts extends PageReadScope {
@@ -1769,6 +1879,8 @@ export interface OntologyReadOpts extends PageReadScope {
   sourceIds?: string[];
   /** Fact visibility tiers the caller may read; undefined reads every tier. */
   visibility?: Array<'private' | 'world'>;
+  /** Leave out observations whose provenance is a life/diary/ page, before each dimension resolves (remote callers). */
+  excludeDiary?: boolean;
 }
 
 // Raw data
@@ -1784,6 +1896,8 @@ export type { PageVersion } from './page-state/version-types.ts';
 export interface WriteAttributionView {
   request_id: string | null; operation: string | null; at: string | null;
   principal: { kind: string; id: string; name: string | null } | null;
+  /** The agent label the caller declared on the write request (X-Gbrain-Agent-Label); unverified, absent when none was sent. */
+  agent_label?: string;
   origin: 'request' | 'maintenance' | 'unrecorded';
 }
 /** A `get_versions` row as trusted local and admin callers see it. */
@@ -1851,6 +1965,14 @@ export interface BrainHealth {
    * consumers can tell "0% coverage" from "no entities to grade".
    */
   entity_page_count: number;
+  /**
+   * #4772: `resolved` when the active schema pack of every source in scope
+   * chose the entity types (src/core/schema-pack/entity-types.ts);
+   * `pack_unavailable` when a pack did not load, so the entity filter was empty
+   * and entity_page_count 0 / null ratios are a degraded reading, never the
+   * legacy hardcoded list.
+   */
+  entity_types_status: 'resolved' | 'pack_unavailable';
   /**
    * Entity link coverage, or null when entity_page_count is below
    * MIN_ENTITY_PAGES_FOR_COVERAGE — a 0/0 or single-page ratio is
@@ -1995,8 +2117,10 @@ export const DEGRADED_STAGES = [
   'keyword_relaxed_carried',
   'safe_index_pending',
   'vector_candidates_incomplete',
-  'projection_pending',
+  'keyword_candidates_incomplete',
+  'projection_pending', 'projection_by_design',
   'projection_status_unknown',
+  'keyword_count_unavailable', 'saved_facts_withheld', 'fact_observed_date_unavailable', 'contested_unavailable', 'facts_history_unavailable',
 ] as const;
 export type DegradedStage = (typeof DEGRADED_STAGES)[number];
 
@@ -2017,11 +2141,12 @@ export const DEGRADED_REASONS = [
   // #4648 — rerank_passthrough reasons (mirror RerankPassThroughReason).
   'empty_result_set',
   'malformed_shape',
-  'budget',
+  'budget', 'rate_limited', 'unreachable', 'auth', // rerank_failed reasons (mirror RerankFailedReason)
   'candidate_budget',
   'iterative_scan_unavailable',
   'egress_denied', // System One: the Jev reranker skipped a query with a candidate from decide.egress.deny_sources
   'embedding_disabled', // the brain opted out of embedding: the query text was never sent to the provider
+  'skipped_after_timeout', // #6495: keyword_arm_failed; the same keyword statement timed out within search.keyword_timeout_negative_cache_seconds
 ] as const;
 export type DegradedReason = (typeof DEGRADED_REASONS)[number];
 
@@ -2044,7 +2169,7 @@ export interface DegradedStageEntry {
  *     short degraded TTL lets the next query recover a reranked result set
  *     (master's v0.48.1.0 behavior, kept at the merge). It never reaches the
  *     empty-result copy because a pass-through implies a non-empty batch.
- *   - `rerank_failed` (the call threw: timeout / provider_error / budget) is transient too.
+ *   - `rerank_failed` (the call threw: timeout / budget / rate_limited / unreachable / auth / provider_error) is transient too.
  *   - `keyword_relaxed_carried` is recall-shaped by definition (see above).
  * Pinned by test/degraded-stages-recall.test.ts; a new fail-open stage must be
  * classified here in the same commit that adds it.
@@ -2064,6 +2189,7 @@ export function affectsRecall(d: { stage?: string; reason?: string } | undefined
 export interface HybridSearchMeta {
   /** True iff vector search actually ran. False when OPENAI_API_KEY missing or embed failed. */
   vector_enabled: boolean;
+  /** #7492: an image-reading vector arm ran (cross-modal image or unified multimodal), so pending image pages could change the answer. */ image_arm?: true;
   /** System One: slot diagnostics (only when a slot ran visibly) and the reranker model version that answered. */
   decide?: import('./search/decide-stage.ts').DecideSearchMeta; rerank?: { model_resolved: string };
   /** System One S4 on the query op (diagnostic only): probability the top-k answer the query, threshold and verdict. */
@@ -2091,6 +2217,8 @@ export interface HybridSearchMeta {
    * yield). Omitted on clean runs. Exhaustion is VISIBLE, not silent.
    */
   vector_pool_underfilled?: Omit<VectorPoolMeta, 'underfilled'>;
+  /** #5989: the bounded CJK keyword arm's outcome and wall time (separate from total hybrid latency). */
+  keyword_candidates?: import('./engine-sql/cjk-search.ts').CjkKeywordMeta;
   /**
    * v0.42.3.0 — autocut decision (signal, cut point, kept/total, gapRatio).
    * Omitted when autocut didn't run (no reranker). Surfaced for
@@ -2138,6 +2266,18 @@ export interface HybridSearchMeta {
    * recall there; the gate is never consulted).
    */
   metadata_boost_gate?: import('./search/metadata-boost-gate.ts').MetadataBoostGateDecision;
+  /**
+   * W3 — the confidence gate in front of the cross-encoder (search/hybrid/rerank-gate.ts):
+   * eligibility, the pre-rerank grade and reason, rank-1 cosine and its gap
+   * over the best other page, the candidate count, `would_skip` and whether a
+   * reranker provider call was made. Present only on the main RRF path and
+   * only when `search.reranker.gate` is not `off`.
+   */
+  rerank_gate?: import('./search/hybrid/rerank-gate.ts').RerankGateMeta;
+  /** `js_fallback` when the SQL cosine re-score failed and this search computed it in JavaScript (search/cosine-rescore.ts). */
+  cosine_rescore?: 'js_fallback';
+  /** Rows folded at result time (search/collapse.ts): twins, redirect stubs and document copies, plus redirect targets read in. Absent when nothing folded. */
+  collapse?: import('./search/collapse.ts').CollapseDecision;
   /**
    * v0.32.x (search-lite): token budget enforcement metadata. Omitted when
    * no budget was applied (backward-compatible with pre-search-lite
@@ -2216,6 +2356,12 @@ export interface EngineConfig {
   database_url?: string;
   database_path?: string;
   engine?: 'postgres' | 'pglite';
+  /** #6495 file-plane `search.keyword_statement_timeout_ms`, read by the Postgres engine at connect (postgres-engine/keyword-statement-timeout.ts). */
+  keyword_statement_timeout_ms?: number;
+  /** PGLite `shared_buffers` for this open (e.g. '32MB'); unset keeps the data directory's setting. */
+  pglite_shared_buffers?: string;
+  /** Postgres: connections the module pool may open (a one-shot read: 2); unset keeps GBRAIN_POOL_SIZE or the default. */
+  pool_max?: number;
 }
 
 // Errors

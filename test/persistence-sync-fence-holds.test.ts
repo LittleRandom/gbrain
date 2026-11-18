@@ -31,6 +31,7 @@ import { printSyncResult, type SyncOpts, type SyncResult } from '../src/commands
 import { isolatedPersistencePostgres } from './helpers/persistence-postgres.ts';
 import { testBackends } from './helpers/test-backends.ts';
 import { withEnv } from './helpers/with-env.ts';
+import { SYNC_IMPORT_PROVENANCE_OP } from '../src/core/persistence/sync-holds.ts';
 import { TEST_WRITE_ATTRIBUTION } from './helpers/write-attribution.ts';
 import { waitFor } from './helpers/wait-for.ts';
 import { readFileSync } from 'node:fs';
@@ -118,7 +119,7 @@ test('a malformed fence among clean files: the sync finishes, holds that file wi
   expect(result.held![0]!.fix.argv).toEqual(preview);
   expect(result.held![0]!.fix.then?.argv).toEqual([...preview, '--apply']);
   expect(result.held![0]).toMatchObject({ line: 9, fence: { tier: 'resolver', auto_retry: false, next_attempt_after: null, classes: ['holder_unresolved'] } });
-  expect(result.holds_fix!.argv).toEqual(['gbrain', 'repair', 'fences', '--source', s.id]);
+  expect(result.holds_fix!.argv).toEqual(['gbrain', 'repair', 'content', '--source', s.id]); // #6377: the source-level step is the content lane
   for (const text of [JSON.stringify(result.held), result.holds_fix!.why]) expect(text).not.toContain('repair frontmatter');
   const text = printed(result);
   expect(text).toContain('Held people/malformed.md: invalid_fence (holder_unresolved) in the takes fence (body), row 1, column who, at line 9');
@@ -130,14 +131,14 @@ test('a malformed fence among clean files: the sync finishes, holds that file wi
   const rows = await engine.executeRaw<{ completed_keys: unknown }>("SELECT completed_keys FROM op_checkpoints WHERE op LIKE 'sync-hold%' AND fingerprint LIKE $1", [`${s.id}:%`]);
   for (const blob of [JSON.stringify(rows), JSON.stringify(result), text, lines, JSON.stringify(status)]) expectNoSecrets(blob);
   expect(lines).toContain(`gbrain repair fences --source ${s.id} --only people/malformed.md`);
-  // Doctor routes a fence-only source to the fence repair preview, never to frontmatter repair.
+  // Doctor routes a fence-only source to the content lane's preview (#6377), never to frontmatter repair.
   const doctor = await gitHeldFilesCheck(engine, [s.id]);
-  expect(doctor).toMatchObject({ status: 'warn', fix: { argv: ['gbrain', 'repair', 'fences', '--source', s.id] }, details: { fences: 1, auto_repair: { active: false } } });
-  expect(doctor.message).toContain(`gbrain repair fences --source ${s.id}`);
+  expect(doctor).toMatchObject({ status: 'warn', fix: { argv: ['gbrain', 'repair', 'content', '--source', s.id] }, details: { fences: 1, auto_repair: { active: false } } });
+  expect(doctor.message).toContain(`gbrain repair content --source ${s.id}`);
   expect(doctor.message).not.toContain('repair frontmatter');
-  // retry-held names the fence repair preview for what still refuses.
+  // retry-held names the content lane's preview for what still refuses.
   const retry = (await retryHeld(engine, s.id, { dryRun: false })).next_action;
-  expect(retry).toContain(`gbrain repair fences --source ${s.id}`);
+  expect(retry).toContain(`gbrain repair content --source ${s.id}`);
   expect(retry).not.toContain('repair frontmatter');
 
   s.write('people/malformed.md', takesPage('Malformed', take(1, 'Synthetic take', 'world'))); commit(s.root, 'fix the holder');
@@ -179,7 +180,11 @@ test('forced probe: a fence that passes the screen but collides with a stored ta
   expect(await s.failedRequests()).toHaveLength(1);
 }), 180_000);
 
-test('sync.holds=fail blocks with the typed refusal; the next sync after the upgrade converts the legacy receipt with no --retry-failed', () => each(async engine => {
+// #6712 PR 4b: a non-company source has no blocked cursor to convert (the persistence-sync-holds ruling): the next pass
+// re-classifies the file and holds it under its own run, and the receipt an older release left stays exactly as it was.
+const receiptRow = (engine: BrainEngine, requestId: string) => engine.executeRaw('SELECT state,error_code,error_message,error_detail,compacted FROM persistence_requests WHERE request_id=$1::uuid', [requestId]);
+
+test('sync.holds=fail blocks with the typed refusal; the next sync after the upgrade holds the file with no --retry-failed and leaves the legacy receipt as it was', () => each(async engine => {
   await engine.setConfig('sync.holds', 'fail');
   const s = await source(engine, { 'people/malformed.md': MALFORMED, 'notes/ok.md': note('Ok') });
   const blocked = await s.sync();
@@ -208,15 +213,17 @@ test('sync.holds=fail blocks with the typed refusal; the next sync after the upg
   expectNoSecrets(JSON.stringify(remote));
   expect((await frontmatterHoldsBannerNote(engine)) ?? '').not.toContain(s.id);
   await engine.unsetConfig('sync.holds');
+  const legacy = await receiptRow(engine, failed!.request_id);
   const converted = await s.sync();
-  expect(converted.converted_from_failed).toEqual([failed!.request_id]);
+  expect(converted.converted_from_failed ?? []).not.toContain(failed!.request_id);
+  expect(await receiptRow(engine, failed!.request_id)).toEqual(legacy);
   expect(converted).toMatchObject({ status: 'first_sync', held_count: 1 });
   expect(converted.held![0]).toMatchObject({ path: 'people/malformed.md', code: 'invalid_fence', fence: { fence: 'takes', section: 'body' } });
   expect(await engine.getPage('notes/ok', { sourceId: s.id })).not.toBeNull();
   expect(await fenceHoldsBannerNote(engine)).toBeNull();
 }), 180_000);
 
-test('a legacy stored-row receipt holds the same bytes from the receipt; a compacted receipt converts only through the re-screen', () => each(async engine => {
+test('a legacy stored-row receipt: the pass holds the same bytes by its own refusal; a compacted receipt: the re-screen holds them; both receipts stay as they were', () => each(async engine => {
   const s = await source(engine, { 'people/probe.md': takesPage('Probe', take(1)) });
   await s.sync();
   await s.storedTake('people/probe', 2, 'Database-only take');
@@ -227,8 +234,11 @@ test('a legacy stored-row receipt holds the same bytes from the receipt; a compa
   await engine.executeRaw('UPDATE persistence_requests SET error_message=$2,error_detail=NULL WHERE request_id=$1::uuid',
     [failed!.request_id, "A takes fence row number is already used by a different take that is not in this page's canonical fence."]);
   await engine.unsetConfig('sync.holds');
+  const legacy = await receiptRow(engine, failed!.request_id);
   const converted = await s.sync();
-  expect(converted).toMatchObject({ status: 'synced', held_count: 1, converted_from_failed: [failed!.request_id] });
+  expect(converted).toMatchObject({ status: 'synced', held_count: 1 });
+  expect(converted.converted_from_failed ?? []).not.toContain(failed!.request_id);
+  expect(await receiptRow(engine, failed!.request_id)).toEqual(legacy);
   // The legacy message named no section; it comes from the refused bytes.
   expect(converted.held![0]).toMatchObject({ code: 'invalid_fence', reason: 'prepare_time', fence: { reason: 'stored_row_collision', fence: 'takes', section: 'body' } });
 
@@ -239,21 +249,33 @@ test('a legacy stored-row receipt holds the same bytes from the receipt; a compa
   const [compacted] = await t.failedRequests();
   await engine.executeRaw('UPDATE persistence_requests SET error_message=NULL,error_detail=NULL,compacted=true WHERE request_id=$1::uuid', [compacted!.request_id]);
   await engine.unsetConfig('sync.holds');
-  expect(await t.sync()).toMatchObject({ status: 'first_sync', held_count: 1, converted_from_failed: [compacted!.request_id] });
+  const compactedRow = await receiptRow(engine, compacted!.request_id);
+  const rescreened = await t.sync();
+  expect(rescreened).toMatchObject({ status: 'first_sync', held_count: 1 });
+  expect(rescreened.converted_from_failed ?? []).not.toContain(compacted!.request_id);
+  expect(await receiptRow(engine, compacted!.request_id)).toEqual(compactedRow);
 
-  // ...but an arbitrary invalid_params receipt, compacted or not, is never a fence hold: the cursor stays blocked.
-  await engine.setConfig('sync.holds', 'fail');
-  const u = await source(engine, { 'notes/ok.md': note('Ok') });
-  u.write('notes/draft.md', MALFORMED);
-  expect((await u.sync({ workingTree: true })).status).toBe('blocked_by_failures');
-  const [arbitrary] = await u.failedRequests();
-  await engine.executeRaw("UPDATE persistence_requests SET error_message='The value is invalid.',error_detail=NULL WHERE request_id=$1::uuid", [arbitrary!.request_id]);
-  await engine.unsetConfig('sync.holds');
-  u.write('notes/draft.md', note('Now clean'));
-  expect((await u.sync({ workingTree: true })).status).toBe('blocked_by_failures');
-  await engine.executeRaw('UPDATE persistence_requests SET error_message=NULL,compacted=true WHERE request_id=$1::uuid', [arbitrary!.request_id]);
-  expect((await u.sync({ workingTree: true })).status).toBe('blocked_by_failures');
-  expect(await u.holds()).toEqual([]);
+  // ...but an arbitrary invalid_params receipt, compacted or not, is never a fence hold: once the file is clean, the next
+  // plain sync retries it (#6712 PR 3, L7: no --retry-failed) and nothing is held or converted.
+  // #6712 PR 4b (design v3.2 §3.3, §6): only a pass at the configured selection (its mode included) stamps last_commit, so the
+  // brain is configured for working-tree sync while these working-tree runs check the first sync.
+  await engine.setConfig('sync.include_working_tree', 'true');
+  try { for (const compacted of [false, true]) {
+    await engine.setConfig('sync.holds', 'fail');
+    const u = await source(engine, { 'notes/ok.md': note('Ok') });
+    u.write('notes/draft.md', MALFORMED);
+    expect((await u.sync({ workingTree: true })).status).toBe('blocked_by_failures');
+    const [arbitrary] = await u.failedRequests();
+    await engine.executeRaw(compacted ? 'UPDATE persistence_requests SET error_message=NULL,error_detail=NULL,compacted=true WHERE request_id=$1::uuid'
+      : "UPDATE persistence_requests SET error_message='The value is invalid.',error_detail=NULL WHERE request_id=$1::uuid", [arbitrary!.request_id]);
+    await engine.unsetConfig('sync.holds');
+    u.write('notes/draft.md', note('Now clean'));
+    const retried = await u.sync({ workingTree: true });
+    expect(retried.status).toBe('first_sync');
+    expect(retried.held ?? []).toEqual([]);
+    expect(retried.converted_from_failed ?? []).not.toContain(arbitrary!.request_id);
+    expect(await u.holds()).toEqual([]);
+  } } finally { await engine.unsetConfig('sync.include_working_tree'); }
 }), 240_000);
 
 test('dry run lists the fence hold a real run would write and writes nothing', () => each(async engine => {
@@ -333,6 +355,28 @@ test('a manifest with one fixable fence, one unfixable fence and clean files: th
   expect((await s.sync()).status).toBe('up_to_date');
 }), 180_000);
 
+test('forced probe: the Git effect commits the normalized file before it records the commit, while the next round starts; the pass still ends on its stamp', () => each(async engine => {
+  const s = await source(engine, { 'notes/a.md': note('A'), 'people/fixable.md': fixable() }, {}, true);
+  const head = git(s.root, 'rev-parse', 'HEAD');
+  // The effect's commit is on disk but its row is not yet committed (`effect:git:mid`) when the pass's next round starts.
+  const committed = Promise.withResolvers<void>(), done = Promise.withResolvers<void>();
+  const { installFaultHook } = await import('../src/core/persistence/fault-points.ts');
+  installFaultHook(async (point, detail) => {
+    if (point === 'effect:git:mid' && detail.sourceId === s.id) { committed.resolve(); await Promise.race([done.promise, Bun.sleep(20_000)]); }
+    if (point === 'sync:round_start' && detail.sourceId === s.id && (detail.round ?? 1) > 1) await Promise.race([committed.promise, Bun.sleep(20_000)]);
+  });
+  let result: SyncResult;
+  try { result = await s.sync(); } finally { done.resolve(); installFaultHook(undefined); }
+  expect(result).toMatchObject({ status: 'first_sync', added: 2 });
+  expect(git(s.root, 'log', '-1', '--format=%s')).toBe('gbrain: persist canonical memory update');
+  expect(await s.lastCommit()).toBe(head);
+  // As without the race: the next sync reads gbrain's own commit as a no-op; the one after is up to date.
+  const again = await s.sync();
+  expect(again).toMatchObject({ added: 0, modified: 0 });
+  expect(again.fences_normalized).toBeUndefined();
+  expect((await s.sync()).status).toBe('up_to_date');
+}), 180_000);
+
 test('dry run lists the file it would normalize beside the hold and leaves every file byte-identical', () => each(async engine => {
   const s = await source(engine, { 'people/fixable.md': fixable(), 'people/malformed.md': MALFORMED, 'notes/ok.md': note('Ok') });
   const before = readFileSync(join(s.root, 'people/fixable.md'), 'utf8');
@@ -386,6 +430,10 @@ test('TE1: a stored take whose prior fence did not parse is updated by its norma
     await tx.executeRaw("UPDATE pages SET compiled_truth=$3 WHERE source_id=$1 AND slug=$2", [s.id, 'people/probe', bad.split('---\n').slice(2).join('---\n')]);
     await tx.executeRaw("INSERT INTO takes(page_id,row_num,claim,kind,holder,weight) SELECT id,2,'Second take','assessment','brain',0.7 FROM pages WHERE source_id=$1 AND slug=$2", [s.id, 'people/probe']);
   }, TEST_WRITE_ATTRIBUTION));
+  // That older writer was a sync import that recorded its import at the revision it wrote. #6712 PR 4b (design v3.2 §2.3 row 19,
+  // §2.7): an unrecorded database-only edit, followed by a file edit, is a Decision (file_drift), never imported over.
+  await engine.executeRaw(`UPDATE op_checkpoints SET completed_keys=jsonb_set(completed_keys,'{0,revision}',to_jsonb((SELECT knowledge_revision::text FROM pages WHERE source_id=$2 AND slug=$3)))
+    WHERE op=$1 AND completed_keys->0->>'page_id'=(SELECT id::text FROM pages WHERE source_id=$2 AND slug=$3)`, [SYNC_IMPORT_PROVENANCE_OP, s.id, 'people/probe']);
   s.write('people/probe.md', bad); commit(s.root, 'invented kind');
   const result = await s.sync();
   expect(result).toMatchObject({ status: 'synced', fences_normalized: { count: 1, by_class: { kind_map: 1 } } });
@@ -439,3 +487,37 @@ test('E33: a completed sync run always has its trend row; a failed trend write f
   expect(recorded).toHaveLength(1);
   expect(recorded[0]!.record).toMatchObject({ count: 2, by_class: { kind_map: 2, holder_alias: 2 } });
 }), 180_000);
+
+test('#9646: a pass stamp on a source with no recorded watermark reads only requests newer than its publication\'s preparation inside the publication', () => each(async engine => {
+  const s = await source(engine, { 'notes/fix-a.md': fixable('A') });
+  expect(await s.sync()).toMatchObject({ fences_normalized: { count: 1 } });
+  // A source whose converged watermark was never recorded: the stamp's trend range starts at 0, the whole request history.
+  await engine.executeRaw(`UPDATE op_checkpoints SET completed_keys=jsonb_set(completed_keys,'{0,obligations,converged}',(completed_keys->0->'obligations'->'converged')-'request_hwm')
+    WHERE op='managed-sync-pass' AND completed_keys->0->>'source_id'=$1`, [s.id]);
+  const [{ newest }] = await engine.executeRaw<{ newest: string }>('SELECT max(sequence)::text AS newest FROM persistence_requests');
+  const trendRows = () => engine.executeRaw<{ fingerprint: string; count: number }>(`SELECT fingerprint, (completed_keys->0->>'count')::int AS count FROM op_checkpoints WHERE op=$1 AND completed_keys->0->>'source_id'=$2`,
+    [FENCE_TREND_OP, s.id]);
+  const before = new Set((await trendRows()).map(row => row.fingerprint));
+  s.write('notes/fix-b.md', fixable('B'));
+  commit(s.root, 'another fixable file');
+  const original = engine.executeRaw;
+  const inPublication: string[] = [];
+  (engine as unknown as { executeRaw: typeof original }).executeRaw = function (this: typeof engine, sql: string, params?: unknown[]) {
+    if (sql.includes('AS fences') && (this as unknown as { _pageTransaction?: boolean })._pageTransaction === true) inPublication.push(String(params?.[2]));
+    return original.call(this, sql, params) as never;
+  } as typeof original;
+  let result: SyncResult;
+  try { result = await s.sync(); } finally { (engine as unknown as { executeRaw: typeof original }).executeRaw = original; }
+  expect(result).toMatchObject({ status: 'synced', fences_normalized: { count: 1 } });
+  // The stamp landed and its trend scan inside the 5 s publication started past everything committed before this sync.
+  expect(inPublication.length).toBeGreaterThan(0);
+  for (const after of inPublication) expect(BigInt(after)).toBeGreaterThanOrEqual(BigInt(newest));
+  const [pass] = await engine.executeRaw<{ hwm: string | null }>(`SELECT completed_keys->0->'obligations'->'converged'->>'request_hwm' AS hwm FROM op_checkpoints
+    WHERE op='managed-sync-pass' AND completed_keys->0->>'source_id'=$1`, [s.id]);
+  expect(pass!.hwm).not.toBeNull();
+  // The stamp recorded this pass's trend row in its own transaction, as before; its count was tallied mostly outside the publication.
+  const added = (await trendRows()).filter(row => !before.has(row.fingerprint));
+  expect(added).toHaveLength(1);
+  expect(added[0]!.count).toBeGreaterThanOrEqual(1);
+}), 180_000);
+

@@ -21,7 +21,7 @@ import { join } from 'node:path';
 import type { BrainEngine } from '../engine.ts';
 import type { TranscriptFormat } from './types.ts';
 import { harnessRoots, type HarnessRoot } from './detect.ts';
-import { isOpenclawCheckpointFile } from './openclaw.ts';
+import { isOpenclawArchivedFile, isOpenclawCheckpointFile, isOpenclawSkippedArtifact } from './openclaw.ts';
 import { isGrokChatHistoryFile } from './grok.ts';
 import { isClaudeCodeSubagentFile, isClaudeCodeWorkflowArtifactFile } from './claude-code.ts';
 import { isClaudeCliSelfTranscriptPath } from '../ai/providers/claude-cli-scratch.ts';
@@ -44,6 +44,12 @@ export interface DiscoverOpts {
    * escape hatch for deliberately auditing the provider's own calls.
    */
   includeSelf?: boolean;
+  /**
+   * GST-2768: also list OpenClaw's retained session files (`.jsonl.reset.*`, `.jsonl.deleted.*.zst`, `.jsonl.bak.*`).
+   * They share a session id with the live file, so only the conversation archive, which merges every file of one
+   * session, asks for them; ingest keeps one file per session.
+   */
+  includeArchived?: boolean;
 }
 
 /** Recursively list regular files under root (lstat: symlinks are skipped). */
@@ -85,8 +91,8 @@ export function discoverTranscriptFiles(roots?: HarnessRoot[], opts: DiscoverOpt
     const files: string[] = [];
     walk(root, files);
     for (const p of files) {
-      if (!p.endsWith(extension)) continue;
-      if (isOpenclawCheckpointFile(p)) continue;
+      if (!p.endsWith(extension) && !(opts.includeArchived && format === 'openclaw' && isOpenclawArchivedFile(p))) continue;
+      if (isOpenclawCheckpointFile(p) || (format === 'openclaw' && isOpenclawSkippedArtifact(p))) continue;
       // Grok: only chat_history.jsonl is a session; updates/events/rewind
       // JSONL next to it would otherwise inflate found-counts and freeze
       // the watermark as host-format drift. SCOPED to the grok root — a
@@ -126,10 +132,10 @@ export interface ImportedSessionIndex {
 
 /**
  * ONE frontmatter-only query — never a query per harness, and never
- * `SELECT p.*`: conversation pages carry bodies up to the split target
- * (~300KB per part by design), so a full-page walk at backfill scale
- * (thousands of sessions) would stream hundreds of MB just to read two
- * frontmatter keys. Both engines serve executeRaw.
+ * `SELECT p.*`: a conversation page holds a whole session (up to the page
+ * ceiling; sessions split before Wave B keep ~45KB parts), so a full-page
+ * walk at backfill scale (thousands of sessions) would stream hundreds of MB
+ * just to read two frontmatter keys. Both engines serve executeRaw.
  */
 export async function indexImportedSessions(
   engine: BrainEngine,
@@ -175,9 +181,9 @@ function sessionKey(raw: string): string {
 
 export interface TranscriptPageIndex {
   /**
-   * normalized session key → conversation page slugs. A session that split
-   * across parts renders one page per part, all stamped with the same
-   * session_id, so this is one-to-many by design.
+   * normalized session key → conversation page slugs. A session imported
+   * before Wave B may be split across parts, one page per part, all stamped
+   * with the same session_id, so this is one-to-many by design.
    */
   bySessionKey: Map<string, string[]>;
   pagesScanned: number;
@@ -187,7 +193,7 @@ export interface TranscriptPageIndex {
  * Reverse of `indexImportedSessions`: maps a session back to the conversation
  * PAGE(S) it was rendered into, so a caller holding only a transcript file
  * path can find the page to attribute it to. Same one-query, frontmatter-only
- * discipline — conversation bodies run to ~300KB per part and must not be
+ * discipline — a conversation body can hold a whole session and must not be
  * streamed to read two keys.
  */
 export async function indexTranscriptPages(

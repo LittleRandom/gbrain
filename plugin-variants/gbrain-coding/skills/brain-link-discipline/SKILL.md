@@ -106,10 +106,18 @@ https://<host>/<owner>/<repo>/blob/<branch>/<that-exact-path>
 ## Sequence (push BEFORE link)
 
 1. Write/edit the brain file.
-2. `git add <file> && git commit -m "..." && git push`
-3. **Verify the push landed** — the push output must show the ref update
-   (e.g. `abc123..def456  main -> main`). A hosted URL 404s until the push
-   completes.
+2. `scripts/brain-commit-push.sh "<msg>" <file>` (or
+   `gbrain git commit-push -m "<msg>" -- <file>` when the brain has no helper).
+   It commits only that file under the checkout's writer lock and pushes,
+   merging remote commits without touching other agents' files.
+3. **Verify the push landed** — the command must exit 0 and print
+   `pushed <sha> to origin/<branch>` (or `nothing to commit`; a
+   `[gbrain notice]` that the checkout lags is still a landed push). A hosted
+   URL 404s until the push completes. On a non-zero exit, output no link:
+   retry once on `commit_lock_busy`; stop and tell the user on
+   `integrate_conflict` or `writer_coordinator_required`; never fall back to
+   stash, `pull --rebase` or a plain push
+   ([outcomes](https://github.com/garrytan/gbrain/blob/master/docs/guides/shared-checkout-git.md#outcomes)).
 4. **In the SAME message that reports the commit, output the link** — as a
    clickable markdown link or bare URL, never a backticked code span.
 
@@ -220,7 +228,7 @@ No hosted remote (fallback steps 2–3):
 
 ## When it fails
 
-Follow the [agent operator protocol](../../docs/protocol/AGENT_OPERATOR_v1.md) for any gbrain error `code`, exit code, `[AGENT]` block or notice block. Specific to this skill:
+Follow the [agent operator protocol](../conventions/agent-operator-protocol.md) for any gbrain error `code`, exit code, `[AGENT]` block or notice block. Specific to this skill:
 
 - A brain-page link would 404 because the page is uncommitted or unsynced: say the link is not live yet and give the repo-relative path; do not invent a hosted URL.
 - `get_page` / `gbrain get` returns `page_not_found` for the slug you meant to link: resolve the real slug (search by title) before linking; never ship a guessed slug.
@@ -233,7 +241,7 @@ Follow the [agent operator protocol](../../docs/protocol/AGENT_OPERATOR_v1.md) f
   instead of a link or repo-relative fallback.
 - ❌ Committing, then waiting for the user to ask for the link.
 - ❌ Relaying a subagent result containing local brain paths verbatim.
-- ❌ Outputting hosted URLs BEFORE `git push` has landed (they 404 until the
+- ❌ Outputting hosted URLs BEFORE the push has landed (they 404 until the
   push completes — push first, verify the ref moved, then link).
 - ❌ Presenting `gbrain publish` output as a URL. It emits a local HTML file
   path; offer it as an attachable artifact.

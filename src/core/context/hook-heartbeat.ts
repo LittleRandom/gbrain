@@ -11,7 +11,7 @@
  * allowlist is enforced by construction, not by trust. Never throws.
  */
 
-import { spawn } from 'node:child_process';
+import { spawn } from '../spawn.ts';
 import { createHash } from 'node:crypto';
 import { accessSync, appendFileSync, chmodSync, closeSync, constants, existsSync, mkdirSync, openSync, readFileSync, readSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
@@ -19,6 +19,9 @@ import { delimiter, join } from 'node:path';
 import type { ToolCallRecord } from '../transcripts/claude-code-jsonl.ts';
 import { ensureGbrainHome, resolveGbrainHome } from '../gbrain-home.ts';
 import { seatReasonHint } from './seat.ts';
+
+/** #6316: the OpenClaw context engine's per-compaction checkpoint event. */
+export const OPENCLAW_COMPACT_EVENT = 'openclaw-compact';
 
 /** Heartbeat file line cap [S3#7]. */
 export const HEARTBEAT_MAX_LINES = 5000;
@@ -166,11 +169,15 @@ export async function writeHeartbeat(
       ...(entry.segment !== undefined ? { segment: entry.segment } : {}),
       ...(entry.inserted !== undefined ? { inserted: entry.inserted } : {}),
       ...(entry.duplicate !== undefined ? { duplicate: entry.duplicate } : {}),
+      ...(entry.superseded !== undefined ? { superseded: entry.superseded } : {}),
       ...(entry.near_duplicate !== undefined ? { near_duplicate: entry.near_duplicate } : {}),
       ...(entry.links !== undefined ? { links: entry.links } : {}),
       ...(entry.flush !== undefined ? { flush: entry.flush } : {}),
       ...(entry.pattern !== undefined ? { pattern: entry.pattern } : {}),
       ...(entry.fingerprint !== undefined ? { fingerprint: entry.fingerprint } : {}),
+      ...(entry.core_chars !== undefined ? { core_chars: entry.core_chars } : {}),
+      ...(entry.core_revision !== undefined ? { core_revision: entry.core_revision } : {}),
+      ...(entry.pressure_pct !== undefined ? { pressure_pct: entry.pressure_pct } : {}),
       // A seat reason carries its fixed recovery hint even when the writer did not attach one.
       ...((entry.hint ?? seatReasonHint(entry.reason)) !== undefined ? { hint: entry.hint ?? seatReasonHint(entry.reason) } : {}),
     });

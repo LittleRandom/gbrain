@@ -150,6 +150,7 @@ function fakeTailnet(o: TailnetOpts = {}): Fake {
     platform: 'linux', env: { HOME: home, USER: 'alice-example', PATH: '/usr/bin' }, home, user: 'alice-example', uid: 1000,
     serveDir, gbrainEnvFile: join(home, '.gbrain', 'env'), plistPath: join(home, 'LaunchAgents', 'com.gbrain.serve.plist'), unitPath: join(home, '.config', 'systemd', 'user', 'gbrain-serve.service'),
     loadConfig: () => ({ engine: 'pglite', database_path: join(home, 'brain.pglite') } as never), executionEnv: 'local', run,
+    mutedNotices: () => new Set(),
     which: (n) => (n === 'tailscale' ? TS : n === 'systemctl' ? '/usr/bin/systemctl' : n === 'gbrain' ? '/usr/local/bin/gbrain' : null),
     fileExists: hermeticExists(home, (p) => p === ts),
     fetch: async (url) => {
@@ -592,7 +593,8 @@ describe('happy path: linux-systemd', () => {
     // wrapper + unit shape
     const wrapper = readFileSync(wrapperPath(f.serveDir), 'utf-8');
     expect(wrapper).toContain(`GBRAIN_ADMIN_BOOTSTRAP_TOKEN="$(cat '${adminTokenPath(f.serveDir)}')"`);
-    expect(wrapper).toContain(`serve --http --port 3131 --public-url https://${DNS} --surface full`);
+    expect(wrapper).toContain(`serve --http --port 3131 --public-url https://${DNS} --surface full --advertise verbs`);
+    expect(receipt.advertise).toBe('verbs');
     expect(wrapper).not.toContain('export GBRAIN_HOME');
     expect(readFileSync(f.deps.unitPath!, 'utf-8')).toContain(`ExecStart=${wrapperPath(f.serveDir)}`);
     // exec ledger: enable + restart (a reinstall relaunches the regenerated wrapper), never enable --now
@@ -656,6 +658,7 @@ describe('happy path: linux-systemd', () => {
     expect(joinedCalls(f)).toContain(`${TS} funnel --bg 4000`);
     const receipt = readExposeReceipt(receiptPath(f.serveDir))!;
     expect(receipt).toMatchObject({ mode: 'funnel', port: 4000, surface: 'verbs', enable_dcr: true });
+    expect(receipt.advertise).toBeUndefined();
     const wrapper = readFileSync(wrapperPath(f.serveDir), 'utf-8');
     expect(wrapper).toContain(`export GBRAIN_HOME='${join(f.home, 'custom')}'`);
     expect(wrapper).toContain('--port 4000 --public-url https://your-machine.your-tailnet.ts.net --surface verbs --enable-dcr');
@@ -694,6 +697,65 @@ describe('happy path: linux-systemd', () => {
     expect(second.created_at).toBe(first.created_at);
     expect(second.updated_at).toBe('2026-06-02T00:00:00.000Z');
     expect(checkOf(jsonDoc(f), 'admin_token')?.detail).toContain('reused');
+  });
+
+  test('an exposure from before the verbs listing default keeps listing everything when re-run; --surface full lists everything', async () => {
+    const f = fakeTailnet();
+    expect(await runMcpExpose(['--yes'], f.deps)).toBe(0);
+    const { advertise: _dropped, ...older } = readExposeReceipt(receiptPath(f.serveDir))!;
+    writeExposeReceipt(receiptPath(f.serveDir), older);
+    expect(await runMcpExpose(['--yes'], f.deps)).toBe(0);
+    expect(readExposeReceipt(receiptPath(f.serveDir))!.advertise).toBeUndefined();
+    expect(readFileSync(wrapperPath(f.serveDir), 'utf-8')).not.toContain('--advertise');
+
+    const g = fakeTailnet();
+    expect(await runMcpExpose(['--yes', '--surface', 'full'], g.deps)).toBe(0);
+    expect(readExposeReceipt(receiptPath(g.serveDir))!.advertise).toBeUndefined();
+    expect(readFileSync(wrapperPath(g.serveDir), 'utf-8')).toContain(`--public-url https://${DNS} --surface full\n`);
+  });
+});
+
+describe('hosted_option', () => {
+  const hostedOf = (doc: { notices?: { code: string; user_message?: string }[] }) => doc.notices?.find(n => n.code === 'hosted_option');
+  test('the run that writes the first receipt carries it; consent-pending, --dry-run, re-publish, --status and --remove do not', async () => {
+    const f = fakeTailnet();
+    expect(await runMcpExpose(['--dry-run', '--json'], f.deps)).toBe(0);
+    expect(hostedOf(jsonDoc(f))).toBeUndefined();
+    f.stdout.length = 0;
+    expect(await runMcpExpose(['--json'], f.deps)).toBe(2);
+    const pending = jsonDoc(f);
+    expect(pending.reason).toBe('confirmation_required');
+    expect(hostedOf(pending)).toBeUndefined();
+    expect(pending.user_message).not.toContain('gbrain.io');
+    f.stdout.length = 0;
+    expect(await runMcpExpose(['--yes', '--json'], f.deps)).toBe(0);
+    const first = jsonDoc(f);
+    expect(first.status).toBe('exposed');
+    expect(hostedOf(first)).toMatchObject({ kind: 'coaching', contract_version: 1 });
+    expect(hostedOf(first)?.user_message).toContain('https://gbrain.io/?ref=cli-mcp-expose');
+    for (const args of [['--yes', '--json'], ['--status', '--json'], ['--remove', '--yes', '--json']]) {
+      f.stdout.length = 0;
+      await runMcpExpose(args, f.deps);
+      expect(hostedOf(jsonDoc(f))).toBeUndefined();
+    }
+  });
+  test('friction exits carry it every time; human output prints the one line', async () => {
+    const f = fakeTailnet();
+    f.deps.which = (n) => (n === 'systemctl' ? '/usr/bin/systemctl' : null);
+    f.deps.fileExists = () => false;
+    expect(await runMcpExpose(['--yes', '--no-install', '--json'], f.deps)).toBe(1);
+    const doc = jsonDoc(f);
+    expect(doc.reason).toBe('tailscale_missing');
+    expect(hostedOf(doc)?.user_message).toContain('?ref=cli-mcp-expose-friction');
+    const login = fakeTailnet({ backendState: 'NeedsLogin', afterUp: 'NeedsLogin' });
+    expect(await runMcpExpose(['--yes'], login.deps)).toBe(2);
+    expect(login.stdout.join('\n')).toContain('Hosted option: gbrain.io runs GBrain for you, nothing to keep online: https://gbrain.io/?ref=cli-mcp-expose-friction  (hide: gbrain notices mute hosted_option)');
+  });
+  test('a muted owner sees nothing', async () => {
+    const f = fakeTailnet();
+    f.deps.mutedNotices = () => new Set(['hosted_option']);
+    expect(await runMcpExpose(['--yes', '--json'], f.deps)).toBe(0);
+    expect(jsonDoc(f).notices).toBeUndefined();
   });
 });
 
@@ -1323,6 +1385,69 @@ describe('--status edges', () => {
     g.stdout.length = 0;
     expect(await runMcpExpose(['--status', '--json'], g.deps)).toBe(1);
     expect(checkOf(jsonDoc(g), 'tailscale.publish')).toMatchObject({ status: 'fail', detail: 'tailscale binary not found' });
+  });
+});
+
+describe('one-click client links', () => {
+  const MCP = `https://${DNS}/mcp`;
+  const CLAUDE_LINE = `  Claude           https://claude.ai/customize/connectors?modal=add-custom-connector&connectorName=GBrain&connectorUrl=${encodeURIComponent(MCP)}`;
+  const CURSOR_LINK = `cursor://anysphere.cursor-deeplink/mcp/install?name=gbrain&config=${encodeURIComponent(Buffer.from(JSON.stringify({ url: MCP })).toString('base64'))}`;
+  const CLAUDE_LINK = CLAUDE_LINE.trim().slice('Claude'.length).trim();
+  test('a Funnel publish prints the Claude and Cursor lines in the Next block', async () => {
+    const f = fakeTailnet();
+    expect(await runMcpExpose(['--yes', '--funnel'], f.deps)).toBe(0);
+    const out = f.stdout.join('\n');
+    const next = out.slice(out.indexOf('Next — choose the connection method'));
+    expect(next).toContain(CLAUDE_LINE);
+    expect(next).toContain(`  Cursor           ${CURSOR_LINK}`);
+    expect(next).not.toContain('must be on your tailnet');
+    expect(out).not.toContain(TOKEN);
+  });
+  test('a tailnet-only publish prints the Cursor line only, with the tailnet note', async () => {
+    const f = fakeTailnet();
+    expect(await runMcpExpose(['--yes'], f.deps)).toBe(0);
+    const out = f.stdout.join('\n');
+    expect(out).toContain(`  Cursor           ${CURSOR_LINK}`);
+    expect(out).toContain('the Cursor machine must be on your tailnet');
+    expect(out).not.toContain('claude.ai/customize');
+  });
+  test('--json carries install_links (Claude only with Funnel), and --status --json repeats them', async () => {
+    const f = fakeTailnet();
+    expect(await runMcpExpose(['--yes', '--funnel', '--json'], f.deps)).toBe(0);
+    expect(jsonDoc(f).install_links).toEqual({ claude: CLAUDE_LINK, cursor: CURSOR_LINK });
+    f.stdout.length = 0;
+    expect(await runMcpExpose(['--status', '--json'], f.deps)).toBe(0);
+    expect(jsonDoc(f).install_links).toEqual({ claude: CLAUDE_LINK, cursor: CURSOR_LINK });
+    const g = fakeTailnet();
+    expect(await runMcpExpose(['--yes', '--json'], g.deps)).toBe(0);
+    expect(jsonDoc(g).install_links).toEqual({ cursor: CURSOR_LINK });
+    g.stdout.length = 0;
+    expect(await runMcpExpose(['--status', '--json'], g.deps)).toBe(0);
+    expect(jsonDoc(g).install_links).toEqual({ cursor: CURSOR_LINK });
+  });
+  test('human --status prints the link lines when everything verifies', async () => {
+    const f = fakeTailnet();
+    expect(await runMcpExpose(['--yes', '--funnel'], f.deps)).toBe(0);
+    f.stdout.length = 0;
+    expect(await runMcpExpose(['--status'], f.deps)).toBe(0);
+    const out = f.stdout.join('\n');
+    expect(out).toContain(CLAUDE_LINE);
+    expect(out).toContain(`  Cursor           ${CURSOR_LINK}`);
+  });
+  test('a non-https receipt URL (--no-tailscale) prints no link lines and no install_links key', async () => {
+    const f = fakeTailnet();
+    expect(await runMcpExpose(['--yes', '--no-tailscale'], f.deps)).toBe(0);
+    expect(f.stdout.join('\n')).not.toMatch(/cursor:\/\/|claude\.ai|^ {2}(Claude|Cursor) /m);
+    f.stdout.length = 0;
+    expect(await runMcpExpose(['--status'], f.deps)).toBe(0);
+    expect(f.stdout.join('\n')).not.toMatch(/cursor:\/\/|claude\.ai/);
+    const g = fakeTailnet();
+    expect(await runMcpExpose(['--yes', '--no-tailscale', '--json'], g.deps)).toBe(0);
+    expect(jsonDoc(g).receipt.mcp_url).toBe('http://127.0.0.1:3131/mcp');
+    expect('install_links' in jsonDoc(g)).toBe(false);
+    g.stdout.length = 0;
+    expect(await runMcpExpose(['--status', '--json'], g.deps)).toBe(0);
+    expect('install_links' in jsonDoc(g)).toBe(false);
   });
 });
 

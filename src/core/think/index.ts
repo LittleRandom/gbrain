@@ -21,23 +21,30 @@ import type Anthropic from '@anthropic-ai/sdk';
 import { OperationTimeoutError, withTimeout } from '../timeout.ts';
 import type { BrainEngine, SynthesisEvidenceInput } from '../engine.ts';
 import type { SearchResult } from '../types.ts';
-import { runGather, renderPagesBlock, pagesBlockExcerptLen, takesHitToTakeForPrompt, selectRelevantExcerpt } from './gather.ts';
+import { runGather, renderPagesBlockDetailed, pagesBlockExcerptLen, takesHitToTakeForPrompt, selectRelevantExcerpt } from './gather.ts';
+import { readThinkPagesBudget } from './pages-budget.ts';
+import { dropHeldFenceRows, stampPageTrust, stampRowTrust } from '../eligibility/stamp.ts';
+import { fenceTranscriptText, neutralizeToolCalls, quoteLabel } from '../search/transcript-quote.ts';
 import { renderTakesBlock } from './sanitize.ts';
 import { buildThinkSystemPrompt, buildThinkUserMessage } from './prompt.ts';
 import { resolveCitations, type ParsedCitation } from './cite-render.ts';
 import { resolveOwnerHolder } from '../owner-holder.ts';
 import { resolveModel } from '../model-config.ts';
 import { chat as gatewayChat, probeChatModel, isThinkingModel, type ChatResult } from '../ai/gateway.ts';
+import { withDefaultChatPhase } from '../ai/chat-usage.ts';
 import { AIConfigError } from '../ai/errors.ts';
 import { normalizeModelId } from '../model-id.ts';
 import { hasAnthropicKey } from '../ai/anthropic-key.ts';
-import { parseTemporalWindow } from './temporal-window.ts';
+import { resolveThinkWindow, trajectoryPointsInWindow } from './temporal-window.ts';
 import { resolveThinkTemporalContext } from './temporal-context.ts';
-import { resolveExcludePrivatePages } from '../search/private-visibility.ts';
+import { ownerWidened, resolveExcludePrivatePages, worldOnlyFacts } from '../search/private-visibility.ts';
 import { deliverEvidence, effectivePlan, resolveEvidencePlan, EVIDENCE_BLOCK_CHAR_CAP, THINK_RETURN_UNIT_CONFIG_KEY, type DeliveryMeta } from '../search/evidence-delivery.ts';
+import { evidenceTitlesEnabled } from '../search/evidence-date.ts';
 import { startThinkDecide, thinkAbstainResult, type ThinkAbstention } from './decide.ts';
 import { classifyIntent } from './intent.ts';
-import { maintenanceTransaction } from '../persistence/attribution.ts';
+import { deriveTrust, type TaintRef } from '../trust/taint.ts';
+import { withGuestAnswer, type GuestStamp } from '../guests/marker.ts';
+import { publishSinglePage, THINK_SYNTHESIS_KIND } from '../generations/adapters/single-page.ts';
 
 /** Anthropic Messages client interface — same shape used by subagent.ts so test stubs can be shared. */
 export interface ThinkLLMClient {
@@ -217,8 +224,24 @@ export interface ThinkResult {
   usage?: { input_tokens: number; output_tokens: number } | null;
   /** Evidence delivery meta, present only when think.return_unit is not chunk. */
   evidence_delivery?: import('../search/evidence-delivery.ts').DeliveryMeta;
+  /**
+   * #5461: true when at least one gathered page reached the model in part (an
+   * excerpt cut by the pages budget / excerpt ceiling, or a delivered block
+   * over its cap). The budget is configurable (`think.pages_budget_chars`,
+   * `think.excerpt_ceiling_chars`) and soft; see think/pages-budget.ts.
+   */
+  evidence_truncated?: boolean;
+  /** GBRA-504: the outside-guest notes that reached the prompt; `answer` then ends with the fixed guest line gbrain appends. */
+  guest_evidence?: Array<{ source_id: string; slug: string; guest: GuestStamp }>;
   /** Gathered pages with the revision retrieved, for retrieval-feedback recording; the op layer strips it. */
   feedback_evidence?: Array<{ source_id: string; slug: string; content_hash: string | null }>;
+  /** #5575 I2: every page, take and trajectory fact placed in the synthesis prompt; `persistSynthesis` taints from them. The op layer strips it. */
+  taint_refs?: TaintRef[];
+  /**
+   * GBRA-498: what reaches the prompt beyond taint_refs, for room marks only: the anchor and the graph pages the prompt
+   * names, and a calibration profile (no page or fact id, so the answer is unknown). Never feeds trust derivation.
+   */
+  room_extra?: Array<{ table: 'pages'; sourceId: string; slug: string } | { table: 'calibration'; id: number }>;
   /** Only set when --save was true and the caller persisted a synthesis page. */
   savedSlug?: string;
   /**
@@ -232,6 +255,8 @@ export interface ThinkResult {
   unverified_quotes?: Array<{ text: string; reason: string }>;
   /** What `persistSynthesis` saves: the raw answer with every claim unit carrying an unverified quote removed, and those units. */
   persist?: { answer: string; unverified_claims: Array<{ text: string; reason: string; detail: string }> };
+  /** The synthesis page as the run found it before gathering (GBRA-161 PR 5): `persistSynthesis` binds its write to this revision. */
+  persist_base?: { sourceId: string; slug: string; revision: string | null };
   /** Diagnostics for `--explain` callers (CLI surface for v0.29). */
   diagnostics: {
     pagesFromHybrid: number;
@@ -245,6 +270,12 @@ export interface ThinkResult {
   abstained?: ThinkAbstention;
   /** The date frame the synthesis read in (reference date + brain timezone). */
   temporal?: { reference_date: string; time_zone: string };
+  /** #6997: set only when a `chat_fallback_chain` model answered: the model asked first (`modelUsed` names the one that answered, which is priced and saved). */
+  requested_model?: string;
+  /** #6997: with `requested_model`, why it did not answer ("failed (...)" / "refused (...)"). Not returned to HTTP MCP callers. */
+  fallback_reason?: string;
+  /** PR #5086: who bounded the evidence, when a window applied: the caller's `since`/`until`, or the one explicit date the question named (`WINDOW_FROM_QUESTION` warning). */
+  window_source?: 'caller' | 'question';
 }
 
 const DEFAULT_MAX_OUTPUT_TOKENS = 4000;
@@ -262,11 +293,14 @@ const THINKING_DEFAULT_MAX_OUTPUT_TOKENS = 16000;
 // OpenAI reasoning models spend output budget on internal reasoning tokens
 // the same way — reasoning tokens are billed as output and count against
 // `max_tokens` — so they get the same headroom. Deliberately scoped to the
-// gpt-5 family and the numbered o-series only; anything else (gpt-4o, the
-// non-reasoning `*-chat` snapshots like gpt-5-chat-latest, other providers'
-// reasoning models routed through their own recipes) keeps the conservative
-// 4000 default.
-const OPENAI_REASONING_MODEL_RE = /^openai[:/](?:gpt-5|o[0-9]+)(?:[.-]|$)/i;
+// gpt-5-and-later families and the numbered o-series only; anything else
+// (gpt-4o, the non-reasoning `*-chat` snapshots like gpt-5-chat-latest, other
+// providers' reasoning models routed through their own recipes) keeps the
+// conservative 4000 default. #7421: matched behind any provider-prefix chain
+// (`openai:`, `litellm:`, `openrouter:openai/`), like the Claude regexes,
+// because the proxy route does not change how the model bills reasoning; an
+// opaque proxy alias (`litellm:my-reasoner`) still cannot be recognized.
+const OPENAI_REASONING_MODEL_RE = /[:/](?:gpt-[5-9]|o[0-9]+)(?:[.-]|$)/i;
 const OPENAI_CHAT_SNAPSHOT_RE = /-chat(?:-|$)/i; // gpt-5-chat-latest, gpt-5.2-chat-latest
 // #4375: the default deep tier (anthropic:claude-opus-4-7) routinely needs
 // more than 4000 tokens for the synthesis JSON envelope; at 4000 the envelope
@@ -432,10 +466,13 @@ export interface ExtractiveFallback {
  * title + the excerpt window with the strongest query-term coverage, cited
  * `[slug]`. NEVER fabricates: every line quotes ONE gathered page and an
  * empty gather returns null (ENG-19 — no pages, no answer, ever).
+ * GST-687: with `untrusted` (a remote caller), a chat page's excerpt is chosen with its tool-call blocks summarized, and it
+ * and a page below the owner's tier are fenced as quoted source material, as think's prompt does (#8042); local is unchanged.
  */
 export function composeExtractiveFallback(
   pages: SearchResult[],
   question: string,
+  untrusted = false,
 ): ExtractiveFallback | null {
   if (pages.length === 0) return null;
   const top = pages.slice(0, EXTRACTIVE_TOP_PAGES);
@@ -447,12 +484,15 @@ export function composeExtractiveFallback(
     const slug = String(page.slug ?? '');
     const title = String(page.title ?? '') || slug;
     const slugIdentity = slug.split('/').pop()?.replace(/[-_]/g, ' ') ?? '';
-    const content = String(page.chunk_text ?? page.compiled_truth ?? page.snippet ?? '');
+    const raw = String(page.chunk_text ?? page.compiled_truth ?? page.snippet ?? '');
+    const quote = untrusted ? quoteLabel({ ...p, chunk_text: raw }, true) : null;
+    const content = quote !== null && quoteLabel({ ...p, chunk_text: raw }) !== null ? neutralizeToolCalls(raw) : raw;
     const excerpt = selectRelevantExcerpt(
       content, question, EXTRACTIVE_EXCERPT_LEN, `${title} ${slugIdentity}`,
     ).trim();
-    citations.push({ page_slug: slug, row_num: null, citation_index: idx + 1 });
-    return excerpt ? `- ${title} [${slug}]: ${excerpt}` : `- ${title} [${slug}]`;
+    citations.push({ page_slug: slug, row_num: null, citation_index: idx + 1, source_id: p.source_id ?? 'default' });
+    if (!excerpt) return `- ${title} [${slug}]`;
+    return quote === null ? `- ${title} [${slug}]: ${excerpt}` : `- ${title} [${slug}]:\n${fenceTranscriptText(excerpt, quote)}`;
   });
   return {
     answer:
@@ -523,23 +563,40 @@ async function persistCitations(
  * the renderer passes through whole instead of cutting its own excerpts;
  * auto's unchanged chunks keep the usual excerpts.
  */
-async function renderThinkPages(engine: BrainEngine, opts: RunThinkOpts, pages: SearchResult[], timeZone: string): Promise<{ pagesBlock: string; evidenceDelivery?: DeliveryMeta }> {
-  const plan = await resolveEvidencePlan(engine, {
-    remote: opts.remote, returnUnit: undefined, returnWindow: undefined, budget: undefined,
-    snippetChars: undefined, snippetCap: 0, configKey: THINK_RETURN_UNIT_CONFIG_KEY, op: 'think',
-  });
+/** #5461: source-qualify each citation from the gather (the highest-ranked gathered page with that slug; null outside the gather). */
+function stampCitationSources(citations: ParsedCitation[], pages: SearchResult[]): void {
+  const sourceOfSlug = new Map<string, string>();
+  for (const pg of pages) if (!sourceOfSlug.has(pg.slug)) sourceOfSlug.set(pg.slug, pg.source_id ?? 'default');
+  for (const c of citations) c.source_id = sourceOfSlug.get(c.page_slug) ?? null;
+}
+
+async function renderThinkPages(engine: BrainEngine, opts: RunThinkOpts, pages: SearchResult[], timeZone: string, warnings: string[]): Promise<{ pagesBlock: string; evidenceTruncated: boolean; evidenceDelivery?: DeliveryMeta }> {
+  const [plan, budget, titles] = await Promise.all([
+    resolveEvidencePlan(engine, {
+      remote: opts.remote, returnUnit: undefined, returnWindow: undefined, budget: undefined,
+      snippetChars: undefined, snippetCap: 0, configKey: THINK_RETURN_UNIT_CONFIG_KEY, op: 'think',
+    }),
+    readThinkPagesBudget(engine, warnings), // #5461
+    evidenceTitlesEnabled(engine), // GBRA-205
+  ]);
+  const excerptLen = pagesBlockExcerptLen(pages.length, undefined, budget);
   const applied = effectivePlan(plan, pages);
-  if (!applied) return { pagesBlock: renderPagesBlock(pages, pagesBlockExcerptLen(pages.length), opts.question, { timeZone }) };
+  if (!applied) {
+    const rendered = renderPagesBlockDetailed(pages, excerptLen, opts.question, { timeZone, titles });
+    return { pagesBlock: rendered.text, evidenceTruncated: rendered.truncated };
+  }
   const delivered = await deliverEvidence(engine, pages, applied, {
     ...(opts.allowedSources !== undefined && opts.allowedSources.length > 0 ? { sourceIds: opts.allowedSources } : opts.sourceId !== undefined ? { sourceId: opts.sourceId } : {}),
     excludePrivate: opts.excludePrivate ?? await resolveExcludePrivatePages(engine, opts.remote),
     requireSafeChunks: opts.remote !== false,
   });
-  const pagesBlock = applied.unit === 'auto'
-    ? renderPagesBlock(delivered.results, pagesBlockExcerptLen(pages.length), opts.question,
-      { verbatim: r => r.delivered?.reason !== 'not_conversation' && r.delivered?.reason !== 'conversation_over_budget', verbatimLen: EVIDENCE_BLOCK_CHAR_CAP, timeZone })
-    : renderPagesBlock(delivered.results, EVIDENCE_BLOCK_CHAR_CAP, opts.question, { verbatim: true, timeZone });
-  return { pagesBlock, evidenceDelivery: delivered.delivery };
+  // GST-2900: delivery re-reads page text from the database, so the held fence rows are dropped again (GST-2891).
+  const results = worldOnlyFacts(opts.remote) ? await dropHeldFenceRows(engine, delivered.results) : delivered.results;
+  const rendered = applied.unit === 'auto'
+    ? renderPagesBlockDetailed(results, excerptLen, opts.question,
+      { verbatim: r => r.delivered?.reason !== 'not_conversation' && r.delivered?.reason !== 'conversation_over_budget', verbatimLen: EVIDENCE_BLOCK_CHAR_CAP, timeZone, titles })
+    : renderPagesBlockDetailed(results, EVIDENCE_BLOCK_CHAR_CAP, opts.question, { verbatim: true, timeZone, titles });
+  return { pagesBlock: rendered.text, evidenceTruncated: rendered.truncated, evidenceDelivery: delivered.delivery };
 }
 
 /**
@@ -573,7 +630,11 @@ export async function runThink(
 ): Promise<ThinkResult> {
   const rounds = Math.max(1, opts.rounds ?? 1);
   const warnings: string[] = [];
-  const window = parseTemporalWindow(opts.since, opts.until);
+  // PR #5086: caller bounds are authoritative; with none, the one explicit date the question names bounds the synthesis.
+  const resolvedWindow = resolveThinkWindow(opts.question, opts.since, opts.until);
+  const window = resolvedWindow?.window ?? null;
+  if (resolvedWindow?.source === 'question') warnings.push('WINDOW_FROM_QUESTION');
+  const windowMeta = resolvedWindow ? { window_source: resolvedWindow.source } : {};
   const temporal = await resolveThinkTemporalContext(engine, { referenceDate: opts.referenceDate });
 
   // Resolve the model through the 6-tier chain.
@@ -599,6 +660,10 @@ export async function runThink(
     }
   }
 
+  const persistSlug = synthesisSlug(opts.question, new Date().toISOString().slice(0, 10));
+  const persistBase = { sourceId: opts.sourceId ?? 'default', slug: persistSlug,
+    revision: (await engine.readPageSnapshot(persistSlug, { sourceId: opts.sourceId ?? 'default', includeDeleted: true }))?.revision ?? null };
+
   // Optional question embedding — caller decides whether to pay the embedder; an opted-out brain never does.
   const questionEmbedding = await embedThinkQuestion(engine, opts, warnings);
 
@@ -609,7 +674,7 @@ export async function runThink(
     anchor: opts.anchor,
     questionEmbedding,
     ...(window ? { window } : {}),
-    takesHoldersAllowList: opts.remote === false ? opts.takesHoldersAllowList : opts.takesHoldersAllowList ?? ['world'],
+    takesHoldersAllowList: opts.remote === false ? opts.takesHoldersAllowList : opts.takesHoldersAllowList ?? (ownerWidened() ? undefined : ['world']),
     excludePrivate: opts.excludePrivate ?? await resolveExcludePrivatePages(engine, opts.remote),
     remote: opts.remote,
     ...(opts.sourceId !== undefined ? { sourceId: opts.sourceId } : {}),
@@ -621,12 +686,15 @@ export async function runThink(
   // legitimately-empty one for MCP/remote callers.
   for (const w of gather.warnings) warnings.push(w);
   if (gather.diagnostics.window?.dropped) warnings.push(`WINDOW_EXCLUDED_${gather.diagnostics.window.dropped}_PAGES`);
+  // #5575 A6: every page and take reaches the prompt with its trust tier; GST-2900 drops held fence rows for world-only callers.
+  gather.pages = await stampPageTrust(engine, gather.pages, undefined, undefined, worldOnlyFacts(opts.remote));
+  gather.takes = await stampRowTrust(engine, 'takes', gather.takes, t => ('take_id' in t ? t.take_id : (t as { id: number }).id));
 
   // Render evidence blocks for the prompt. #4510: the per-page excerpt is
   // budget-aware — 600 chars is the FLOOR (a big gather never collapses each
   // page below it) and a small gather spreads the block budget into much
   // larger, often complete, per-page windows.
-  const { pagesBlock, evidenceDelivery } = await renderThinkPages(engine, opts, gather.pages, temporal.timeZone);
+  const { pagesBlock, evidenceTruncated, evidenceDelivery } = await renderThinkPages(engine, opts, gather.pages, temporal.timeZone, warnings);
   const takesForPrompt = gather.takes.map(takesHitToTakeForPrompt);
   const { rendered: takesBlock, sanitizedCount } = renderTakesBlock(takesForPrompt);
   if (sanitizedCount > 0) {
@@ -673,6 +741,7 @@ export async function runThink(
   // is the kill switch. `withTrajectory: false` caller opt also bypasses.
   // `other` intent short-circuits before any SQL fires.
   let trajectoryBlock = '';
+  const trajectoryFactIds: number[] = [];
   let trajectoryPointsCount = 0;
   let trajectoryExcludedCount = 0;
   const trajectoryEnabledConfig = await readThinkTrajectoryEnabled(engine);
@@ -681,12 +750,13 @@ export async function runThink(
       const trajIntent = thinkDecide ? await thinkDecide.trajectoryIntent(classifyIntent(opts.question)) : classifyIntent(opts.question);
       if (trajIntent === 'temporal' || trajIntent === 'knowledge_update') {
         const { extractCandidateEntities } = await import('./entity-extract.ts');
-        const retrievedSlugs = gather.pages.map(p => p.slug);
+        const retrievedSlugs = [...gather.pages.map(p => p.slug), ...gather.outsideWindowSlugs];
         const candidates = extractCandidateEntities(opts.question, retrievedSlugs);
         if (candidates.length > 0) {
           const { resolveEntitySlugWithSource } = await import('../entities/resolve.ts');
           const { formatTrajectoryBlock } = await import('../trajectory-format.ts');
           const sourceIdScalar = opts.sourceId ?? 'default';
+          const excludePrivate = opts.excludePrivate ?? await resolveExcludePrivatePages(engine, opts.remote);
           // Per-candidate trajectory fetch. Concurrency cap = 3; each call
           // has its own 5s timeout via Promise.race. allSettled prevents
           // one error from killing the others (Codex Problem 13: timeout
@@ -711,7 +781,8 @@ export async function runThink(
                     entitySlug: resolved.slug,
                     ...(opts.sourceId !== undefined ? { sourceId: opts.sourceId } : {}),
                     ...(opts.allowedSources !== undefined ? { sourceIds: opts.allowedSources } : {}),
-                    ...(opts.remote !== undefined ? { remote: opts.remote } : {}),
+                    ...(opts.remote !== undefined ? { remote: worldOnlyFacts(opts.remote) } : {}),
+                    excludePrivate,
                     kind: 'all',
                     limit: 100,
                   }),
@@ -721,14 +792,11 @@ export async function runThink(
                   if (err instanceof OperationTimeoutError) return [];
                   throw err;
                 });
-                const boundedPoints = window ? points.filter(point => {
-                  const ms = point.valid_from.getTime();
-                  const outside = (window.startMs !== null && ms < window.startMs)
-                    || (window.endMs !== null && ms > window.endMs);
-                  if (outside) trajectoryExcludedCount++;
-                  return !outside;
-                }) : points;
+                const windowed = window ? trajectoryPointsInWindow(points, window) : { kept: points, excluded: 0 };
+                trajectoryExcludedCount += windowed.excluded;
+                const boundedPoints = windowed.kept;
                 if (boundedPoints.length === 0) return null;
+                trajectoryFactIds.push(...boundedPoints.map(point => point.fact_id));
                 const fmt = formatTrajectoryBlock(boundedPoints, resolved.slug, {
                   intent: trajIntent,
                 });
@@ -768,8 +836,8 @@ export async function runThink(
   const systemPrompt = buildThinkSystemPrompt({
     currentDate: true, intent, willSave: opts.save, withCalibration: !!calibrationBlockOpts,
     ...(opts.anchor !== undefined ? { anchor: opts.anchor } : {}),
-    ...(opts.since !== undefined ? { since: opts.since } : {}),
-    ...(opts.until !== undefined ? { until: opts.until } : {}),
+    ...(resolvedWindow?.since !== undefined ? { since: resolvedWindow.since } : {}),
+    ...(resolvedWindow?.until !== undefined ? { until: resolvedWindow.until } : {}),
   });
   const userMessage = buildThinkUserMessage({
     question: opts.question, pagesBlock, takesBlock, currentDate: `${temporal.referenceDate} (${temporal.timeZone})`,
@@ -790,6 +858,7 @@ export async function runThink(
   // [E2] best-effort usage aggregation across synthesis calls (single-pass in
   // v0.28+, but summed so the round loop inherits it when gap-fill lands).
   let usage: { input_tokens: number; output_tokens: number } | null = null;
+  let fallback: { answered_by: string; reason?: string } | undefined;
   // Initialized to the llm_error shape; every non-throwing branch overwrites it.
   let response: ThinkResponse = { answer: '', citations: [], gaps: [] };
   if (opts.stubResponse) {
@@ -825,13 +894,13 @@ export async function runThink(
       // [WP2/E2] non-empty gather still has value — attach the extractive
       // digest so callers (the synthesize verb) can surface it instead of
       // the stub answer. Null on empty gather (never fabricate).
-      const stubExtractive = composeExtractiveFallback(gather.pages, opts.question);
+      const stubExtractive = composeExtractiveFallback(gather.pages, opts.question, opts.remote !== false);
       // Degrade gracefully: return the gather without synthesis. Better than throwing.
       return {
         question: opts.question,
-        answer: modelProblem
+        ...withGuestAnswer(gather.pages, { answer: modelProblem
           ? `(model "${modelUsed}" not usable — ${detail}${fix})`
-          : '(no LLM available — set ANTHROPIC_API_KEY or pass `client`)',
+          : '(no LLM available — set ANTHROPIC_API_KEY or pass `client`)' }),
         citations: [],
         gaps: [
           modelProblem
@@ -847,7 +916,11 @@ export async function runThink(
         synthesisOk: false,  // #1698: no LLM ran — never persist this
         synthesis_status: modelProblem ? 'model_unusable' : 'no_llm',
         ...(stubExtractive ? { extractive: stubExtractive } : {}),
+        // GBRA-498: the extractive digest quotes the gathered pages, so a room marks this answer from them too.
+        taint_refs: [...gather.pages.map(pg => ({ table: 'pages' as const, sourceId: pg.source_id ?? 'default', slug: pg.slug })),
+          ...gather.takes.map(t => ({ table: 'takes' as const, id: t.take_id }))],
         usage: null,         // [E2] no LLM ran — no accounting
+        ...windowMeta,
         diagnostics: {
           pagesFromHybrid: gather.diagnostics.pagesFromHybrid,
           takesFromKeyword: gather.diagnostics.takesFromKeyword,
@@ -885,17 +958,8 @@ export async function runThink(
       // response keeps its empty llm_error initialization.
     }
     if (created) {
-      // [E2] capture usage when the message carries it (test-injected clients
-      // and providers without accounting leave it null).
-      const u = (created as { usage?: { input_tokens?: number; output_tokens?: number } }).usage;
-      if (u && typeof u.input_tokens === 'number' && typeof u.output_tokens === 'number') {
-        // Single synthesis call in v0.28+; when gap-driven rounds land, sum here.
-        const prev = usage as { input_tokens: number; output_tokens: number } | null;
-        usage = {
-          input_tokens: (prev?.input_tokens ?? 0) + u.input_tokens,
-          output_tokens: (prev?.output_tokens ?? 0) + u.output_tokens,
-        };
-      }
+      fallback = (created as { fallback?: { answered_by: string; reason?: string } }).fallback;
+      usage = addMessageUsage(usage, created);
       const block = created.content.find(b => b.type === 'text');
       const text = block && 'text' in block ? block.text : '';
       const parsed = tryParseJSON(text);
@@ -953,6 +1017,7 @@ export async function runThink(
   for (const slug of new Set(resolved.citations.map(c => c.page_slug))) {
     if (!gatheredSlugs.has(slug)) warnings.push(`CITATION_NOT_IN_GATHER:${slug}`);
   }
+  stampCitationSources(resolved.citations, gather.pages);
 
   // Round-loop scaffolding (rounds > 1 currently re-runs without gap-driven retrieval).
   // The loop is in place so the v0.29 gap-fill heuristic doesn't change the call site.
@@ -970,25 +1035,32 @@ export async function runThink(
   // [WP2/E2] compose failed + non-empty gather → attach extractive material
   // (callers decide whether to surface it; null on empty gather — ENG-19).
   const extractive = synthesisStatus !== 'ok'
-    ? composeExtractiveFallback(gather.pages, opts.question)
+    ? composeExtractiveFallback(gather.pages, opts.question, opts.remote !== false)
     : null;
 
   return {
     question: opts.question,
-    answer: response.answer, ...(synthesisStatus === 'ok' ? await groundThinkAnswer(engine, response.answer, [opts.question, pagesBlock, takesBlock, graphBlock ?? '', trajectoryBlock], warnings) : {}),
+    ...withGuestAnswer(gather.pages, { answer: response.answer, ...(synthesisStatus === 'ok' ? await groundThinkAnswer(engine, response.answer, [opts.question, pagesBlock, takesBlock, graphBlock ?? '', trajectoryBlock], warnings) : {}) }),
     citations: resolved.citations,
     gaps: response.gaps,
     pagesGathered: gather.pages.length,
     takesGathered: gather.takes.length,
     graphHits: gather.graphSlugs.length,
-    modelUsed,
+    modelUsed: fallback?.answered_by ?? modelUsed,
+    ...(fallback ? { requested_model: modelUsed, ...(fallback.reason ? { fallback_reason: fallback.reason } : {}) } : {}),
     rounds: 1,
     warnings,
     // #1698: persistable only when a real synthesis produced a non-empty answer.
     // ANDs the not-JSON/sentinel flag with a content check (catches valid-but-empty JSON).
     synthesisOk: synthesisOk && response.answer.trim().length > 0,
     synthesis_status: synthesisStatus,
+    evidence_truncated: evidenceTruncated,
     feedback_evidence: gather.pages.map(pg => ({ source_id: pg.source_id ?? 'default', slug: pg.slug, content_hash: pg.content_hash ?? null })),
+    taint_refs: [...gather.pages.map(pg => ({ table: 'pages' as const, sourceId: pg.source_id ?? 'default', slug: pg.slug })),
+      ...gather.takes.map(t => ({ table: 'takes' as const, id: t.take_id })), ...trajectoryFactIds.map(id => ({ table: 'facts' as const, id }))],
+    room_extra: [...(graphBlock ? (gather.graphRefs ?? gather.graphSlugs.map(slug => ({ slug, sourceId: opts.sourceId ?? 'default' })))
+      .filter(r => gather.graphSlugs.slice(0, 30).includes(r.slug)).map(r => ({ table: 'pages' as const, sourceId: r.sourceId, slug: r.slug })) : []),
+      ...(calibrationBlockOpts ? [{ table: 'calibration' as const, id: 0 }] : [])],
     ...(extractive ? { extractive } : {}),
     usage, ...(evidenceDelivery ? { evidence_delivery: evidenceDelivery } : {}),
     diagnostics: {
@@ -998,7 +1070,23 @@ export async function runThink(
       graphHits: gather.diagnostics.graphHits,
     },
     temporal: { reference_date: temporal.referenceDate, time_zone: temporal.timeZone },
+    ...windowMeta,
+    persist_base: persistBase,
   };
+}
+
+/**
+ * [E2] `prev` plus the message's token usage; `prev` unchanged when the message carries none
+ * (test-injected clients and providers without accounting). Single synthesis call in v0.28+;
+ * when gap-driven rounds land, runThink sums each round through here.
+ */
+function addMessageUsage(
+  prev: { input_tokens: number; output_tokens: number } | null,
+  message: unknown,
+): { input_tokens: number; output_tokens: number } | null {
+  const u = (message as { usage?: { input_tokens?: number; output_tokens?: number } }).usage;
+  if (!u || typeof u.input_tokens !== 'number' || typeof u.output_tokens !== 'number') return prev;
+  return { input_tokens: (prev?.input_tokens ?? 0) + u.input_tokens, output_tokens: (prev?.output_tokens ?? 0) + u.output_tokens };
 }
 
 /** Normalizes the model's parsed JSON envelope. */
@@ -1044,9 +1132,17 @@ export function stripGapsSection(answer: string): string {
   return kept.replace(/\s+$/, '');
 }
 
+/** The synthesis page of a question on a day: `synthesis/<slugified-question>-<date>`. */
+function synthesisSlug(question: string, today: string): string {
+  const slugSafe = question.toLowerCase().replace(/[^a-z0-9\s]+/g, '').trim().replace(/\s+/g, '-').slice(0, 60) || 'untitled';
+  return `synthesis/${slugSafe}-${today}`;
+}
+
 /**
  * Persist a synthesis page + its evidence. Returns the saved slug.
- * Synthesis pages are written under `synthesis/<slugified-question>-<date>.md`.
+ * Synthesis pages are written under `synthesis/<slugified-question>-<date>.md` as a single-item `think_synthesis`
+ * generation (GBRA-161 PR 5): bound to the revision the run found before gathering (`persist_base`, else read now), so a
+ * page that changed meanwhile is fenced (`generation_fenced`), and the page it replaces is versioned first.
  */
 export async function persistSynthesis(
   engine: BrainEngine,
@@ -1062,13 +1158,7 @@ export async function persistSynthesis(
   }
 
   const today = new Date().toISOString().slice(0, 10);
-  const slugSafe = result.question
-    .toLowerCase()
-    .replace(/[^a-z0-9\s]+/g, '')
-    .trim()
-    .replace(/\s+/g, '-')
-    .slice(0, 60) || 'untitled';
-  const slug = `synthesis/${slugSafe}-${today}`;
+  const slug = synthesisSlug(result.question, today);
 
   // Build the markdown body. A claim whose quote is not in the evidence is not saved as prose;
   // it goes to frontmatter unverified_claims (reviewable with get_page, out of search and recall).
@@ -1080,7 +1170,12 @@ export async function persistSynthesis(
     result.gaps.length > 0 ? '## Gaps\n\n' + result.gaps.map(g => `- ${g}`).join('\n') : '',
   ].filter(Boolean).join('\n');
 
-  const page = await maintenanceTransaction(engine, tx => tx.putPage(slug, {
+  const derivation = await deriveTrust(engine, result.taint_refs ?? [], { channel: 'derive:think' });
+  const sourceId = scope.sourceId ?? 'default';
+  const base = result.persist_base;
+  const expectedRevision = base && base.slug === slug && base.sourceId === sourceId ? base.revision
+    : (await engine.readPageSnapshot(slug, { sourceId, includeDeleted: true }))?.revision ?? null;
+  const { pageId } = await publishSinglePage(engine, { kind: THINK_SYNTHESIS_KIND, sourceId, slug, expectedRevision, derivation, page: {
     title: result.question.slice(0, 200),
     type: 'synthesis',
     compiled_truth: body,
@@ -1093,9 +1188,9 @@ export async function persistSynthesis(
       takes_gathered: result.takesGathered,
       ...(result.persist?.unverified_claims.length ? { unverified_claims: result.persist.unverified_claims.map(c => ({ ...c, sources: ['think evidence'], detected_at: today })) } : {}),
     },
-  }, scope.sourceId ? { sourceId: scope.sourceId } : undefined));
+  } });
 
-  const persisted = await persistCitations(engine, page.id, result.citations, scope);
+  const persisted = await persistCitations(engine, pageId!, result.citations, scope);
   return { slug, evidenceInserted: persisted.inserted, warnings: persisted.warnings };
 }
 
@@ -1226,14 +1321,15 @@ async function tryBuildGatewayClient(
 
       let result: ChatResult;
       try {
-        result = await gatewayChat({
+        // #7176: chat_usage_log rows for think say so, unless a job or cycle phase already does.
+        result = await withDefaultChatPhase('think', () => gatewayChat({
           model: modelStr,
           system,
           messages,
           maxTokens: params.max_tokens,
           // An explicit --model is a hard requirement (#1698), never a hop.
           ...(opts.explicitModel || opts.allowFallback === false ? { allowFallback: false } : {}),
-        });
+        }));
       } catch (e) {
         // AIConfigError at chat time = e.g. key revoked mid-run. For an EXPLICIT
         // model the user typed, this is a hard error (rethrow) — the early gate
@@ -1262,6 +1358,7 @@ function chatResultToMessage(result: ChatResult, modelStr: string): {
   type: 'message';
   role: 'assistant';
   model: string;
+  fallback?: { answered_by: string; reason?: string };
   content: Array<{ type: 'text'; text: string }>;
   usage: { input_tokens: number; output_tokens: number };
   stop_reason: 'end_turn' | 'max_tokens' | 'tool_use' | 'stop_sequence';
@@ -1271,6 +1368,7 @@ function chatResultToMessage(result: ChatResult, modelStr: string): {
     type: 'message',
     role: 'assistant',
     model: modelStr,
+    ...(result.fallbackFrom ? { fallback: { answered_by: result.model, ...(result.fallbackReason ? { reason: result.fallbackReason } : {}) } } : {}),
     content: [{ type: 'text', text: result.text }],
     usage: {
       input_tokens: result.usage.input_tokens,

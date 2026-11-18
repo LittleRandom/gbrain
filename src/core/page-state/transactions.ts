@@ -74,18 +74,42 @@ export function transactionMemo<T>(tx: object, keys: string | readonly string[],
  * between them, so postgres.js pipelines those already prepared on the
  * transaction's connection (docs/eval/managed-sync-catchup.md, "Pipelining
  * spike": order kept, later statements of a failed pipeline fail with 25P02).
- * Each call must send its statement synchronously (`executeRaw`, engine-sql
- * `run`), so call order is send order. The first failure in call order is
- * thrown. PGLite runs the calls one at a time.
+ * A call that awaits between statements sends its later ones after the other
+ * calls' first. The first failure in call order that is not a 25P02 abort is
+ * thrown (the 25P02 itself when that is all there is). PGLite runs the calls one at a time.
  */
-export async function pipelined(engine: { kind: string }, calls: ReadonlyArray<() => Promise<unknown>>): Promise<unknown[]> {
-  if (engine.kind !== 'postgres') {
+export async function pipelined(engine: object, calls: ReadonlyArray<() => Promise<unknown>>): Promise<unknown[]> {
+  if ((engine as { kind?: unknown }).kind !== 'postgres') {
     const results: unknown[] = [];
     for (const call of calls) results.push(await call());
     return results;
   }
   const settled = await Promise.allSettled(calls.map(call => { try { return call(); } catch (error) { return Promise.reject(error); } }));
-  const failed = settled.find(s => s.status === 'rejected') as PromiseRejectedResult | undefined;
+  const rejected = settled.filter((s): s is PromiseRejectedResult => s.status === 'rejected');
+  // A statement sent after the one that failed reports 25P02 (transaction aborted); the cause is the other one.
+  const failed = rejected.find(s => (s.reason as { code?: unknown } | null)?.code !== '25P02') ?? rejected[0];
   if (failed) throw failed.reason;
   return settled.map(s => (s as PromiseFulfilledResult<unknown>).value);
+}
+
+/**
+ * GBRA-133 (PR 2b): statements a Postgres transaction sends without waiting for before its COMMIT (a coordinated write's
+ * settings restore), so they share COMMIT's round trip. Each is ordered ahead of COMMIT on the transaction's connection,
+ * and the driver never sends a statement behind COMMIT, so #6543's boundary holds. One that failed aborted the
+ * transaction, so its COMMIT rolled back: the transaction then rejects with that statement's error.
+ */
+export async function withCommitChecks<T>(run: (checks: Array<Promise<unknown>>) => Promise<T>): Promise<T> {
+  const checks: Array<Promise<unknown>> = [];
+  const result = await run(checks);
+  await Promise.all(checks);
+  return result;
+}
+
+/** A statement already sent: left to the enclosing Postgres transaction's COMMIT (undefined), or returned to await. */
+export function settleAtCommit(engine: object, sent: Promise<unknown>): Promise<unknown> | undefined {
+  const checks = (engine as { _commitChecks?: Array<Promise<unknown>> })._commitChecks;
+  if (!checks) return sent;
+  sent.catch(() => undefined);
+  checks.push(sent);
+  return undefined;
 }

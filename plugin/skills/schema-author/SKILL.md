@@ -220,14 +220,21 @@ expert-routed types.)
 
 ### Phase 7 — Commit (preserve the change)
 
-If the pack is in source control, commit:
+If the pack is in source control, commit and push only the pack file:
 
 ```
 cd ~/.gbrain/schema-packs/mine
-git add pack.json
-git commit -m "schema: add researcher + paper types + authored link"
-git push
+gbrain git commit-push -m "schema: add researcher + paper types + authored link" -- pack.json
 ```
+
+It takes the checkout's writer lock and merges a rejected push without
+rebasing, so it is safe when other agents share the checkout. On a non-zero
+exit: retry once on `commit_lock_busy`; on `integrate_conflict` stop and ask
+the user which version of `pack.json` wins; on `git_push_unavailable` the
+remote is unreachable (the commit is saved; rerun with `--push-only` later) or,
+when the pack repo has no remote at all, nothing was committed: commit just the
+pack locally with `git add pack.json && git commit -m "<msg>" -- pack.json`. Never fall back to
+stash, `pull --rebase` or a plain push ([outcomes](https://github.com/garrytan/gbrain/blob/master/docs/guides/shared-checkout-git.md#outcomes)).
 
 If the brain daemon is running (`gbrain serve --http`), other processes
 pick up the change within 1 second (stat-mtime TTL gate in
@@ -252,7 +259,7 @@ loadActivePack — v0.40.6.0 closed the cross-process invalidation gap).
 
 ## When it fails
 
-Follow the [agent operator protocol](../../docs/protocol/AGENT_OPERATOR_v1.md) for any gbrain error `code`, exit code, `[AGENT]` block or notice block. Specific to this skill:
+Follow the [agent operator protocol](../conventions/agent-operator-protocol.md) for any gbrain error `code`, exit code, `[AGENT]` block or notice block. Specific to this skill:
 
 - Mutation codes: `PACK_READONLY` → fork first (`gbrain schema fork gbrain-base mine`); `STILL_REFERENCED` → remove the named references first; `LOCK_BUSY` → wait about 30 seconds and retry.
 - Over MCP, a mutation returns `insufficient_scope`: schema writes need the `admin` scope, which only the brain host's operator grants; tell the user.
@@ -312,20 +319,3 @@ On failure, the error envelope follows the standard `StructuredAgentError` shape
   pass `--force` if you know the holder is wedged.
 - `permission_denied` (MCP only) → your OAuth client doesn't have `admin`
   scope. Re-register with `gbrain auth register-client --scopes admin`.
-
-## Tools outside your MCP surface
-
-This plugin serves the starter tool surface. When a step above names one of these tools and your tool list
-does not have it, call request_tools {"surface":"full"} to add it to this session, or run its gbrain CLI equivalent:
-
-- `get_active_schema_pack` → `gbrain schema active`
-- `list_schema_packs` → `gbrain schema list`
-- `reload_schema_pack` → `gbrain call reload_schema_pack <params_json>`
-- `schema_apply_mutations` → `gbrain call schema_apply_mutations <params_json>`
-- `schema_explain_type` → `gbrain schema explain`
-- `schema_graph` → `gbrain schema graph`
-- `schema_lint` → `gbrain schema lint`
-- `schema_review_orphans` → `gbrain schema review-orphans`
-- `schema_stats` → `gbrain schema stats`
-
-To widen every new session, set this machine's plugin surface with GBRAIN_SURFACE=full.

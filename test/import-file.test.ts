@@ -1,11 +1,13 @@
 import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
-import { writeFileSync, mkdirSync, rmSync, symlinkSync, readdirSync, readFileSync, existsSync } from 'fs';
+import { writeFileSync, mkdirSync, rmSync, symlinkSync, readdirSync, readFileSync, existsSync, mkdtempSync } from 'fs';
+import { tmpdir } from 'os';
 import { join } from 'path';
 import { importFile, importFromContent } from '../src/core/import-file.ts';
 import type { BrainEngine } from '../src/core/engine.ts';
 import { MARKDOWN_CHUNKER_VERSION } from '../src/core/chunkers/recursive.ts';
+import { CODE_FILE_MAX_BYTES, PAGE_MAX_BYTES } from '../src/core/page-size-policy.ts';
 
-const TMP = join(import.meta.dir, '.tmp-import-test');
+const TMP = mkdtempSync(join(tmpdir(), 'gbrain-import-file-test-'));
 
 // Minimal mock engine that tracks calls and supports transaction()
 //
@@ -16,6 +18,15 @@ const TMP = join(import.meta.dir, '.tmp-import-test');
 // "page not found after write" path. This is the correct loud-failure
 // behavior for a real desync, but for the existing unit tests we need the
 // mock to behave like a working DB where writes are readable.
+const GUARD_READS: Record<string, (...args: any[]) => unknown> = {
+  readManagedModeRows: () => [{ enabled: false }],
+  getSourceStrictness: () => false,
+  getConfigValues: () => [],
+  readTransactionSettings: (names: string[]) => names.map(() => null),
+  applyTransactionSettings: () => undefined,
+  isFolderRestricted: () => false,
+};
+
 function mockEngine(overrides: Partial<Record<string, any>> = {}): BrainEngine {
   const calls: { method: string; args: any[] }[] = [];
   // In-memory page store: slug → page row (simulates a real DB index).
@@ -30,6 +41,8 @@ function mockEngine(overrides: Partial<Record<string, any>> = {}): BrainEngine {
     get(_, prop: string) {
       if (prop === '_calls') return calls;
       if (prop === 'getTags') return overrides.getTags || (() => Promise.resolve([]));
+      // Like a real engine, the reuse read resolves to a row array (no stored chunks).
+      if (prop === 'getChunkReuseRows') return overrides.getChunkReuseRows || (() => Promise.resolve([]));
       if (prop === 'getPage') {
         return async (slug: string, opts?: { sourceId?: string }) => {
           // If the test provides a custom getPage, call it first (for the
@@ -76,7 +89,10 @@ function mockEngine(overrides: Partial<Record<string, any>> = {}): BrainEngine {
       // transaction: just call the fn with the same engine (no real DB transaction in tests)
       if (prop === 'transaction') return async (fn: (tx: BrainEngine) => Promise<any>) => fn(engine);
       // Like a real engine, executeRaw always resolves to a row array.
-      if (prop === 'executeRaw' && !overrides.executeRaw) return (...args: any[]) => { calls.push({ method: prop, args }); return Promise.resolve([]); };
+      // #6482: the strict mode reader needs one well-formed unmanaged row.
+      if (prop === 'executeRaw' && !overrides.executeRaw) return (...args: any[]) => { calls.push({ method: prop, args }); return Promise.resolve(String(args[0]).includes('FROM persistence_brain') ? [{ enabled: false }] : []); };
+      // The import guards read through typed methods; a page-less mock engine answers them like a fresh unmanaged brain.
+      if (!overrides[prop] && prop in GUARD_READS) return (...args: any[]) => { calls.push({ method: prop, args }); return Promise.resolve(GUARD_READS[prop]!(...args)); };
       return track(prop);
     },
   });
@@ -162,9 +178,9 @@ This is the compiled truth.
     expect(putCall.args[1].compiled_truth).not.toContain('\uFEFF');
   });
 
-  test('skips files larger than MAX_FILE_SIZE (5MB)', async () => {
+  test('skips files larger than MAX_FILE_SIZE (the 24 MiB page ceiling)', async () => {
     const filePath = join(TMP, 'big-file.md');
-    const bigContent = '---\ntitle: Big\n---\n' + 'x'.repeat(5_100_000);
+    const bigContent = '---\ntitle: Big\n---\n' + 'x'.repeat(PAGE_MAX_BYTES + 100_000);
     writeFileSync(filePath, bigContent);
 
     const engine = mockEngine();
@@ -437,7 +453,7 @@ Content to chunk but not embed.
     // must trigger BEFORE parseMarkdown / chunkText / embedBatch — if it doesn't,
     // an authenticated attacker can force the owner to pay for embedding a
     // multi-megabyte string.
-    const bigContent = '---\ntitle: Big\n---\n' + 'x'.repeat(5_100_000);
+    const bigContent = '---\ntitle: Big\n---\n' + 'x'.repeat(PAGE_MAX_BYTES + 100_000);
 
     const engine = mockEngine();
     const result = await importFromContent(engine, 'big-slug', bigContent, { noEmbed: true });
@@ -450,10 +466,11 @@ Content to chunk but not embed.
   });
 
   test('uses UTF-8 byte length, not JS string length, for the size check', async () => {
-    // 2.6M 4-byte codepoints = ~10.4 MB UTF-8 but only 2.6M JS UTF-16 code units.
+    // 6.5M 4-byte codepoints = 26 MB UTF-8 but only 13M JS UTF-16 code units.
     // A length-based check would let this through; a byteLength check catches it.
     const fourByteChar = '\u{1F600}'; // emoji, 4 bytes in UTF-8
-    const bigContent = fourByteChar.repeat(2_600_000);
+    const bigContent = fourByteChar.repeat(6_500_000);
+    expect(bigContent.length).toBeLessThan(PAGE_MAX_BYTES);
 
     const engine = mockEngine();
     const result = await importFromContent(engine, 'emoji-slug', bigContent, { noEmbed: true });
@@ -466,12 +483,28 @@ Content to chunk but not embed.
   test('accepts in-memory content just under MAX_FILE_SIZE', async () => {
     // Sanity: content exactly at the limit must still import. If this test
     // fails, the guard is off-by-one and will break legitimate large imports.
-    const content = '---\ntitle: Borderline\n---\n' + 'x'.repeat(4_900_000);
+    const head = '---\ntitle: Borderline\n---\n';
+    const sentence = 'Normal prose about acme-example. ';
+    const body = sentence.repeat(Math.floor((PAGE_MAX_BYTES - head.length) / sentence.length));
+    const content = head + body + 'x'.repeat(PAGE_MAX_BYTES - head.length - body.length);
+    expect(Buffer.byteLength(content, 'utf-8')).toBe(PAGE_MAX_BYTES);
 
-    const engine = mockEngine();
+    const engine = mockEngine({ getConfig: (key: string) => Promise.resolve(key === 'pages.segmented_storage' ? 'off' : null) });
     const result = await importFromContent(engine, 'borderline-slug', content, { noEmbed: true });
 
     expect(result.status).toBe('imported');
+  }, 60_000);
+
+  test('a code file keeps the 5 MB code limit while Markdown takes the page ceiling', async () => {
+    const filePath = join(TMP, 'big.ts');
+    writeFileSync(filePath, `export const blob = "${'x'.repeat(CODE_FILE_MAX_BYTES)}";\n`);
+
+    const engine = mockEngine();
+    const result = await importFile(engine, filePath, 'big.ts', { noEmbed: true });
+
+    expect(result.status).toBe('skipped');
+    expect(result.error).toContain('too large');
+    expect((engine as any)._calls.length).toBe(0);
   });
 
   test('assigns sequential chunk_index values', async () => {
@@ -521,7 +554,7 @@ describe('importFile — CJK wave (v0.32.7)', () => {
       },
       executeRaw: async (sql: string) => {
         if (isVersionStamp(sql)) expect(replacementCompleted).toBe(true);
-        return [];
+        return sql.includes('FROM persistence_brain') ? [{ enabled: false }] : [];
       },
     });
   }

@@ -49,7 +49,7 @@ that you author with `gbrain schema init` or `gbrain schema fork`.
 Inspection verbs:
 
 ```bash
-gbrain schema active     # show resolved pack + which tier set it
+gbrain schema active [--source <id>] [--json]  # show resolved pack + which tier set it
 gbrain schema list       # list bundled + installed packs
 gbrain schema show       # pretty-print the active pack
 gbrain schema validate   # validate a manifest's shape
@@ -62,6 +62,25 @@ Use `gbrain config unset schema_pack` to remove that database override, then
 `gbrain schema active` to confirm the resolved pack and its selection tier.
 `gbrain config get schema_pack` and `gbrain config show` report the same
 resolved pack and name its tier.
+
+### Per-source resolution
+
+`gbrain schema active --source <id>` resolves the pack the engine uses for
+that source, including the per-source database override
+(`schema_pack.source.<id>`), and prints `Resolved for source <id>: <tier>`
+(`per-source-db`, `db-config`, `home-config`, `env` or `default`). Under
+`--json` the document carries `pack`, `version`, `identity`,
+`resolved_from`, `source_id` and `database` (`read`, `unreadable` or
+`not_configured`).
+
+- An unregistered or archived source is refused with `unknown_source`; its fix
+  is `gbrain sources list --json`, which lists the ids `--source` accepts.
+- When the brain database can't be read, the database tiers are skipped and
+  the answer comes from the environment and `~/.gbrain/config.json` only. Text
+  mode prints a `Degraded: database unreadable` line on stderr and exits 0;
+  `--json` exits nonzero with a `database_error` envelope that still carries
+  the file-plane answer (`degraded: true`). Run `gbrain doctor --json`, then
+  `gbrain schema active --json` again.
 
 Authoring + discovery verbs:
 
@@ -118,7 +137,7 @@ classification as `schema lint --with-db`'s `stored_type_undeclared`:
   undeclared type, per source against that source's pack.
 
 Fix one by declaring it (`gbrain schema add-type <type> --primitive <p>
---prefix <dir/>`) or by rewriting the pages with a declared type. On a managed
+--prefix <dir/>`, or `--no-prefix` for a type set by frontmatter only) or by rewriting the pages with a declared type. On a managed
 brain the `unify-types` job cannot apply yet, so rewrite the page with
 `put_page` (read it with `get_page include_content:true`, change `type:`, put it
 back). gbrain's own outputs use declared types: `gbrain report` and the dream
@@ -192,6 +211,15 @@ Every read + write path consults the active pack at runtime:
 - **`extract_facts`** runs only on `extractable: true` types.
 - **`enrichment-service`** routes person/company enrichment based on the
   pack's primitive declarations.
+- **Entity counters** (`get_health` / `gbrain health` `entity_page_count`,
+  `link_coverage`, `timeline_coverage`, `most_connected`; doctor
+  `graph_coverage` and `orphan_ratio`) count the types the pack declares with
+  `primitive: entity`, resolved per source when sources carry their own pack.
+  The legacy names (`entity`, `person`, `company`, `organization`) still count
+  while a pack leaves them undeclared; a pack that declares one under another
+  primitive wins. A pack that does not load empties the filter and the result
+  says `entity_types_status: pack_unavailable` (doctor: a `graph_coverage`
+  warn) instead of counting a hardcoded list.
 - **Search hybrid cache** (`knobsHash`) folds in pack name + version.
   A cache row written under pack A is unreachable when pack
   B is active. Cross-pack contamination is structurally impossible.
@@ -317,6 +345,50 @@ gbrain schema downgrade
 The cache + eval rows that pack-aware code wrote are isolated by the
 `knobsHash` pack-folding — they become unreachable under the
 restored pack so no eviction is needed.
+
+### YAML scalars: what the pack parser reads
+
+The pack YAML parser is a hand-rolled subset (no anchors, tags, or flow
+mappings; ship JSON for those). Quoted scalars decode their escapes:
+
+- A double-quoted scalar carries the JSON escape subset (`\\`, `\"`, `\/`,
+  `\b`, `\f`, `\n`, `\r`, `\t`, `\uXXXX`), which is exactly what every
+  `gbrain schema` mutation writes. An escape outside that subset (`"\q"`, a
+  YAML-only `"\x41"`) refuses with the line number instead of being kept as
+  literal text.
+- A single-quoted scalar is literal text; `''` is one quote.
+- A `#` inside either kind of quote is content, and a backslash inside
+  double quotes never ends the string.
+
+So a link-type regex written as `regex: \b(works? at)\b` (bare) or
+`regex: "\\b(works? at)\\b"` (double-quoted) loads as `\b(works? at)\b`,
+and a mutation writes it back as the same bytes. Before the wave 14 release a
+mutation doubled every backslash in a quoted scalar (the parser kept the
+escapes), so a pack with one regex grew 2x per `add-alias`.
+
+### Oversized pack
+
+Every mutation now parses its own output and refuses with
+`schema_pack_emit_mismatch` when it does not read back as the manifest, so
+the growth cannot recur. A pack that already grew is handled like this:
+
+- `gbrain schema <mutation>`, `gbrain schema active` and every query refuse
+  to load a pack file above 8 MiB with `schema_pack_too_large` (the size is
+  read before any byte is), and `gbrain doctor` warns on a mutable pack above
+  1 MiB (`schema_pack_active`, `details.code: schema_pack_oversized`).
+- The original text is not recoverable automatically: after N doublings only
+  the author knows the intended regex. Open the pack file the message names
+  (`~/.gbrain/schema-packs/<name>/pack.yaml`), find the grown lines (usually
+  `inference.regex` under `link_types`; each is a very long run of
+  backslashes), rewrite each as the intended expression, save, and re-run
+  `gbrain schema validate <name>`. A `cp pack.yaml pack.yaml.bak` first costs
+  nothing.
+- `GBRAIN_SCHEMA_PACK_MAX_BYTES=<bytes>` raises the load bound for one
+  command when a pack is legitimately large; `GBRAIN_SCHEMA_PACK_WARN_BYTES`
+  moves the doctor warn bound.
+
+**Say to your agent:** *"gbrain says my schema pack is too large; help me
+restore the regex lines by hand."*
 
 ## Distribution
 

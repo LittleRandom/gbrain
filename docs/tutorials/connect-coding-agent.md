@@ -37,7 +37,7 @@ here using the actual harness adapter.
 Install Bun if needed, then the canonical GBrain distribution:
 
 ```bash
-bun install -g github:garrytan/gbrain#latest-stable
+bun install -g github:garrytan/gbrain#stable
 gbrain engine status --json
 ```
 
@@ -54,9 +54,9 @@ For the intended unconfigured local brain:
 gbrain init --pglite --no-embedding
 ```
 
-PGLite runs locally without a database server or Docker. **Relay the printed
-search-mode cost matrix and confirm the user's choice before continuing**, as
-required by [Step 3.5](../../INSTALL_FOR_AGENTS.md#step-35-confirm-search-mode-with-the-user-do-not-skip).
+PGLite runs locally without a database server or Docker. **Tell the user the
+search mode in effect and the printed cost matrix** when you report the install, as
+described in [Step 3.5](../../INSTALL_FOR_AGENTS.md#step-35-tell-the-user-which-search-mode-is-in-effect-do-not-skip).
 The matrix illustrates model API costs, not the price of a Codex or Claude
 subscription. Choosing a mode does not enable paid APIs or automatic capture.
 
@@ -83,19 +83,22 @@ Configure the agent you are using:
 
 ```bash
 # Claude Code
-claude mcp add gbrain -- "$(command -v gbrain)" serve --surface verbs
+gbrain setup claude-code
 
 # Codex
-codex mcp add gbrain -- "$(command -v gbrain)" serve --surface verbs
+gbrain setup codex
 ```
 
-These launch a local stdio MCP process. Use the same intended brain and source
+These register a local stdio MCP process that starts through gbrain's
+launcher, so a session opened in a cloned repository never loads its
+`bunfig.toml` or `.env` (pass `--no-hooks` to skip setup's hooks). Use the same intended brain and source
 you inspected above; if an isolated installation already provided an absolute
-launcher, use that command in place of the bare `gbrain`.
+launcher, pass it as `--gbrain-bin <that launcher>`.
 
-The verbs surface exposes exactly `recall`, `remember`, `entity`,
-`synthesize`, `forget`, `context_pack`, and `delta`.
-Start with keyless recall and remembering. Server-side synthesis and semantic
+The full surface serves every operation, including the seven memory verbs
+(`recall`, `remember`, `entity`, `synthesize`, `forget`, `context_pack`,
+`delta`); a harness that caps its tool count can register `--surface verbs`
+for exactly those seven. Start with keyless recall and remembering. Server-side synthesis and semantic
 retrieval may require separately configured capabilities.
 
 PGLite allows one process to own its database at a time. Do not launch two

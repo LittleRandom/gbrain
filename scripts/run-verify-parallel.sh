@@ -18,6 +18,8 @@
 #
 # Env overrides:
 #   GBRAIN_VERIFY_TIMEOUT       per-check wallclock cap, seconds (default 120)
+#   GBRAIN_VERIFY_SKIP_TYPECHECK=1  leave typecheck out: test.yml's typecheck job
+#                               runs tsc in parallel under its own measured timeout
 #   GBRAIN_VERIFY_LOG_DIR       where to write per-check logs (default tempdir,
 #                               removed on success and kept on failure)
 #   GBRAIN_TEST_RECEIPT_DIR     also write the verify receipt (X2): one JUnit
@@ -64,8 +66,13 @@ CHECKS=(
   # ── heavy (longest-first) ──
   "typecheck"
   "check:admin-build"
+  # #7126: src/admin-embedded.ts embeds exactly the committed admin/dist; the
+  # admin build above writes a throwaway directory, so it cannot catch this.
+  "check:admin-embedded"
   "check:wasm"
   "check:pglite-embedded"
+  # gbrain's bundled skills survive bun build --compile byte-identical (GBRA-194).
+  "check:skills-embedded"
   # HEIC + AVIF decoders survive bun build --compile (~0.6s: the smoketest
   # bundles a handful of modules, not the CLI).
   "check:image-decoders"
@@ -76,6 +83,8 @@ CHECKS=(
   "check:orphan-modules"
   # agent contract v1 (A2): generated docs/guides/error-codes.md matches the registry
   "check:error-codes"
+  # #5575 ENG-16: write-gate detector patterns are bounded and window-safe
+  "check:write-gate-regex"
   # agent contract v1 scanner (B9): shrink-only per-rule baselines
   "check:agent-contract"
   # No-op placeholder assertions (expect(true).toBe(true) and friends) in
@@ -98,10 +107,14 @@ CHECKS=(
   "check:skill-brain-first"
   # A-NEW-3: bundled SKILL.md files pass the shared-skill publication parser.
   "check:skill-publication"
+  # GBRA-225: skill drift against the live CLI surface, and per-skill size ceilings.
+  "check:skill-health"
   "check:conversation-parser"
   "check:resolver"
   "check:privacy"
   "check:test-names"
+  # A test that opens a changelog.d fragment by name breaks on the release commit.
+  "check:test-fragment-reads"
   "check:test-isolation"
   # D7: a test that gates execution on a GBRAIN_* opt-in the operator-env
   # preload strips is a silent skip; TS AST scan, ~2s.
@@ -130,23 +143,32 @@ CHECKS=(
   "check:eval-glossary"
   "check:tool-catalog"
   "check:skills-manifest"
+  # GBRA-225: skills.lock.history.json covers the lock and only grows.
+  "check:skills-lock-history"
   "check:no-pii-agent-voice"
   "check:synthetic-corpus-privacy"
   "check:operations-filter-bypass"
   "check:gateway-routed"
   "check:worker-pool-atomicity"
   "check:doc-history"
+  # GST-2548: documented scripts/ and test/ paths exist. The unit and census
+  # lanes skip a doc-only pull request; verify does not.
+  "check:docs-repo-paths"
   "check:fixture-privacy"
   "check:source-scope-onboard"
   "check:getpage-scope"
+  "check:relative-dotdot"
+  "check:origin-assignment"
   "check:no-double-retry"
   "check:batch-audit-site"
   "check:engine-dynamic-import"
+  "check:file-url-pathname"
   "check:grok-pin"
   "check:opencode-pin"
   "check:pin-doc-privacy"
   "check:worker-lock-renewal-shape"
   "check:bootstrap-tag"
+  "check:install-ref"
   "check:plugin-tree"
   "check:skill-refs"
   # Previously reachable ONLY from the deleted check:all (i.e. never run):
@@ -160,6 +182,9 @@ CHECKS=(
   # W5 (refactor wave 1): per-function line ratchet over src/**/*.ts (TS AST,
   # ~1.5s); baseline scripts/function-size-baseline.tsv.
   "check:function-size"
+  # GBRA-130: per-item catches that test an error code against a list and
+  # rethrow the rest only shrink; baseline scripts/item-allowlist-catches-baseline.tsv.
+  "check:item-allowlist-catches"
   # EO10 (refactor wave 1): engine-sql/ and schema-migrations/ never import
   # back up into the engine façades or migrate.ts (ESM TDZ cycles).
   "check:layering"
@@ -169,12 +194,42 @@ CHECKS=(
   # #5595/#5475: no fsync of a read-only descriptor outside src/core/fs-durable.ts
   # (Windows refuses it with EPERM).
   "check:durable-flush"
+  # Wave 18b: a missing column/table reads as "pre-migration" only when the
+  # handler names it (isMissingSchemaObject); broad predicates are allowlisted.
+  "check:schema-error-predicates"
+  # Trunk Dynamic CI: the filter runs only on pull_request and every gated job
+  # keeps the fail-open !cancelled() && != 'false' form.
+  "check:dynamic-ci"
+  # #4992: subprocess launches go through src/core/spawn.ts (windowsHide
+  # default); NOT_YET_MIGRATED is a ratchet that only shrinks.
+  "check:windows-hide"
   # Goal (a) (refactor wave 1): engine SQL only shrinks; baseline
   # scripts/engine-sql-baseline.tsv.
   "check:engine-sql-ratchet"
+  # D6 (docs/designs/RUST_ENGINE.md): raw SQL outside the engines and two-way
+  # pglite/postgres branches only fall; baselines scripts/engine-raw-sql-baseline.tsv
+  # and scripts/engine-kind-branches-baseline.tsv.
+  "check:engine-raw-sql-ratchet"
+  "check:engine-kind-branches"
+  # GBRA-248 W1: world reads in src/core (loadConfig, env, fs, module state,
+  # spawn, process hooks) only fall; baseline scripts/core-world-reads-baseline.tsv.
+  "check:core-world-reads"
+  # GBRA-161: derived-retire writers only shrink; reviewed ceilings in
+  # docs/architecture/derived-census.tsv.
+  "check:derived-census"
+  # Wave B segmented storage (spec 1.5 layer 4): whole-body page readers only
+  # shrink; baseline scripts/page-body-readers-baseline.tsv.
+  "check:page-body-readers"
+  # Wave B large pages: every content_chunks reader applies the chunk-visibility
+  # predicate or carries a reason; baseline scripts/chunk-visibility-baseline.tsv only shrinks.
+  "check:chunk-visibility"
   # CQ3 / EO17 (refactor wave 1): engine-sql splices only constant text, no
   # composed $n, no expanded IN lists.
   "check:engine-sql-dynamic"
+  # #9192: a migration that changes what the page revision trigger watches empties search until the rebuild.
+  "check:migration-projection"
+  # GBRA-218: the remote-privacy relaxations are read only in private-visibility.ts.
+  "check:remote-privacy-reads"
   # EO4 (refactor wave 1): RLS read brands stay unforgeable; brand factories
   # importable only from their allowlists (never src/core/ops/**).
   "check:engine-sql-brands"
@@ -186,13 +241,27 @@ CHECKS=(
   # W7 (refactor wave 1): workflow phrases the wave retired stay out of the
   # docs agents follow (CLAUDE.md, AGENTS.md, CONTRIBUTING.md, docs/, skills/).
   "check:retired-phrases"
+  # #6530: skills, recipes, templates, docs, plugin trees and agent docs never
+  # teach git pull --rebase, stash, autostash, repo-wide add/commit, reset
+  # --hard or a bare/force push for a shared brain checkout (~0.5s).
+  "check:shared-tree-git"
   "check:schema-migration-order"
+  # A since: 'TBD' BEHAVIOR_CHANGES row never ships: refused on a stamped tree
+  # (VERSION has a CHANGELOG header and differs from origin/master's) and on master.
+  "check:behavior-since"
+  # Stable's promise (docs/STABILITY.md): a documented command, flag, MCP tool, config key or exit code the base has
+  # leaves only through a matured deprecations.d record; new behavior-changes.d rows carry kind:.
+  "check:public-surface"
+  # CHANGELOG.md keeps every release heading origin/master has (a cut file is refused).
+  "check:changelog-headings"
   "check:structural-manifest"
   # Every generated artifact's freshness in one place (GBRA-47 B8); its Fix
   # line is `bun run regen:all`, the same code path that regenerates them.
   "check:regen-all"
   # v0.50.5.0 security wave: compiled binaries must not autoload a cwd bunfig.toml.
   "check:compile-autoload"
+  # The vendored postgres driver's three copies equal pinned upstream plus its patch (networked; a recorded skip offline).
+  "check:vendor-postgres"
 )
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -210,6 +279,11 @@ SOLO_CHECKS=(
   # Budget: 30 s wall clock (scripts/guard-self-test.sh BUDGET_SECONDS).
   "check:guard-self-test"
 )
+if [ "${GBRAIN_VERIFY_SKIP_TYPECHECK:-}" = "1" ]; then
+  KEPT=()
+  for c in "${CHECKS[@]}"; do [ "$c" = "typecheck" ] || KEPT+=("$c"); done
+  CHECKS=("${KEPT[@]}")
+fi
 ALL_CHECKS=("${CHECKS[@]}" "${SOLO_CHECKS[@]}")
 
 if [ "${#CHECKS[@]}" -eq 0 ]; then
@@ -238,7 +312,7 @@ if [ -n "${GBRAIN_VERIFY_LOG_DIR:-}" ]; then
   LOG_DIR="$GBRAIN_VERIFY_LOG_DIR"
   mkdir -p "$LOG_DIR" || { echo "ERROR: cannot create $LOG_DIR" >&2; exit 2; }
 else
-  LOG_DIR="$(mktemp -d /tmp/gbrain-verify-XXXXXX)"
+  LOG_DIR="$(mktemp -d "${TMPDIR:-/tmp}/gbrain-verify-XXXXXX")"
   KEEP_LOGS=0
   trap '[ "$KEEP_LOGS" = "1" ] || rm -rf "$LOG_DIR"' EXIT
 fi
@@ -293,13 +367,22 @@ spawn_check() {
       bun run "$c" > "$LOG_FILE" 2>&1 &
       pid=$!
       # The watchdog owns no caller pipes (an orphaned sleep holding stdout
-      # stalled spawnSync callers for the whole $TIMEOUT) and its TERM trap
-      # takes its sleep down with it, closing the window where pkill -P runs
-      # before the sleep is forked.
-      ( trap 'kill "$nap" 2>/dev/null; exit 0' TERM
-        sleep "$TIMEOUT" & nap=$!
-        wait "$nap" && kill -TERM "$pid" 2>/dev/null && \
-          sleep 5 && kill -KILL "$pid" 2>/dev/null ) </dev/null >/dev/null 2>&1 &
+      # stalled spawnSync callers for the whole $TIMEOUT). Each of its sleeps
+      # runs through `nap`: on TERM the watchdog kills that sleep and waits for
+      # it, so the sleep is gone before the watchdog exits and before the
+      # `wait "$cap_pid"` below returns. A TERM that lands between forking a
+      # sleep and recording its pid only sets `stop`, acted on once the pid is
+      # known (bash 3.2 has no signal masking).
+      ( nap() {
+          stop=
+          trap 'stop=1' TERM
+          sleep "$1" & n=$!
+          trap 'kill "$n" 2>/dev/null; wait "$n" 2>/dev/null; exit 0' TERM
+          if [ -n "$stop" ]; then kill "$n" 2>/dev/null; wait "$n" 2>/dev/null; exit 0; fi
+          wait "$n"
+        }
+        nap "$TIMEOUT" && kill -TERM "$pid" 2>/dev/null && \
+          nap 5 && kill -KILL "$pid" 2>/dev/null ) </dev/null >/dev/null 2>&1 &
       cap_pid=$!
       wait "$pid" 2>/dev/null
       # Capture the check's exit code from ITS `wait`, before any watchdog

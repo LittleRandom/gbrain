@@ -30,11 +30,13 @@
  *   - docs/UPGRADING_DOWNSTREAM_AGENTS.md — per-release upgrade chronicle
  *   - docs/test-audit/                — dated audit evidence that quotes the
  *     tests and docs it examined, including the dead commands they pinned
+ *   - docs/research/rust-engine/      — research maps pinned to one commit; they
+ *     name MCP tool names and older commands as they stood at that commit
  */
 import { describe, expect, test } from 'bun:test';
 import { readdirSync, readFileSync, statSync } from 'fs';
 import { dirname, join, relative } from 'path';
-import { CLI_ONLY } from '../src/cli.ts';
+import { CLI_ONLY } from '../src/cli/main.ts';
 import {
   codeRegions, flagRejection, gbrainInvocations, HISTORICAL_MARKER, liveCliVerbs,
 } from './helpers/cli-command-surface.ts';
@@ -47,6 +49,7 @@ const EXCLUDED = [
   'docs/UPGRADING_DOWNSTREAM_AGENTS.md',
   'docs/designs/',
   'docs/plans/',
+  'docs/research/rust-engine/',
   'docs/test-audit/',
 ];
 

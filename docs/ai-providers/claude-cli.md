@@ -56,8 +56,8 @@ recipe — it has no base URL, only a subprocess binary path
 
 ## What actually happens on a call
 
-Each `doGenerate` call spawns `claude --print --output-format json --model
-<id> --disable-slash-commands --tools '' --strict-mcp-config --settings
+Each `doGenerate` call spawns `claude --print --output-format json --verbose
+--model <id> --disable-slash-commands --tools '' --strict-mcp-config --settings
 '{"disableAllHooks":true}'` as a
 subprocess, with `cwd` set to a per-process directory under the OS tmpdir
 (`join(tmpdir(), 'gbrain-claude-cli-cwd-' + process.pid)`, created via
@@ -65,6 +65,17 @@ subprocess, with `cwd` set to a per-process directory under the OS tmpdir
 touch or inspect its contents), and pipes the rendered prompt to it on
 stdin:
 
+- `--verbose` makes stdout the session's event array rather than the bare
+  result envelope. When a response hits its output cap, Claude Code continues
+  it on its own with a second request, and the envelope's `result` holds only
+  the text after that point. The adapter rebuilds the full answer from the
+  call's assistant events. When it cannot prove the rebuilt text is the whole
+  answer, the call returns no text and no tool calls, finishes `length` (so
+  callers retry or escalate, as for any capped answer) and reports
+  `providerMetadata['claude-cli'].code = 'continuation_unproven'` with its
+  reason. The gateway keeps that result as it is: the `chat_fallback_chain`
+  does not resend it (only refusals and thrown errors move to the next
+  model), and `toolLoop` stops `length` without dispatching a tool.
 - `--tools ''` disables every built-in tool (Bash/Read/WebSearch/…) — the
   subprocess must behave like a raw LLM, not a full agent.
 - `--strict-mcp-config` skips loading the user's MCP servers. Without it,
@@ -83,6 +94,14 @@ stdin:
   gbrain's own hooks therefore still fires inside claude-cli calls; gbrain's
   Stop hook, the serve-side harvest and the sweep all skip those
   self-captures, so nothing is extracted from them.
+- A call with an output cap carries it as `CLAUDE_CODE_MAX_OUTPUT_TOKENS` in
+  both the `--settings` env and the child env. Claude Code thinks by default
+  on Claude 5 models, and the API needs a thinking budget of at least 1024
+  tokens below that cap, so a call capped at 1024 tokens or fewer (the
+  `models doctor` probe, query-intent and classification calls) also sets
+  `MAX_THINKING_TOKENS=0` in both places and reports
+  `providerMetadata['claude-cli'].thinking = 'disabled_below_floor'`. A larger
+  cap leaves thinking to the CLI.
 - The subprocess env is a copy of gbrain's own process env with the
   cloud-auth routing variables scrubbed before spawn: the three direct-API
   keys (`ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL`)
@@ -106,9 +125,20 @@ stdin:
 
 `--bare` (which would skip loading the user-level `~/.claude/CLAUDE.md`
 entirely) is not among the flags passed, because it also forces
-`ANTHROPIC_API_KEY` auth (per the recipe's source comment). One effect of
-not passing it: the user-level `~/.claude/CLAUDE.md` still loads and gets
-cached tokens on every call.
+`ANTHROPIC_API_KEY` auth (per the recipe's source comment). On Claude Code
+2.1.314 or newer the child gets `--setting-sources ""` instead, so your
+user-level `~/.claude/CLAUDE.md`, memory and `settings.json` stay out of
+every call and the login is kept (gbrain reads `claude --version` once per
+binary per process). An older CLI still loads them on every call.
+
+Trade-off: `--setting-sources ""` loads no settings source at all, so the
+`env` block, `apiKeyHelper` and permission rules in your `settings.json` don't
+reach the child either. The subscription (OAuth) login is kept, but a claude
+login or proxy that depends on `settings.json` doesn't apply to gbrain's
+claude-cli calls on these versions. To load them again, set
+`GBRAIN_CLAUDE_CLI_USER_SETTINGS=1` in the environment gbrain runs in (your
+shell or `~/.gbrain/.env`; a project `.env` can't set it): the child then gets
+no `--setting-sources` flag and gbrain skips the version probe.
 
 The adapter does not use `claude`'s own agentic tool-calling — it injects a
 fenced instruction block into the system prompt teaching the model a
@@ -136,7 +166,7 @@ above.
 | Prompt caching | The recipe declares `supports_prompt_cache: true`: Claude Code caches prompt prefixes itself on every `--print` run (Anthropic's Claude Code docs put `-p` runs in the main-conversation TTL bucket — one hour on a subscription, five minutes on an API key). gbrain cannot place `cache_control` breakpoints on this path — the adapter renders messages to stdin text and ignores `providerOptions` — so caching is automatic rather than gateway-driven, and `doctor`'s `subagent_capability` does not grade a claude-cli subagent tier `degraded:no_caching`. `cache_read_input_tokens` is surfaced as `usage.cachedInputTokens` (next row). |
 | Usage / token counts | Reported `usage.input_tokens` / `usage.output_tokens` are read straight from the CLI's `--output-format json` envelope (`result.usage?.input_tokens` / `output_tokens`); gbrain does not independently count tokens for this path. The envelope's `cache_read_input_tokens` is surfaced as `usage.cachedInputTokens`, so cache reads are counted in gbrain's usage accounting; `cache_creation_input_tokens` is not surfaced (the AI SDK's usage shape has no corresponding field). |
 | Cost figures | The recipe declares `cost_per_1m_input_usd: 3.0` / `cost_per_1m_output_usd: 15.0` — the same Sonnet-class figures the `anthropic` recipe declares (`price_last_verified: 2026-06-17`) — purely so gbrain's budget ledger has a number to attribute per call. Neither the recipe nor the adapter code checks what you're actually billed; treat these as the ledger's nominal per-call number, not a verified charge. The `--max-usd` / `--max-cost` budget gate does not read them either: it prices `claude-cli:<model>` at the nominal Anthropic rate for that model, and a short alias (`claude-cli:haiku`) prices identically to the dated id it resolves to; `pricing.overrides` forces $0 or a real rate for any `claude-cli:*` string, and on a subscription one line prices every claude-cli model: `gbrain pricing set 'claude-cli:*' --rate 0` (an exact model entry still wins; at $0 no cap limits claude-cli calls). |
-| User-level CLAUDE.md | `~/.claude/CLAUDE.md` still loads on every call (see above) — only the working directory changes (see "What actually happens on a call" for exactly what that directory is and isn't). |
+| User-level CLAUDE.md | Kept out on Claude Code 2.1.314 or newer (`--setting-sources ""`); an older CLI loads `~/.claude/CLAUDE.md` on every call (see above). Otherwise only the working directory changes (see "What actually happens on a call" for exactly what that directory is and isn't). |
 
 ## Doctor probe timeout: per-recipe, 30s for claude-cli
 
@@ -196,6 +226,7 @@ check, removal and hosted brains. Two points are specific to `claude-cli`:
 | `claude CLI 2.0.60 or newer required (found <version>); upgrade Claude Code` | The installed CLI's argument parser rejected one of the provider's flags (`error: unknown option …` after the `--- raw ---` marker); 2.0.59 and older reject `--disable-slash-commands` | Upgrade Claude Code (`claude update`, or reinstall), then rerun | user | `persistent_install` | `claude --version` |
 | `claude-cli exited <code>` + `--- raw ---` blob | Non-zero exit from the `claude` subprocess where stdout carried no parseable result envelope; the CLI's stderr/stdout follows the `--- raw ---` marker (kept behind the marker so error classifiers never phrase-match model-derived text) | Run `claude` interactively with the same model to see the underlying CLI error directly (e.g. not logged in, model unavailable) | user (log in, pick an available model) | `credentials` when logging in | `gbrain models doctor --json` (one tiny call per model) |
 | `claude-cli output not JSON: ...` | `JSON.parse(stdout)` threw (stdout wasn't valid JSON at all) | Confirm the installed `claude` CLI version still supports `--print --output-format json`; this adapter's JSON handling was verified against CLI 2.1.145 | agent | none | `claude --version` |
-| `claude-cli JSON event array had no "result" event` | stdout parsed as a JSON array (the `"verbose": true` event-stream shape in `~/.claude/settings.json`) but none of the events had `type: "result"` | Check `~/.claude/settings.json` for `"verbose": true`; the adapter tolerates the array shape but still needs a `result` event in it | user (edits their Claude Code settings) | none | `gbrain models doctor --json` (one tiny call per model) |
+| `claude-cli JSON event array had no "result" event` | stdout parsed as the `--verbose` event array but none of the events had `type: "result"` (the run ended before reporting) | Run `claude --print --output-format json --verbose` by hand with the same model to see where it stops | agent | none | `gbrain models doctor --json` (one tiny call per model) |
+| `[claude-cli] continuation_unproven (<reason>)` on stderr (once per reason per process); the call finishes `length` with no text | The answer hit its output cap and Claude Code continued it, and stdout could not prove the full text: the bare envelope without the event array (`events_missing`), an event array with no assistant message (`no_assistant_events`), or assistant segments that do not provably make up this answer (`segments_unmatched`) | Callers treat it as a capped answer and retry or escalate. `events_missing` and `no_assistant_events`: upgrade the claude CLI so `--output-format json --verbose` prints the session's assistant events. `segments_unmatched`: raise the caller's output cap (the setting its truncation warning names) | agent | none | rerun the call; a raised cap or an upgraded CLI finishes `stop` |
 | `gbrain models doctor` reports `chat` as `status: unknown` for a `claude-cli:` model | The probe allows 30s for the subprocess (see "Doctor probe timeout" above); a persistent `unknown` means the call genuinely failed or outran even that window — `classifyError` falls through to `unknown` for the adapter's abort message | Investigate directly: run the same model via `gbrain models doctor --json` or call `claude` by hand (e.g. not logged in, model unavailable) | agent | none | `gbrain models doctor --json` (one tiny call per model) |
 | A call bills through the Anthropic API or a cloud backend instead of the local session | The adapter deletes `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_BASE_URL` and every `CLAUDE_CODE_USE_*` backend-switch flag from the subprocess env — this covers gbrain's own env leaking into the call. It does not inspect billing switches the installed `claude` CLI carries in its own config files | If billing looks wrong, check the `claude` CLI's own auth/billing configuration on this machine, not just gbrain's env. For intentional cloud routing, use the `anthropic` recipe instead | user | none | the `claude` CLI's own auth status on this machine |

@@ -102,6 +102,10 @@ export interface World {
   connector?: { sourceId: string; root: string };
   /** Session drops this robot injects (the pooler_disconnect fault); absent in every other run. */
   sessionDrops?: SessionDrops;
+  /** Write reply wait every op context carries; absent = the operation default (a probe shortens it to force `write_pending`). */
+  writeWaitMs?: number;
+  /** `consumer:claiming` passes a counting or crashing worker's fault hook saw; `finish` waits for one after its probe (#6957). */
+  claimPasses?: number;
 }
 
 /**
@@ -125,7 +129,8 @@ export class SessionDrops {
   }
 }
 
-const DROPPED_CONNECTION = /CONNECTION_CLOSED|CONNECTION_ENDED|ECONNRESET|57P01|08P01|08006|server conn crashed|terminating connection|Connection terminated/i;
+// CONNECT_TIMEOUT: a backend the fault killed mid-handshake surfaces to the client as a connect timeout, not a close.
+const DROPPED_CONNECTION = /CONNECTION_CLOSED|CONNECTION_ENDED|CONNECTION_DESTROYED|CONNECT_TIMEOUT|ECONNRESET|57P01|08P01|08006|server conn crashed|terminating connection|Connection terminated/i;
 const DROP_RETRIES = 8;
 
 /**
@@ -162,8 +167,17 @@ export const CONNECTOR_SLUG = 'gh/acme-example/app/1';
 const CONNECTOR_CONFIG = { kind: 'github', gh_scope: 'repos', gh_repos: 'acme-example/app', gh_token_env: 'CRASH_ROBOT_CONNECTOR_TOKEN' };
 export function connectorSourceConfig(): Record<string, string> { return { ...CONNECTOR_CONFIG }; }
 
-/** A user edits a page file in the checkout and commits it, then the owner syncs through the real `sync_brain` handler. */
-async function runSync(world: World, d: OpDescriptor): Promise<Record<string, unknown>> {
+/** Git's refusal while another Git process (a gbrain Git effect committing a page) holds the checkout's index or a ref lock. */
+const GIT_LOCK_BUSY = /\.lock'?: File exists|cannot lock ref/;
+const USER_COMMIT_RETRY_MS = 20_000;
+
+/**
+ * A user edits a page file in the checkout and commits it with their own `git add` and `git commit`. The commit has
+ * landed only when Git reports every file clean at HEAD (a resubmission after a crash finds it already committed). A
+ * lock another Git process holds is retried, as a person retries; any other failure, or a lock held past the bound,
+ * throws out of `executeOp` and fails the run, so the model is never told of a sync whose user commit does not exist.
+ */
+async function userEdit(world: World, d: OpDescriptor): Promise<void> {
   const root = world.roots?.[d.source];
   if (!root) throw new Error(`op descriptor ${d.id}: source ${d.source} has no checkout`);
   const slug = String(d.args.slug);
@@ -177,8 +191,22 @@ async function runSync(world: World, d: OpDescriptor): Promise<Record<string, un
     writeFileSync(join(root, sibling), `---\ntype: note\ntitle: batch ${i}\n---\n\nBatch page ${i} of ${slug}.\n`);
   }
   const git = (...args: string[]) => Bun.spawnSync(['git', '-C', root, ...args], { stdout: 'pipe', stderr: 'pipe' });
-  git('add', '--', ...files);
-  git('-c', 'user.name=Crash Robot', '-c', 'user.email=robot@example.invalid', 'commit', '-q', '-m', `edit ${slug}`, '--', ...files);
+  const deadline = Date.now() + USER_COMMIT_RETRY_MS;
+  for (;;) {
+    const add = git('add', '--', ...files);
+    const commit = add.exitCode === 0 ? git('-c', 'user.name=Crash Robot', '-c', 'user.email=robot@example.invalid', 'commit', '-q', '-m', `edit ${slug}`, '--', ...files) : add;
+    const status = git('--no-optional-locks', 'status', '--porcelain', '--untracked-files=all', '--', ...files);
+    if (status.exitCode === 0 && status.stdout.length === 0) return;
+    const stderr = commit.stderr.toString().trim();
+    if (!GIT_LOCK_BUSY.test(stderr) || Date.now() > deadline) {
+      throw new Error(`op descriptor ${d.id}: the user's commit of ${slug} did not land (git ${commit === add ? 'add' : 'commit'} exit ${commit.exitCode}): ${stderr || status.stderr.toString().trim() || status.stdout.toString().trim()}`);
+    }
+    await Bun.sleep(100);
+  }
+}
+
+/** The owner syncs the user's commit through the real `sync_brain` handler. */
+async function runSync(world: World, d: OpDescriptor): Promise<Record<string, unknown>> {
   return await operationsByName.sync_brain.handler(contextFor(world, 'local', d.source),
     { source_id: d.source, no_pull: true, no_embed: true }) as Record<string, unknown>;
 }
@@ -251,7 +279,7 @@ async function revokeAccess(world: World, actor: string): Promise<void> {
 
 export function contextFor(world: World, actor: string, sourceId: string): OperationContext {
   const base = { engine: world.engine, config: world.config, dryRun: false, sourceId,
-    logger: { info() {}, warn() {}, error() {} } };
+    logger: { info() {}, warn() {}, error() {} }, ...(world.writeWaitMs !== undefined ? { writeWaitMs: world.writeWaitMs } : {}) };
   if (actor === 'local') return { ...base, remote: false };
   const auth = world.auth.get(actor);
   if (!auth) throw new Error(`op descriptor: actor ${actor} is not an authenticated remote`);
@@ -341,13 +369,14 @@ export async function executeOp(world: World, d: OpDescriptor): Promise<OpObserv
     const { params } = await paramsFor(world, d);
     (world.submitted ??= new Map()).set(d.id, params);
     world.onSubmit?.(d, params);
+    const run = { ...d, args: params as OpDescriptor['args'] };
+    if (d.kind === 'sync') await userEdit(world, run);
     let observation: OpObservation;
     try {
-      const run = { ...d, args: params as OpDescriptor['args'] };
       const result = d.kind === 'sync' ? await runSync(world, run) : await runConnector(world, run);
       const status = String(result.status);
       observation = { ...base, status: ['synced', 'first_sync', 'up_to_date'].includes(status) ? 'committed' : status === 'partial' ? 'pending' : 'refused',
-        ...(['synced', 'first_sync', 'up_to_date', 'partial'].includes(status) ? {} : { code: status }), values: {}, raw: jsonSafe({ status, reason: result.reason }) };
+        ...(['synced', 'first_sync', 'up_to_date', 'partial'].includes(status) ? {} : { code: status }), values: {}, raw: jsonSafe({ status, reason: result.reason, fromCommit: result.fromCommit, toCommit: result.toCommit, added: result.added, modified: result.modified }) };
     } catch (error) {
       const e = error as { code?: string; message?: string };
       observation = { ...base, status: 'refused', code: e.code ?? 'uncoded_error', agentCode: agentEnvelopeCode(error, 'sync_brain'),

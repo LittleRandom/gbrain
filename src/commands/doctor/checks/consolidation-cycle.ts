@@ -9,6 +9,7 @@ import { resolveHoursEnv } from '../../../core/env-number.ts';
 import type { Check } from '../../doctor.ts';
 import type { Action } from '../../../core/agent-output.ts';
 import { agentFix, checkError, infoCheck } from '../check-fix.ts';
+import { isAvailable } from '../../../core/ai/gateway.ts';
 
 /** Local alias; the shared warn-once memo lives in core so it can't fork per module. */
 const _resolveSyncFreshnessHours = resolveHoursEnv;
@@ -34,13 +35,24 @@ const _resolveSyncFreshnessHours = resolveHoursEnv;
  * Single-source brains get `ok` with a "not applicable" message.
  * SQL error → `warn` (own try/catch, not relying on the outer doctor
  * dispatcher — codex flagged this).
+ *
+ * A managed brain refuses that line (`writer_coordinator_required`: managed
+ * sync needs `--no-pull` and rejects `--skip-failed`), so it gets the recipe
+ * it accepts: `gbrain sync --all --no-pull --hard-deadline 13m` every 15
+ * minutes on the owner host, after `gbrain sources refresh <id>` for each
+ * checkout that tracks a remote. Managed sync takes no per-source lock, so
+ * the deadline stays under the interval to keep ticks from overlapping. A
+ * schema without `persistence_brain` reads as unmanaged.
  */
-export async function checkSyncConsolidation(engine: BrainEngine): Promise<Check> {
+export async function checkSyncConsolidation(engine: BrainEngine, opts: { sourceIds?: string[] } = {}): Promise<Check> {
   try {
+    // A remote caller's grant bounds the count: the brain-wide source count
+    // would tell a source-bound token how many sources it cannot see.
     const rows = await engine.executeRaw<{ id: string }>(
       `SELECT id FROM sources
         WHERE archived IS NOT TRUE
-          AND local_path IS NOT NULL`,
+          AND local_path IS NOT NULL${opts.sourceIds ? '\n          AND id = ANY($1::text[])' : ''}`,
+      opts.sourceIds ? [opts.sourceIds] : undefined,
     );
     const sourceCount = rows.length;
     if (sourceCount < 2) {
@@ -48,6 +60,18 @@ export async function checkSyncConsolidation(engine: BrainEngine): Promise<Check
         name: 'sync_consolidation',
         status: 'ok',
         message: 'Single-source brain — sync --all consolidation not applicable.',
+      };
+    }
+    const { managedPersistenceEnabled } = await import('../../../core/persistence/ownership.ts');
+    if (await managedPersistenceEnabled(engine).catch(() => false)) {
+      return {
+        name: 'sync_consolidation',
+        status: 'ok',
+        message:
+          `${sourceCount} active sources on a managed brain. Recommended cron on the owner host, every 15 minutes: ` +
+          '`gbrain sync --all --no-pull --hard-deadline 13m`. Managed sync never pulls: for each checkout that tracks a remote, ' +
+          'chain `gbrain sources refresh <id>;` in front of it to take upstream commits. ' +
+          'Keep the deadline under the interval: managed sync takes no per-source lock, so a tick that outlives the interval would overlap the next one.',
       };
     }
     return {
@@ -215,7 +239,7 @@ export async function checkCycleFreshness(
       }
     }
 
-    const fix = firstStale ? cycleFix(firstStale) : undefined;
+    const fix = firstStale ? cycleFix(firstStale, isAvailable('chat') || isAvailable('embedding')) : undefined;
     if (hasFailures) {
       return {
         name: 'cycle_freshness',
@@ -264,8 +288,11 @@ async function youngOrEmptySources(engine: BrainEngine, ids: string[], now: numb
   return out;
 }
 
-function cycleFix(sourceId: string): Action {
-  return agentFix(['gbrain', 'dream', '--source', sourceId], `Runs one full maintenance cycle for source '${sourceId}' (sync, extract, consolidate). Phases that call a chat model spend provider credits when keys are configured; \`gbrain autopilot --install\` keeps every source cycled.`, 'cycle_freshness',
-    { consent: ['paid'], requires_exclusive: true });
+/** GBRA-438: a keyless brain has no paid phase to run, so the fix asks no paid consent there. */
+function cycleFix(sourceId: string, paid: boolean): Action {
+  return agentFix(['gbrain', 'dream', '--source', sourceId], paid
+    ? `Runs one full maintenance cycle for source '${sourceId}' (sync, extract, consolidate). Phases that call a chat model spend provider credits when keys are configured; \`gbrain autopilot --install\` keeps every source cycled.`
+    : `Runs one full maintenance cycle for source '${sourceId}' (sync, extract, consolidate). No model key is configured, so no phase spends anything.`, 'cycle_freshness',
+    { consent: paid ? ['paid'] : [], requires_exclusive: true });
 }
 

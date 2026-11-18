@@ -205,7 +205,7 @@ slug binding; generic `submit_job` does not accept these job names.
 ## Phase 1: Submit
 
 ```
-gbrain agent run "Research Acme Corp revenue" --tools "search,query"
+gbrain agent run --tools "search,query" "Research Acme Corp revenue"
 ```
 
 `--tools` accepts a comma-separated subset of `BRAIN_TOOL_ALLOWLIST` (see
@@ -313,6 +313,19 @@ Route any operation expected to exceed ~2 minutes through the **highest
 rung of this ladder the deployment supports**. This is a harness-routing
 convention the agent follows, not a mechanical guarantee — nothing stops a
 bare background shell except this skill saying don't.
+
+**Paid work gets consent before it is submitted.** A job runs without a
+terminal, so a paid command (`embed --stale`, or anything else that calls a
+model provider) stops with exit 3 and a consent payload unless it already
+carries the user's approval. Get that approval first, in the conversation:
+run the command's preview (for example `gbrain embed --stale --dry-run`),
+relay the estimate, and only after the user agrees put the approval in the
+submitted command (`gbrain embed --stale --yes --max-usd <cap>` with the cap
+they approved), or rely on a standing approval the user set with
+`gbrain config set consent.preapprove.paid.max_usd_per_run <usd>`. Never add
+`--yes` without the user's answer. When a job ends with exit 3 or the
+`confirmation_required` code, relay its message to the
+user and stop; don't resubmit it with `--yes`.
 
 ### Rung 1 — Minion job + deadman (Postgres + worker)
 
@@ -504,7 +517,7 @@ Total tokens so far: 4.3k
 
 ## When it fails
 
-Follow the [agent operator protocol](../../docs/protocol/AGENT_OPERATOR_v1.md) for any gbrain error `code`, exit code, `[AGENT]` block or notice block. Specific to this skill:
+Follow the [agent operator protocol](../conventions/agent-operator-protocol.md) for any gbrain error `code`, exit code, `[AGENT]` block or notice block. Specific to this skill:
 
 - `gbrain jobs submit` over MCP for a protected job returns `permission_denied`: it must run from the trusted local CLI on the brain host; tell the user.
 - A shell job dead-letters immediately with the flag named in `error_text` (shell jobs disabled): tell the user which env flag the host operator must set; do not retry.
@@ -518,7 +531,7 @@ Follow the [agent operator protocol](../../docs/protocol/AGENT_OPERATOR_v1.md) f
 - Don't spawn > 5 concurrent agents without checking `gbrain jobs stats` first
 - Don't resubmit when a submit reports `coalesced` — the work is already queued; monitor the matched job id instead
 - For subagent work, don't use `sessions_spawn` with `runtime: "subagent"` when Minions is available (use `gbrain agent run` instead)
-- Don't poll `get_job` in a tight loop (use `get_job_progress` for lightweight checks)
+- Don't poll `get_job` in a tight loop: after a long submit, offer `watch_job` when it's listed so gbrain reports back when the job finishes (else `get_job_progress`); on OpenClaw offer `gbrain setup openclaw --wakeshift`, never run it unasked
 - Don't run an operation expected to exceed ~2 minutes as a bare background shell — it dies with the session; route through the Durable execution ladder
 - Don't say "I'll report back when it finishes" without an armed deadman or a scheduled check that will actually fire
 - Don't let a deadman post noise when the completion arrived normally — check reported-state first, stay silent, self-delete

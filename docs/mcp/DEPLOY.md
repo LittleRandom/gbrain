@@ -59,17 +59,25 @@ the OAuth request when issuing my owner login link."*
 ### Local stdio (zero setup)
 
 ```bash
-gbrain serve                  # full operation catalog (default)
-gbrain serve --surface verbs  # just the 7 memory verbs (quickstart surface)
+gbrain serve --surface starter --advertise verbs   # what new registrations pin; a bare serve defaults to the full catalog
 ```
 
 Works with Claude Code, Cursor, Windsurf, and any MCP client that supports stdio.
-No server, no tunnel, no token needed. Works on both PGLite and Postgres engines.
-`--surface verbs` exposes exactly the seven-verb memory protocol (`recall`,
-`remember`, `entity`, `synthesize`, `forget`, `context_pack`, `delta` —
-[MEMORY_VERBS v1](../protocol/MEMORY_VERBS_v1.md)) instead of the full catalog;
-`--surface starter` sits between (~27 ops: the verbs plus the daily-driver set);
-omit the flag (default `full`) for every operation.
+On Claude Code, `gbrain setup claude-code` writes and verifies this registration
+for you ([setup guide](../guides/setup.md)). No server, no tunnel, no token needed. Works on both PGLite and Postgres engines.
+`--surface full` serves every operation; `--advertise verbs` lists only the seven
+memory verbs and `request_tools` in tools/list, and `request_tools` returns any
+other tool's schema. A bare `gbrain serve` lists everything. For a client that cannot hold the full
+catalog, `--surface verbs` exposes exactly the seven-verb memory protocol
+(`recall`, `remember`, `entity`, `synthesize`, `forget`, `context_pack`,
+`delta` — [MEMORY_VERBS v1](../protocol/MEMORY_VERBS_v1.md)) and `--surface
+starter` sits between (40 ops: the verbs plus the daily-driver set).
+
+On a Postgres brain, `gbrain serve --cli-socket` (off by default; or
+`gbrain config set serve.cli_socket true`) also lets this serve answer the
+same user's CLI `search`, `query`, `get` and op-backed `recall` over a
+private Unix socket, so agents that shell out to the CLI skip a cold database
+connection per call ([warm CLI socket](../guides/cli-socket.md)).
 
 `--surface` is the callable ceiling. To keep every operation callable while
 listing fewer tools to the agent, set `mcp.advertised_surface`:
@@ -89,8 +97,12 @@ instructions tell the agent how many more tools are callable. On stdio,
 `request_tools` with `tools: [names]` returns their schemas and adds them to
 that session's list (the server sends `tools/list_changed`). On the OAuth HTTP
 server, a client that set its own surface (`request_tools` with `surface`, or
-`gbrain auth rescope-client`) has that surface listed in full. Unset
-advertises the whole callable set.
+`gbrain auth rescope-client`) has that surface listed in full, and a client an
+install default set up (`gbrain auth clients` shows `full (set by install)`)
+lists the memory verbs and `request_tools` whatever the server's `--advertise`
+or `mcp.advertised_surface` says; `gbrain auth rescope-client <client_id>
+--surface full` lists everything for it. Unset advertises the whole callable
+set.
 
 #### Stdio source binding
 
@@ -388,7 +400,12 @@ A self-registered client goes through three gates:
 2. **Owner approval on `/authorize`.** Every authorization-code connection
    redirects to the admin dashboard, where you see the client, its redirect
    URI, and the requested scopes, and approve or deny. No code is minted
-   until you approve. Consent never widens the registered scope.
+   until you approve. Consent never widens the registered scope. For a newly
+   self-registered client you also choose the source it reads and writes
+   (it registers on `default`); the choice is recorded in the grant audit
+   (`action: consent`), and the first approval ends the choice, so later
+   requests show the source read-only. A `client_credentials` client never
+   gets this choice and stays on `default`.
 3. **Per-request clamp.** Issued codes and tokens are re-intersected with the
    client's current registered scope, so a later `rescope-client` takes effect
    on the next request.
@@ -679,6 +696,24 @@ Retry-After: 5
 - Container health checks that probe `/health` treat the `503` as unhealthy and
   restart the container. Pass `--fail-fast` (or set `GBRAIN_SERVE_FAIL_FAST=1`)
   there so the process exits non-zero with the classified envelope on stderr.
+- A supervisor that should also catch a pool that accepts TCP but answers no
+  real request probes `/health?deep=1` instead: it runs `SELECT 1` through the
+  same pooled dispatch the MCP handlers use, returns the pool block
+  (`checked_out`, `waiters`, `inflight_oldest_ms`, `stuck_discards`, …) and
+  answers 503 when the probe times out or a statement is past the pool's
+  in-flight budget ([pool diagnostics](../ENGINES.md#pg-connection-stuck)). A
+  two-minute interval is fine; one deep probe runs at a time. Every 503 names a
+  stable `code` (`persistence_restart_required`, `pool_inflight_over_budget`,
+  `deep_health_probe_failed`) with `fix` and `docs`, and both answers carry the
+  `transport` block (pooler mode, `max_pipeline`, the server
+  `statement_timeout`); the probe only reports
+  ([serve deep health](../ENGINES.md#serve-deep-health)).
+- To have serve restart itself when it stays unhealthy, set
+  `GBRAIN_SERVE_RESTART_REQUIRED_EXIT_SECONDS=<n>` (at least `120`; in `~/.gbrain/env`
+  for the service `gbrain mcp expose` installs). After `n` continuous seconds
+  of `persistence_restart_required` it exits `69` (`serve_unhealthy_exit`,
+  cleanup bounded at 5 s; at most 3 self-exits per hour) and the supervisor starts a fresh one
+  ([unhealthy exit](../ENGINES.md#serve-unhealthy-exit)).
 - A second `gbrain serve --http` on a port another server already holds exits
   with `serve_port_in_use`. A Postgres connect failure keeps the degraded-engine
   path (`GBRAIN_DB_ACCESS` marker, `gbrain db-repair`).
@@ -726,6 +761,20 @@ Operator checklist:
 
 Optional defense-in-depth: a dedicated Postgres role (or RLS) limited to the
 allowed `source_id`s, so even a leaked connection string can't read everything.
+
+### Writer coordination lock in containers
+
+A managed checkout's writers share one native lock file outside the checkout.
+It lives in `$GBRAIN_HOME/.gbrain/persistence/locks` unless `GBRAIN_HOME` is the
+checkout or lies inside it; then it goes under `GBRAIN_COORDINATION_HOME` (else
+`~/.gbrain/persistence`). For the lock to survive container recreation, mount the
+directory that holds it together with the checkout and its parent: mount
+`GBRAIN_HOME`, or, when `GBRAIN_HOME` is inside the checkout, set
+`GBRAIN_COORDINATION_HOME` to a mounted absolute path outside the checkout in the
+container's environment (a `.env` file in the working directory cannot set it).
+`gbrain sources writer status --json` shows the resolved path and the rule that
+chose it under `onboarding.sources[].coordination_lock`; the full rule is in
+[topologies](../architecture/topologies.md#coordination-lock).
 
 ### Run gbrain under a real init (tini / `--init`)
 

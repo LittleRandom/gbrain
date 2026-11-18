@@ -4,7 +4,7 @@ import { join, resolve } from 'node:path';
 import { isThinClient } from '../config.ts';
 import { opError, OperationError, type OperationContext } from '../ops/contract.ts';
 import { readFix } from '../ops/op-fix.ts';
-import { getWorktreeBinding } from '../persistence/ownership.ts';
+import { getWorktreeBinding, readPersistenceBrain } from '../persistence/ownership.ts';
 import { checkedContentRoot, inventorySkillpack, sameInventory, type PackInventory } from './setup-files.ts';
 import { contentSetupKey, installPackagedSharedSkills, setupSharedBrainContent, type SharedContentReceipt } from './setup.ts';
 import type { DatabaseContentExportReceipt } from './migration-export.ts';
@@ -18,6 +18,8 @@ export interface SharedMigrationStage {
   stage: 'inventory' | 'ownership' | 'projection' | 'policy' | 'members';
   status: 'complete' | 'action_required' | 'conflict' | 'planned';
   reason?: string;
+  /** A conflict's stable code, for readers that must not parse `reason`. */
+  code?: string;
 }
 export interface SharedSourceMigration {
   source_id: string;
@@ -29,6 +31,8 @@ export interface SharedSourceMigration {
   status: 'complete' | 'action_required' | 'conflict' | 'planned';
   member_installations?: SharedMemberMigration[];
   parked?: SharedSourceParked;
+  /** The source's policy could not be read, so the migration preserved its files without inspecting them. */
+  policy_unverified?: true;
 }
 /**
  * A source whose pack exceeds an inventory bound. Later runs skip it without
@@ -97,13 +101,8 @@ export async function runSharedSkillsMigration(ctx: OperationContext, options: {
     report.pending_actions.push('Canonical-content migration belongs on the host. Reconnect this client after upgrading its adapter; no host repository or local grants were created.');
     return report;
   }
-  const [brain] = await ctx.engine.executeRaw<{ brain_id: string; enabled: boolean; skill_bundles_enabled: boolean }>(
-    'SELECT brain_id,enabled,skill_bundles_enabled FROM persistence_brain WHERE singleton=1');
-  if (!brain) {
-    throw opError('writer_not_initialized', 'Apply the shared-skills schema before migrating content.',
-      'This brain has no persistence identity yet, so the shared-skills schema is not applied. Preview the pending migrations with the command in fix, then apply them.',
-      { fix: readFix('Lists the pending schema migrations without applying them.', { argv: ['gbrain', 'apply-migrations', '--dry-run', '--json'] }) });
-  }
+  // #6482: the shared fail-closed read; a missing singleton is `storage_error` with the writer-status probe, never "unmanaged".
+  const brain = await readPersistenceBrain(ctx.engine);
   report.brain_id = brain.brain_id;
   const publication = await legacyPublication(ctx);
   const limits = await readInventoryLimits(ctx.engine);
@@ -130,12 +129,13 @@ export async function runSharedSkillsMigration(ctx: OperationContext, options: {
       root: source.local_path || (source.id === 'default' ? fallback : null), inventory: null, publication, stages: [], status: dryRun ? 'planned' : 'complete' };
     report.sources.push(row);
     const persist = async () => { if (!dryRun) await ctx.engine.setConfig(key, JSON.stringify(row)); };
-    const pending = async (stage: SharedMigrationStage['stage'], reason: string, conflict = false) => {
-      row.status = conflict ? 'conflict' : 'action_required';
-      row.stages.push({ stage, status: row.status, reason });
+    const pending = async (stage: SharedMigrationStage['stage'], reason: string, conflictCode?: string) => {
+      row.status = conflictCode ? 'conflict' : 'action_required';
+      row.stages.push({ stage, status: row.status, reason, ...(conflictCode ? { code: conflictCode } : {}) });
       await persist();
     };
     if (sourcePolicy.mode === 'preserve_files') {
+      if (sourcePolicy.unverified) row.policy_unverified = true;
       row.member_installations = await inspectSharedMemberMigration(ctx.engine, source.id, source.incarnation);
       await pending('projection', sourcePolicy.reason);
       continue;
@@ -199,7 +199,8 @@ export async function runSharedSkillsMigration(ctx: OperationContext, options: {
         await pending('inventory', parkedReason(source.id, row.parked));
         continue;
       }
-      await pending('inventory', error instanceof OperationError ? error.message : 'The source pack cannot be inventoried safely; inspect its manifest and declared files.', true);
+      await pending('inventory', error instanceof OperationError ? error.message : 'The source pack cannot be inventoried safely; inspect its manifest and declared files.',
+        error instanceof OperationError ? error.code : 'local_conflict');
       continue;
     }
     row.stages.push({ stage: 'inventory', status: 'complete' });
@@ -221,7 +222,7 @@ export async function runSharedSkillsMigration(ctx: OperationContext, options: {
     await persist();
     if (!row.inventory) {
       if (existsSync(join(row.root, 'skills')) && readdirSync(join(row.root, 'skills')).length) {
-        await pending('projection', 'Unmanifested source-local skills require reviewed adoption; no files or private markers were replaced.', true);
+        await pending('projection', 'Unmanifested source-local skills require reviewed adoption; no files or private markers were replaced.', 'shared_skills_unmanifested');
         continue;
       }
       if (!dryRun) {

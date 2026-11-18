@@ -177,7 +177,8 @@ This skill guarantees:
 - Sync is incremental: a durable config-scalar watermark plus a trailing-window
   re-list; the watermark advances ONLY on a fully clean run (no fetch errors, no
   `--limit` cap, clean ingest), so a partial run never creates a silent gap.
-- `--dry-run` fetches nothing and writes nothing; `--limit N` caps a run and does
+- `--dry-run` fetches nothing and writes nothing; a listing that stopped early
+  reports `partial` with `listComplete: false`. `--limit N` caps a run and does
   not advance the watermark.
 - Scheduled auto-sync is opt-in per provider (`connectors.<provider>.auto_sync`),
   daily by default, credential-gated and auth-error-gated; it fires for nobody
@@ -190,7 +191,7 @@ This skill guarantees:
 
 ## When it fails
 
-Follow the [agent operator protocol](../../docs/protocol/AGENT_OPERATOR_v1.md) for any gbrain error `code`, exit code, `[AGENT]` block or notice block. Specific to this skill:
+Follow the [agent operator protocol](../conventions/agent-operator-protocol.md) for any gbrain error `code`, exit code, `[AGENT]` block or notice block. Specific to this skill:
 
 - `forbidden` (a Cloudflare/bot challenge): the provider refuses server-side fetch from this machine. Tell the user and switch to the export-file lane (`gbrain transcripts ingest`); never loop retries.
 - An auth error (expired cookie or token): ask the user to re-run `gbrain connectors auth` for that provider themselves; the credential belongs to them and stays on their machine.

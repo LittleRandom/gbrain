@@ -186,7 +186,7 @@ from recurring:
   narration. When a file's behavior changes, UPDATE its entry to the new truth.
 - **CI is the enforcement, not this prose.** `scripts/check-key-files-current-state.sh`
   (in `bun run verify`) fails on the bolded-release-clause marker in the reference
-  docs AND on size caps for CLAUDE, README, the index, and each subsystem. A written rule caused this disease; a guard
+  docs AND on size caps for CLAUDE, the index, and each subsystem. A written rule caused this disease; a guard
   cures it.
 - **After any CLAUDE.md or reference-doc edit, run `bun run build:llms`** — the
   llms bundle inlines/links these (config in `scripts/llms-config.ts`); the
@@ -197,8 +197,8 @@ from recurring:
 Confirm the user's mode choice during installation; relay the matrix in
 `INSTALL_FOR_AGENTS.md` Step 3.5. The current command-level expansion and cost
 contract lives in [search modes](docs/guides/search-modes.md), not a second knob
-table here. `query` expands in every mode unless explicitly disabled; `search`
-and memory verbs do not. Semantic result reuse is disabled.
+table here. `query` never expands by default (`search.expansion true` turns it
+on; `--expand` / `--no-expand` win); `search` and memory verbs never do. Semantic result reuse is disabled.
 
 Read `docs/eval/SEARCH_MODE_METHODOLOGY.md` for eval methodology and
 `docs/eval/METRIC_GLOSSARY.md` for metric definitions. Eval audit records stay in
@@ -301,10 +301,9 @@ checkpoint resume, or DB-contention-aware pace mode.
 
 ## Version locations (single source of truth: `VERSION` file)
 
-Every release updates the required version stamps in the table below.
-`bun run release:restamp` rewrites all of them, renumbers the branch's own
-schema migrations after master's and runs the auto-derived regenerations;
-run it when the PR is next to merge ([how](docs/RELEASING.md#release-restamp)).
+Every release updates the required version stamps in the table below. PRs do
+not: a PR carries a `changelog.d` fragment, and the release PR rewrites every
+row ([releases per batch](docs/RELEASING.md#releases-per-batch)).
 Update TODOS only when filing new work. `/ship`'s Step 12 idempotency check
 catches VERSION vs package.json drift; the canonical list lives here.
 
@@ -366,9 +365,9 @@ four numeric segments are required first. Historical 3-segment versions
   (e.g. "v0.21.0 Code Cathedral"); update only when the README's marketing
   copy is intentionally being refreshed, NOT on every micro/patch bump.
 
-**Always use PATCH without asking**, including the initial release choice;
-override `/ship`'s MINOR/MAJOR prompts. Auto-allocate past collisions, sync all
-version stamps and the PR title, then report the number. This changes numbering
+**PRs carry no version** ([releases per batch](docs/RELEASING.md#releases-per-batch)):
+/ship writes a `changelog.d` fragment, and the release PR picks the next PATCH
+(never MINOR or MAJOR) and syncs every stamp. This changes numbering
 only: scope, merge, deployment, paid-work and validation approvals still apply.
 CI rejects mismatched `VERSION`/`package.json` or versions not newer than master.
 
@@ -469,8 +468,8 @@ This applies to README, CHANGELOG, docs, PRs, commits, issues, and release pages
 
 ## PR title format — version FIRST (IRON RULE)
 
-PR titles and version-bump commit subjects start with the version, followed by
-the conventional-commit subject:
+A PR without a version is titled in plain words. Release PR titles and version-bump commit subjects start with the
+version, followed by the conventional-commit subject:
 
 ```
 vMAJOR.MINOR.PATCH.MICRO <type>(<scope>): <summary> (#issue or wave ref)

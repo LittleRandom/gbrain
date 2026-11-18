@@ -8,6 +8,7 @@
  *   gbrain edge-proposals reject <id>
  *   gbrain edge-proposals undo <id> | --all-applied
  *   gbrain edge-proposals date <id> <YYYY-MM-DD>   date an undated pair: writes "Started <type> [[target]]"
+ *   gbrain edge-proposals retry <id> | --all-held  clear a judge error so the next cycle judges the pair again
  *
  * Every proposal names the subject page, the relationship that ends, the close
  * date (from relationship-specific evidence) and why. gbrain never invents a
@@ -17,34 +18,45 @@ import type { BrainEngine } from '../core/engine.ts';
 import { applyEdgeProposal, rejectEdgeProposal, undoEdgeProposal, DREAM_TIMELINE_SOURCE } from '../core/cycle/edge-contradictions.ts';
 import { isCalendarDate, dateKey } from '../core/link-validity.ts';
 import { setCliExitVerdict } from '../core/cli-force-exit.ts';
+import { intFlagValue } from '../cli/flag-values.ts';
+import { EDGE_PROPOSALS_SUBCOMMANDS, ROUTERS, subcommandHelpRequested } from '../cli/subcommands.ts';
+import { bigintToStringReplacer } from '../core/utils.ts';
 
 const STATUSES = ['proposed', 'applied', 'rejected', 'undone', 'stale', 'reverted_by_user', 'undated_unresolved', 'ambiguous_same_date', 'compatible', 'error'];
 
 interface Row {
-  id: number; status: string; link_type: string; subject: string; a_target: string; b_target: string; ending: string | null;
+  id: number | string; status: string; link_type: string; subject: string; a_target: string; b_target: string; ending: string | null;
   close_date: unknown; born_closed: boolean; model: string | null; confidence: number | null; generated_line: string | null; created_at: unknown;
 }
 
 function usage(): string {
   return [
-    'Usage: gbrain edge-proposals <list|show|accept|reject|undo|date> [args]',
+    'Usage: gbrain edge-proposals <list|show|accept|reject|undo|date|retry> [args]',
     '  list [--status <status|all>] [--limit N] [--json]   default status: proposed + undated_unresolved',
     '  show <id> [--json]',
     '  accept <id>             write the closure line on the subject page and re-derive its links',
     '  reject <id>             keep both relationships',
     '  undo <id> | --all-applied   remove the closure line(s) this phase wrote',
     '  date <id> <YYYY-MM-DD>  record when the newer relationship started (undated pairs), then re-run the dream cycle',
+    '  retry <id> | --all-held clear a judge error (held after 3 attempts) so the next dream cycle judges the pair again',
   ].join('\n');
 }
 
+/** Postgres returns `bigint` ids as BigInt (#6193): a safe integer stays a number, anything larger an exact string. */
+function normalizeId(id: unknown): number | string {
+  const n = Number(id);
+  return Number.isSafeInteger(n) ? n : String(id);
+}
+
 async function rows(engine: BrainEngine, where: string, params: unknown[], limit = 50): Promise<Row[]> {
-  return engine.executeRaw<Row>(
+  const raw = await engine.executeRaw<Row>(
     `SELECT p.id, p.status, p.link_type, f.slug AS subject, ta.slug AS a_target, tb.slug AS b_target, te.slug AS ending,
             p.close_date::text AS close_date, p.born_closed, p.model, p.confidence, p.generated_line, p.created_at
        FROM link_edge_proposals p
        JOIN pages f ON f.id = p.from_page_id JOIN pages ta ON ta.id = p.a_to_page_id JOIN pages tb ON tb.id = p.b_to_page_id
        LEFT JOIN pages te ON te.id = p.ending_to_page_id
       WHERE ${where} ORDER BY p.created_at DESC, p.id DESC LIMIT ${Math.max(1, Math.min(1000, limit))}`, params);
+  return raw.map(r => ({ ...r, id: normalizeId(r.id) }));
 }
 
 function describe(r: Row): string {
@@ -56,20 +68,38 @@ function describe(r: Row): string {
   return `#${r.id} [${r.status}] ${pair}`;
 }
 
-export async function runEdgeProposals(engine: BrainEngine, args: string[]): Promise<void> {
-  const [sub, ...rest] = args;
-  const json = rest.includes('--json');
-  const flag = (name: string) => { const i = rest.indexOf(name); return i >= 0 ? rest[i + 1] : undefined; };
-  const id = Number(rest.find(a => /^\d+$/.test(a)));
-  const out = (value: unknown, text: string) => console.log(json ? JSON.stringify(value, null, 2) : text);
+export { EDGE_PROPOSALS_SUBCOMMANDS as SUBCOMMANDS } from '../cli/subcommands.ts';
 
-  if (!sub || sub === '--help' || sub === 'help') { console.log(usage()); return; }
+export function printUsage(): void {
+  console.log(usage());
+}
+
+export async function runEdgeProposals(engine: BrainEngine, args: string[]): Promise<void> {
+  if (subcommandHelpRequested(args, ROUTERS['edge-proposals'])) { printUsage(); return; }
+  const [sub, ...rest] = args as [(typeof EDGE_PROPOSALS_SUBCOMMANDS)[number] | undefined, ...string[]];
+  const json = rest.includes('--json');
+  const flag = (name: string) => {
+    const at = rest.findIndex(a => a === name || a.startsWith(`${name}=`));
+    if (at < 0) return undefined;
+    return rest[at] === name ? rest[at + 1] ?? '' : rest[at]!.slice(name.length + 1);
+  };
+  const id = Number(rest.find(a => /^\d+$/.test(a)));
+  const out = (value: unknown, text: string) => console.log(json ? JSON.stringify(value, bigintToStringReplacer, 2) : text);
+
+  if (!sub) { printUsage(); return; }
   if (sub === 'list') {
     const status = flag('--status');
     if (status && status !== 'all' && !STATUSES.includes(status)) { console.error(`Unknown status ${status}. One of: ${STATUSES.join(', ')}, all`); setCliExitVerdict(2); return; }
-    const list = status === 'all' ? await rows(engine, 'TRUE', [], Number(flag('--limit') ?? 50))
-      : await rows(engine, 'p.status = ANY($1::text[])', [status ? [status] : ['proposed', 'undated_unresolved']], Number(flag('--limit') ?? 50));
+    const rawLimit = flag('--limit');
+    const limit = rawLimit === undefined ? 50 : intFlagValue(rawLimit, '--limit', { min: 1, example: 50 });
+    const list = status === 'all' ? await rows(engine, 'TRUE', [], limit)
+      : await rows(engine, 'p.status = ANY($1::text[])', [status ? [status] : ['proposed', 'undated_unresolved']], limit);
     out(list, list.length ? list.map(describe).join('\n') + '\n\nNext: gbrain edge-proposals accept <id> | reject <id>' : 'No open relationship proposals.');
+    return;
+  }
+  if (sub === 'retry' && rest.includes('--all-held')) {
+    const cleared = await engine.executeRaw<{ id: number }>(`DELETE FROM link_edge_proposals WHERE status = 'error' AND detail LIKE 'held after %' RETURNING id`);
+    out({ cleared: cleared.map(r => normalizeId(r.id)) }, `${cleared.length} held judge error(s) cleared; the next dream cycle judges those pairs again.`);
     return;
   }
   if (!Number.isSafeInteger(id) || id <= 0) { console.error(`${usage()}\n\nA proposal id is required (gbrain edge-proposals list shows them).`); setCliExitVerdict(2); return; }
@@ -90,6 +120,12 @@ export async function runEdgeProposals(engine: BrainEngine, args: string[]): Pro
     const result = sub === 'accept' ? await applyEdgeProposal(engine, id) : sub === 'reject' ? await rejectEdgeProposal(engine, id) : await undoEdgeProposal(engine, id);
     out({ id, ...result }, `#${id}: ${result.status}${result.reason ? ` — ${result.reason}` : ''}`);
     if (!['applied', 'rejected', 'undone'].includes(result.status)) setCliExitVerdict(1);
+    return;
+  }
+  if (sub === 'retry') {
+    const cleared = await engine.executeRaw<{ id: number }>(`DELETE FROM link_edge_proposals WHERE id = $1 AND status = 'error' RETURNING id`, [id]);
+    if (!cleared.length) { console.error(`No judge error #${id}.`); setCliExitVerdict(1); return; }
+    out({ id, status: 'cleared' }, `#${id}: cleared; the next dream cycle judges the pair again.`);
     return;
   }
   if (sub === 'date') {

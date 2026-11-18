@@ -7,13 +7,15 @@ import type { BrainEngine } from '../engine.ts';
 import type { PageSnapshot } from '../page-state/types.ts';
 import type { WriteAuthority, WriteRequest } from '../persistence/model.ts';
 import { derivedExtractionSkip } from '../persistence/derived-extraction-gate.ts';
+import { isSegmentedPage } from '../page-body/page-shape.ts';
+import type { BodyStorage } from '../page-body/types.ts';
 import { CHRONICLE_ACTIVATED_AT_KEY, autoChronicleSetting, chronicleSettings, type ChronicleSettings } from './config.ts';
 import { CHRONICLE_EXTRACTOR_VERSION, type ChronicleLedgerRow, type ChronicleTrigger } from './contract.ts';
 import { isChronicleEligible, isChronicleShaped } from './eligibility.ts';
 import { chronicleBackstopReceipt, type ChronicleBackstopReceipt, type ChronicleReasonCode, type ChronicleReasonContext } from './reasons.ts';
 
 /** Publications that import page content and therefore carry a decision (C1). */
-const DECIDING_OPERATIONS = new Set(['put_page', 'capture', 'edit_page', 'restore_page', 'revert_version']);
+const DECIDING_OPERATIONS = new Set(['put_page', 'capture', 'edit_page', 'append_page', 'restore_page', 'revert_version']);
 const DECIDING_INTENTS = new Set(['managed_sync_import', 'connector_v2_import']);
 /** Skip reasons after which an earlier extracted generation of the page is retired (E8). */
 export const RETIRE_REASONS = ['not_chronicle_shaped', 'dream_generated', 'too_short'] as const;
@@ -21,7 +23,10 @@ export const RETIRE_REASONS = ['not_chronicle_shaped', 'dream_generated', 'too_s
 export interface ChronicleDecisionPage {
   type: string;
   slug: string;
+  /** For a segmented page, its `truth_lead` (the page row has no `compiled_truth`). */
   compiled_truth?: string | null;
+  body_storage?: BodyStorage | null;
+  body_bytes?: number | null;
   frontmatter?: Record<string, unknown> | null;
   effective_date?: Date | string | null;
   effective_date_source?: string | null;
@@ -123,7 +128,8 @@ export interface ChronicleRowWrite {
  * Record a decision. An extracted row stays extracted unless a later
  * generation of the page was extracted after it (A→B→A re-extracts A once,
  * E9); a pending or failed backfill row is never overwritten by an
- * automatic decision.
+ * automatic decision. A new decision leaves any `--max-usd` campaign
+ * (#6199): its stamp is cleared, and only campaign.ts writes one.
  */
 export async function upsertChronicleRow(engine: BrainEngine, w: ChronicleRowWrite): Promise<boolean> {
   const written = await engine.executeRaw(
@@ -133,7 +139,8 @@ export async function upsertChronicleRow(engine: BrainEngine, w: ChronicleRowWri
      ON CONFLICT (source_id, page_id, content_hash, extractor_version) DO UPDATE SET
        slug=EXCLUDED.slug, state=EXCLUDED.state, reason=EXCLUDED.reason, trigger=EXCLUDED.trigger,
        principal_kind=EXCLUDED.principal_kind, principal_id=EXCLUDED.principal_id, request_id=EXCLUDED.request_id,
-       no_extract=EXCLUDED.no_extract, next_attempt_at=EXCLUDED.next_attempt_at, decided_at=now(), updated_at=now()
+       no_extract=EXCLUDED.no_extract, next_attempt_at=EXCLUDED.next_attempt_at, decided_at=now(), updated_at=now(),
+       campaign_id=NULL, attempt_cap_usd=NULL, max_attempts=NULL, pricing_policy=NULL, campaign_max_usd=NULL
      WHERE NOT (EXCLUDED.trigger='auto' AND c.trigger='backfill' AND c.state IN ('pending','failed'))
        AND (c.state <> 'extracted' OR EXISTS (SELECT 1 FROM chronicle_page_state newer
          WHERE newer.source_id=c.source_id AND newer.page_id=c.page_id AND newer.content_hash<>c.content_hash
@@ -171,8 +178,12 @@ export async function recordChronicleDecision(tx: BrainEngine, row: DecidingRequ
   outcome: Record<string, unknown>): Promise<void> {
   if (!snapshot || snapshot.page.deleted_at || !snapshot.page.content_hash || !row.operation) return;
   const kind = typeof row.intent?.kind === 'string' ? row.intent.kind : null;
-  if (!DECIDING_OPERATIONS.has(row.operation) && !(row.operation === 'submit_job' && kind && DECIDING_INTENTS.has(kind))) return;
   const page = snapshot.page;
+  if (!DECIDING_OPERATIONS.has(row.operation) && !(row.operation === 'submit_job' && kind && DECIDING_INTENTS.has(kind))) {
+    // #9636: add_link authors no content; it only carries a still-pending automatic decision to the revision it publishes.
+    if (row.operation !== 'add_link' || !(await tx.executeRaw(`SELECT 1 FROM chronicle_page_state WHERE source_id=$1 AND page_id=$2 AND state='pending'
+      AND trigger='auto' AND no_extract=false AND extractor_version=$3 LIMIT 1`, [row.source_id, Number(page.id), CHRONICLE_EXTRACTOR_VERSION])).length) return;
+  }
   const base = { sourceId: row.source_id, pageId: Number(page.id), contentHash: String(page.content_hash), slug: page.slug,
     trigger: 'auto' as const, principalKind: row.principal_kind ?? null, principalId: row.principal_id ?? null, requestId: row.id };
   if (!isChronicleShaped(page.type, page.slug)) {
@@ -188,7 +199,10 @@ export async function recordChronicleDecision(tx: BrainEngine, row: DecidingRequ
   }
   const now = new Date();
   const setting = autoChronicleSetting(enabledRaw);
-  const decision = decideChronicle({ page, authority: row.authority ?? null, noExtract,
+  const decisionPage: ChronicleDecisionPage = isSegmentedPage(page) ? { type: page.type, slug: page.slug, frontmatter: page.frontmatter,
+    effective_date: page.effective_date, effective_date_source: page.effective_date_source, body_storage: page.body_storage, body_bytes: page.body_bytes,
+    compiled_truth: (await tx.executeRaw<{ truth_lead: string | null }>('SELECT truth_lead FROM pages WHERE id=$1', [page.id]))[0]?.truth_lead } : page;
+  const decision = decideChronicle({ page: decisionPage, authority: row.authority ?? null, noExtract,
     enabled: setting === 'on', invalidSetting: setting === 'invalid', settings, now });
   const receiptCtx: ChronicleReasonContext = { sourceId: base.sourceId, since: now.toISOString().slice(0, 10),
     dailyLimit: settings.dailyLimit, recentDays: settings.recentDays };

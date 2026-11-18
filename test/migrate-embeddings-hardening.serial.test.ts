@@ -46,6 +46,7 @@ const OUTGOING_RERANKER = 'fixture-provider:reranker-v1';
 import {
   configureGateway,
   resetGateway,
+  requireConfig,
   __setEmbedTransportForTests,
 } from '../src/core/ai/gateway.ts';
 import { runEmbedCore } from '../src/commands/embed.ts';
@@ -387,7 +388,7 @@ describe('reranker companion (D8)', () => {
       const plan = await resolveRerankerPlan(engine, 'fixture-provider:embedding-v1', 'voyage:voyage-4', undefined);
       expect(plan.exposed).not.toBeNull();
       expect(plan.exposed!.model).toBe(OUTGOING_RERANKER);
-      expect(plan.action).toEqual({ kind: 'switch', to: 'voyage:rerank-2.5' });
+      expect(plan.action).toEqual({ kind: 'switch', to: 'voyage:rerank-3-lite' });
     } finally {
       await engine.unsetConfig('search.reranker.model');
     }
@@ -404,7 +405,7 @@ describe('reranker companion (D8)', () => {
       const plan = await resolveRerankerPlan(engine, 'fixture-provider:embedding-v1', 'openai:text-embedding-3-small', undefined);
       expect(plan.exposed).not.toBeNull();
       expect(plan.action.kind).toBe('none');
-      expect((plan.action as { suggestion: string | null }).suggestion).toBe('voyage:rerank-2.5');
+      expect((plan.action as { suggestion: string | null }).suggestion).toBe('voyage:rerank-3-lite');
     } finally {
       await engine.unsetConfig('search.reranker.model');
     }
@@ -712,6 +713,26 @@ describe('config-plane hygiene (env leak + env-canonical gates)', () => {
       else process.env.OPENROUTER_API_KEY = prevOpenRouter;
       // persistEmbeddingFileConfig reconfigured the in-process gateway from
       // the env-merged view — restore the baseline file plane + gateway.
+      writeFileConfig('openai:text-embedding-3-small', TO_DIMS);
+      configureGateway({
+        embedding_model: 'openai:text-embedding-3-small',
+        embedding_dimensions: TO_DIMS,
+        env: { OPENAI_API_KEY: 'sk-test-fake', VOYAGE_API_KEY: 'pa-test-fake' },
+      });
+      installTransport();
+    }
+  }, 30000);
+
+  test('#7666: the post-apply gateway keeps a DB-plane provider_base_urls override, and the file plane never gains it', async () => {
+    const cfgPath = join(tmpHome, '.gbrain', 'config.json');
+    const url = 'http://127.0.0.1:11435/v1';
+    await engine.setConfig('provider_base_urls.ollama', url);
+    try {
+      await persistEmbeddingFileConfig('openai:text-embedding-3-small', TO_DIMS, engine);
+      expect(requireConfig().base_urls?.ollama).toBe(url);
+      expect(readFileSync(cfgPath, 'utf-8')).not.toContain(url);
+    } finally {
+      await engine.executeRaw(`DELETE FROM config WHERE key = 'provider_base_urls.ollama'`);
       writeFileConfig('openai:text-embedding-3-small', TO_DIMS);
       configureGateway({
         embedding_model: 'openai:text-embedding-3-small',
@@ -1094,6 +1115,25 @@ describe('empty-brain migration (plan pin 15)', () => {
     } finally {
       await e2.disconnect();
       writeFileConfig('openai:text-embedding-3-small', TO_DIMS);
+    }
+  }, 120000);
+});
+
+describe('concurrent-writer census', () => {
+  test('an unreadable worker registry does not also drop the embed-job count', async () => {
+    const registry = join(tmpHome, '.gbrain', 'workers');
+    rmSync(registry, { recursive: true, force: true });
+    writeFileSync(registry, 'not a directory');
+    await engine.executeRaw(
+      `INSERT INTO minion_jobs (submission_authority, name, queue, status, created_at, updated_at)
+       VALUES ('{"version":1,"kind":"application"}'::jsonb, 'embed-backfill', 'default', 'waiting', now(), now())`,
+    );
+    try {
+      const ctx = await planMigrationFlow(engine, { to: 'openai:text-embedding-3-small', dim: TO_DIMS });
+      expect(ctx.concurrentWriters).toEqual({ workers: null, embedJobs: 1 });
+    } finally {
+      await engine.executeRaw(`DELETE FROM minion_jobs WHERE name = 'embed-backfill'`);
+      rmSync(registry, { force: true });
     }
   }, 120000);
 });

@@ -91,6 +91,11 @@ interface QueueState {
 const queues = new Map<BrainEngine, QueueState>();
 const pendingEventIds = new Map<string, number>();
 let dropped = 0;
+/**
+ * The `how_to_rate` cadence counter, per client and PROCESS-LOCAL: it resets
+ * when the process restarts, so a restarted server coaches again on its first
+ * answer. The visible MCP rate line (dispatch `rateLine`) does not depend on it.
+ */
 let answersSinceHint = new Map<string, number>();
 
 function enqueue(engine: BrainEngine, job: Job): void {
@@ -140,6 +145,8 @@ async function runQueue(q: QueueState): Promise<void> {
     }
   } finally {
     q.running = null;
+    // A drained queue holds nothing, so it does not keep its engine alive (a host may open an engine per request).
+    if (q.jobs.length === 0 && queues.get(q.engine) === q) queues.delete(q.engine);
   }
 }
 

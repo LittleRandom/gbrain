@@ -55,11 +55,17 @@ test('pending sources are retained separately for each engine', async () => fixt
   await seed(a.engine, 'alpha'); await seed(a.engine, 'beta'); await seed(b.engine, 'alpha');
   scheduleDeferredSyncEmbeds(a.engine, 'alpha'); scheduleDeferredSyncEmbeds(a.engine, 'beta');
   scheduleDeferredSyncEmbeds(b.engine, 'alpha');
-  const stdout: unknown[][] = [], originalLog = console.log;
+  const stdout: unknown[][] = [], stderr: string[] = [], originalLog = console.log, originalWrite = process.stderr.write.bind(process.stderr);
   console.log = (...args: unknown[]) => { stdout.push(args); };
+  process.stderr.write = ((chunk: string | Uint8Array) => { stderr.push(String(chunk)); return true; }) as typeof process.stderr.write;
   try { await maybeDrainDeferredEmbeds(a.engine); }
-  finally { console.log = originalLog; }
+  finally { console.log = originalLog; process.stderr.write = originalWrite; }
   expect(stdout).toEqual([]); // The resident stdio owner's protocol stays clean.
+  // GBRA-133: the pass logs its start, each source's duration and its decision with the pass duration.
+  const lines = stderr.join('').split('\n').filter(line => line.startsWith('[serve-sync] embed-drain'));
+  expect(lines[0]).toBe('[serve-sync] embed-drain started sources=2');
+  expect(lines.filter(line => /^\[serve-sync\] embed-drain embedded=\d+ failures=0 source=(alpha|beta) ms=\d+$/.test(line))).toHaveLength(2);
+  expect(lines.at(-1)).toMatch(/^\[serve-sync\] embed-drain decision=(drained|retry)( delay_ms=\d+ failures=\d+)? ms=\d+$/);
   expect(await embedded(a.engine, 'alpha')).toBe(true);
   expect(await embedded(a.engine, 'beta')).toBe(true);
   expect(await embedded(b.engine, 'alpha')).toBe(false);
@@ -109,4 +115,22 @@ test('disconnect retains the native owner until an abort-ignoring provider settl
   expect(inspectLockHolder(path).held).toBe(false);
   await engine.connect({ database_path: path });
   expect((await engine.executeRaw<{ n: number }>('SELECT 1 AS n'))[0].n).toBe(1);
+}), 60_000);
+
+test('a brain whose database row disables embedding drains as keyless, not as a failure (#9715)', async () => fixture(async make => {
+  const { engine } = await make('disabled');
+  await seed(engine, 'alpha');
+  await engine.setConfig('embedding_disabled', 'true');
+  let sent = 0;
+  __setEmbedTransportForTests(async ({ values }) => { sent += values.length; return vectors(values); });
+  scheduleDeferredSyncEmbeds(engine, 'alpha');
+  const stderr: string[] = [], originalWrite = process.stderr.write.bind(process.stderr);
+  process.stderr.write = ((chunk: string | Uint8Array) => { stderr.push(String(chunk)); return true; }) as typeof process.stderr.write;
+  try { await maybeDrainDeferredEmbeds(engine); }
+  finally { process.stderr.write = originalWrite; }
+  const lines = stderr.join('').split('\n').filter(line => line.startsWith('[serve-sync] embed-drain'));
+  expect(lines.some(line => line.includes('failed'))).toBe(false);
+  expect(lines.at(-1)).toMatch(/decision=keyless/);
+  expect(sent).toBe(0);
+  expect(await embedded(engine, 'alpha')).toBe(false);
 }), 60_000);

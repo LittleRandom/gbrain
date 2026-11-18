@@ -144,7 +144,7 @@ describe('#2964: sync auto-inits a never-git-initialized default brain dir', () 
     expect(existsSync(join(dir, '.git'))).toBe(true);
   });
 
-  test('a registered non-default local source (sourceId != default, no remote_url) on a non-git dir still throws — not auto-inited', async () => {
+  test('a registered non-default local source (sourceId != default, no remote_url) on a non-git dir is imported without Git (#7973) — not auto-inited', async () => {
     await engine.executeRaw(
       `INSERT INTO sources (id, name, local_path, config) VALUES ('mysource', 'mysource', $1, '{}'::jsonb)`,
       [dir],
@@ -158,7 +158,7 @@ describe('#2964: sync auto-inits a never-git-initialized default brain dir', () 
         noEmbed: true,
         full: true,
       }),
-    ).rejects.toThrow(/git repository/i);
+    ).resolves.toMatchObject({ status: 'synced' });
     expect(existsSync(join(dir, '.git'))).toBe(false);
   });
 
@@ -277,10 +277,10 @@ describe('#2964: sync auto-inits a never-git-initialized default brain dir', () 
   test('a gbrain.yml that mentions db_only but resolves no dirs refuses the baseline commit (round 6 P2: unsupported-syntax sniff test)', async () => {
     const { performSync } = await import('../src/commands/sync.ts');
     const { execSync } = await import('child_process');
-    // Flow-style array — valid YAML, but the narrow custom parser only
-    // handles block-style lists, so loadStorageConfig warns and resolves
-    // an empty db_only list rather than throwing.
-    writeFileSync(join(dir, 'gbrain.yml'), 'storage:\n  db_only: [private-cache/]\n');
+    // A flow-style array split over lines — valid YAML, but the narrow
+    // custom parser reads block lists and one-line flow lists only (#8007),
+    // so loadStorageConfig resolves an empty db_only list rather than throwing.
+    writeFileSync(join(dir, 'gbrain.yml'), 'storage:\n  db_only: [private-cache/,\n    archive/]\n');
 
     await expect(
       performSync(engine, { noPull: true, noEmbed: true, full: true }),
@@ -369,4 +369,29 @@ describe('#2964: sync auto-inits a never-git-initialized default brain dir', () 
     expect(statSync(join(dir, '.git')).isFile()).toBe(true);
   });
 
+});
+
+describe('GST-2767: the self-heal never initializes a brain dir that sits inside another repository', () => {
+  let engine: PGLiteEngine;
+  let outer: string;
+  beforeAll(async () => { engine = new PGLiteEngine(); await engine.connect({}); await engine.initSchema(); }, 60_000);
+  afterAll(async () => { await engine.disconnect(); }, 60_000);
+  afterEach(() => { if (outer) rmSync(outer, { recursive: true, force: true }); });
+
+  for (const via of ['real', 'link'] as const) {
+    test('a brain dir under a repository git cannot read (both probes throw), reached by its ' + via + ' path, is refused and gets no .git of its own', async () => {
+      await resetPgliteState(engine);
+      const { performSync } = await import('../src/commands/sync.ts');
+      const { mkdirSync, symlinkSync } = await import('fs');
+      outer = mkdtempSync(join(tmpdir(), 'gbrain-2767-outer-'));
+      mkdirSync(join(outer, 'repo-a', 'brain'), { recursive: true });
+      writeFileSync(join(outer, 'repo-a', '.git'), 'gitdir: /nonexistent-gitdir-2767\n');
+      writeFileSync(join(outer, 'repo-a', 'brain', 'page1.md'), mdPage('Page 1'));
+      const brain = via === 'real' ? join(outer, 'repo-a', 'brain') : join(outer, 'source-a');
+      if (via === 'link') symlinkSync(join(outer, 'repo-a', 'brain'), brain);
+      await engine.setConfig('sync.repo_path', brain);
+      await expect(performSync(engine, { repoPath: brain, noPull: true, noEmbed: true, full: true })).rejects.toThrow(/sits above it and git cannot open it/);
+      expect(existsSync(join(outer, 'repo-a', 'brain', '.git'))).toBe(false);
+    });
+  }
 });

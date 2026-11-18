@@ -10,13 +10,14 @@
  * pattern: by the time a handler runs, operations.ts has finished loading).
  */
 
-// WP4 (request_tools): the four static imports below are runtime leaves
+// WP4 (request_tools): the static imports below are runtime leaves
 // relative to operations.ts (no import cycles back into it). The cyclic
 // dependencies — src/mcp/surface.ts (→ brain-allowlist → operations),
 // src/mcp/publish-gates.ts (→ operations), and the assembled `operations`
 // array itself — are loaded via dynamic import inside the handler instead
 // (the verbs.ts house pattern).
 import { isUndefinedColumnError } from '../utils.ts';
+import { suggestNearest } from '../levenshtein.ts';
 import { hasScope, operationScopesAllowed } from '../scope.ts';
 import { RateLimiter } from '../../mcp/rate-limit.ts';
 import { writeSurfaceChangeAudit } from '../surface-audit.ts';
@@ -158,20 +159,20 @@ const request_tools: Operation = {
   name: 'request_tools',
   idempotent: false,
   outputRedaction: 'no_stored_text',
-  description: 'More tools: no arguments lists your catalog; {tools: [names]} returns schemas; {surface} widens it (per OAuth client; stdio: this session).',
+  description: 'More tools and params: no arguments lists your catalog; {tools: [names]} returns schemas with every param you may pass; {surface} widens it (per client or stdio session).',
   area: 'discovery',
   // FOV-4: callable by read OR agent scope — discovery for every token class.
   agentCallable: true,
   params: {
     tools: {
       type: 'array',
-      items: { type: 'string', description: 'A tool name from the catalog.' },
-      description: 'Tool names to fetch schemas for.',
+      items: { type: 'string' },
+      description: 'Tool names to fetch.',
     },
     surface: {
       type: 'string',
       enum: ['verbs', 'starter', 'full'],
-      description: 'Surface to widen to (stdio: this session only).',
+      description: 'stdio: this session only.',
     },
   },
   scope: 'read',
@@ -186,18 +187,16 @@ const request_tools: Operation = {
     // callers were never surface-bounded.
     const ceiling = ctx.surfaceCeiling ?? 'full';
 
-    // D5: the three branches are mutually exclusive. {surface, tools}
-    // together is ambiguous (persist vs descriptor fetch) — reject loudly
-    // rather than silently persisting and ignoring the tools list.
+    // GBRA-449: {surface, tools} together runs the surface branch exactly as a surface-only call (its refusals
+    // included), then the descriptor branch against the resulting surface; surface_change carries the first answer.
     if (p.surface !== undefined && p.tools !== undefined) {
-      throw opError(
-        'invalid_params',
-        'pass either {surface} (persist) or {tools} (descriptor fetch), not both.',
-        'Call request_tools once with `tools` to fetch descriptors, and separately with `surface` to change this client\'s tool surface.',
-      );
+      const surfaceChange = await request_tools.handler(ctx, { surface: p.surface }) as Record<string, unknown>;
+      const changed = !surfaceChange.dry_run && (surfaceChange.persisted === true || surfaceChange.scope === 'session') && isMcpSurface(surfaceChange.surface as string);
+      const described = changed ? { ...ctx, surface: surfaceChange.surface as OperationContext['surface'] } : ctx;
+      return { ...(await request_tools.handler(described, { tools: p.tools }) as Record<string, unknown>), surface_change: surfaceChange };
     }
 
-    // ── persist branch (D5: accepts ONLY {surface}) ─────────────────────
+    // ── persist branch ({surface}) ──────────────────────────────────────
     if (p.surface !== undefined) {
       const requested = p.surface as string;
       if (!isMcpSurface(requested)) {
@@ -294,47 +293,76 @@ const request_tools: Operation = {
     const catalogCeiling = session && session.widenAllowed && !session.readOnly ? clampSurface('full') : ceiling;
     const visible = await visibleOpsForCaller(ctx, catalogCeiling);
 
+    const catalog = () => {
+      const groups = new Map<string, Array<{ name: string; one_line: string }>>();
+      for (const op of visible) {
+        // Area names are non-contractual grouping labels (amendment 22).
+        const area = op.area ?? 'other';
+        const bucket = groups.get(area) ?? [];
+        bucket.push({ name: op.name, one_line: firstSentenceOf(op.description) });
+        groups.set(area, bucket);
+      }
+      return [...groups.entries()]
+        .sort(([a], [b]) => a.localeCompare(b))
+        .map(([area, tools]) => ({ area, tools }));
+    };
+    const catalogNote = session
+      ? 'Call request_tools {tools: ["name", ...]} for full schemas, or {surface: "starter"|"full"} to add those tools to this session (nothing is written).'
+      : 'Call request_tools {tools: ["name", ...]} for full schemas, or {surface: "starter"|"full"} to persist a wider tool surface for your OAuth client (within the server ceiling), then re-issue tools/list.';
+
     // ── descriptor branch (D5: read-only) ───────────────────────────────
     if (p.tools !== undefined) {
       const requested = (p.tools as unknown[]).filter((t): t is string => typeof t === 'string');
-      const byName = new Map(visible.map(o => [o.name, o]));
+      // Registry definitions less the params dispatch refuses on this connection's surface (#9669): a starter op keeps the
+      // full-surface-only params on its reviewed list (STARTER_CALLABLE_PARAMS) and drops the rest.
+      const { operations } = await import('../operations.ts');
+      const { paramCallable } = await import('../../mcp/surface.ts');
+      const surfaceParams = (op: Operation): Operation => ({ ...op, params: Object.fromEntries(Object.entries(op.params).filter(([key]) => paramCallable(op, key, ctx.surface ?? 'full'))) });
+      const visibleSet = new Set(visible.map(o => o.name));
+      const byName = new Map(operations.filter(o => visibleSet.has(o.name)).map(o => [o.name, o]));
       const picked: Operation[] = [];
       const seen = new Set<string>();
       for (const name of requested) {
         if (seen.has(name)) continue;
         seen.add(name);
         const op = byName.get(name);
-        if (op) picked.push(op); // invisible names silently omitted (D5)
+        if (op) picked.push(surfaceParams(op)); // invisible names silently omitted (D5)
+      }
+      if (picked.length === 0) {
+        // D1: an empty or unknown-only list gets the catalog instead of `{tools: []}`.
+        // Suggestions come only from the caller-visible set and requested names are
+        // never echoed, so an existing-but-invisible name and a nonexistent one
+        // produce the same bytes (no existence oracle).
+        const visibleNames = visible.map(o => o.name);
+        const didYouMean = [...new Set([...seen].map(name => suggestNearest(name, visibleNames)).filter((n): n is string => n !== null))].sort();
+        return {
+          tools: [],
+          ...(didYouMean.length ? { did_you_mean: didYouMean } : {}),
+          catalog: catalog(),
+          total_tools: visible.length,
+          note: `${seen.size ? 'None of the requested names is a tool this connection can call. ' : ''}${didYouMean.length ? 'The closest callable names are in did_you_mean; the' : 'The'} catalog lists every tool you can call. ${catalogNote}`,
+        };
       }
       const { buildToolDefs } = await import('../../mcp/tool-defs.ts');
       const { resolveStrictParamsMode } = await import('../../mcp/validate-params.ts');
       const strictParams = (await resolveStrictParamsMode(ctx.engine, ctx.config)) === 'reject';
-      if (ctx.revealTools && picked.length) {
-        ctx.revealTools(picked.map(o => o.name));
-        return { tools: buildToolDefs(picked, { strictParams }), listed: true, note: 'These tools are now in your tool list (tools/list_changed was sent); call them directly.' };
+      if (ctx.revealTools) {
+        // A widenable session's catalog reaches past what it serves; only tools it can call now are listed.
+        const callable = catalogCeiling === ceiling ? visibleSet : new Set((await visibleOpsForCaller(ctx, ceiling)).map(o => o.name));
+        const reachable = picked.filter(o => callable.has(o.name)).map(o => o.name);
+        const outside = picked.filter(o => !callable.has(o.name)).map(o => `\`${o.name}\``);
+        if (reachable.length) ctx.revealTools(reachable);
+        if (!outside.length) return { tools: buildToolDefs(picked, { strictParams }), listed: true, note: 'These tools are now in your tool list (tools/list_changed was sent); call them directly.' };
+        return {
+          tools: buildToolDefs(picked, { strictParams }), listed: false,
+          note: `${reachable.length ? `${reachable.map(n => `\`${n}\``).join(', ')} are now in your tool list (tools/list_changed was sent). ` : ''}${outside.join(', ')} are outside this session's '${ceiling}' surface, so they are not listed and cannot be called yet: call request_tools {"surface":"full"} to add them to this session, then call them by name.`,
+        };
       }
       return { tools: buildToolDefs(picked, { strictParams }) };
     }
 
     // ── catalog branch (no args) ────────────────────────────────────────
-    const groups = new Map<string, Array<{ name: string; one_line: string }>>();
-    for (const op of visible) {
-      // Area names are non-contractual grouping labels (amendment 22).
-      const area = op.area ?? 'other';
-      const bucket = groups.get(area) ?? [];
-      bucket.push({ name: op.name, one_line: firstSentenceOf(op.description) });
-      groups.set(area, bucket);
-    }
-    const catalog = [...groups.entries()]
-      .sort(([a], [b]) => a.localeCompare(b))
-      .map(([area, tools]) => ({ area, tools }));
-    return {
-      catalog,
-      total_tools: visible.length,
-      note: session
-        ? 'Call request_tools {tools: ["name", ...]} for full schemas, or {surface: "starter"|"full"} to add those tools to this session (nothing is written).'
-        : 'Call request_tools {tools: ["name", ...]} for full schemas, or {surface: "starter"|"full"} to persist a wider tool surface for your OAuth client (within the server ceiling), then re-issue tools/list.',
-    };
+    return { catalog: catalog(), total_tools: visible.length, note: catalogNote };
   },
 };
 

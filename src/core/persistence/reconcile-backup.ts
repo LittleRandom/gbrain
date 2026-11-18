@@ -21,6 +21,8 @@ import { authorizeStoredRequest } from './authority.ts';
 const backupPattern = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}\.[a-f0-9]{64}\.json$/;
 const backupReference = (brain: string, principal: Principal, requestId: string) => `${requestId}.${digest({ brain, principal, requestId })}.json`;
 const backupDirectory = () => join(canonicalFilesystemPath(configDir()), 'reconciliation-previews');
+/** Whether a backup is retained under this request id (#6712 PR 4b: a keep_db admission refused after retention leaves one and no request). */
+export const reconcileBackupRetained = (brain: string, principal: Principal, requestId: string): boolean => existsSync(join(backupDirectory(), backupReference(brain, principal, requestId)));
 const receiptFix = (requestId: string): Action => readFix('The receipt shows whether this reconcile request is still pending, recovering or terminal.',
   { argv: ['gbrain', 'write-request', '--', requestId] });
 const privatePermissions = (stat: Stats) => process.platform === 'win32' ||
@@ -141,7 +143,7 @@ export async function manageReconcileBackups(engine: BrainEngine, authority: Wri
     }
     const limits = await readJournalLimits(engine);
     return { source_id: authority.sourceId, slug, backups, next_after: rows.length > limit ? rows[limit - 1].request_id : null,
-      capacity: { max_retained_bytes: limits.brainRecoveryBytes, max_retained_count: limits.brainLifetimeIds } };
+      capacity: { max_retained_bytes: limits.brainRecoveryBytes, ...(Number.isFinite(limits.brainLifetimeIds) ? { max_retained_count: limits.brainLifetimeIds } : {}) } };
   }
   const reference = params.backup_reference!;
   if (!backupPattern.test(reference)) throw opError('invalid_params', 'An exact private backup reference is required.',

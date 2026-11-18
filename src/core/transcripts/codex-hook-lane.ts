@@ -113,6 +113,17 @@ export interface ParsedCodexTranscript extends ParsedTranscript {
  * documented accounting). Throws only on filesystem errors — callers confine
  * first and fail open.
  */
+/**
+ * #8016: Codex bookkeeping events that carry no turn but are expected in a
+ * session that opened and closed with no prompt. A named allowlist, so an
+ * unknown record type still reads as drift.
+ */
+const CODEX_BOOKKEEPING_EVENTS = new Set(['thread_settings_applied']);
+function isCodexBookkeeping(entry: unknown): boolean {
+  const e = entry as { type?: unknown; payload?: { type?: unknown } } | null;
+  return e?.type === 'event_msg' && typeof e.payload?.type === 'string' && CODEX_BOOKKEEPING_EVENTS.has(e.payload.type);
+}
+
 export function parseCodexHookTranscript(
   path: string,
   opts: { maxBytes?: number; collectToolCalls?: boolean } = {},
@@ -153,6 +164,7 @@ export function parseCodexHookTranscript(
   let cwd: string | undefined;
   let parsedLines = 0;
   let skippedLines = 0;
+  let headerLines = 0;
 
   for (const line of raw.split('\n')) {
     const t = line.trim();
@@ -168,6 +180,7 @@ export function parseCodexHookTranscript(
     const mapped = mapCodexLine(entry);
     switch (mapped.kind) {
       case 'session':
+        headerLines++;
         // #4981: first header wins (a forked rollout inherits its parent's header
         // later in the file); identity is payload.id, the id in the rollout filename.
         if (!sessionId && mapped.sessionId) sessionId = mapped.sessionId;
@@ -197,6 +210,7 @@ export function parseCodexHookTranscript(
         boundaryTurnIndexes.push(turns.length);
         break;
       case 'skip':
+        if (isCodexBookkeeping(entry)) headerLines++; // #8016: recognized, carries no turn
         break;
     }
   }
@@ -214,6 +228,7 @@ export function parseCodexHookTranscript(
     toolCallTurnIndexes,
     sessionId,
     cwd,
+    recognizedOnly: parsedLines > 0 && skippedLines === 0 && headerLines === parsedLines,
   };
 }
 

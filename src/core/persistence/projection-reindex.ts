@@ -8,6 +8,7 @@ import { loadConfig } from '../config.ts';
 import { readProjectionSnapshot, preparePageProjection, installPageProjection, installPageEmbeddings, retryProjectionConflict } from '../page-state/projections.ts';
 import { PageRevisionConflictError } from '../page-state/types.ts';
 import { embedBatchWithBackoff } from '../embed-retry.ts';
+import { embeddingSendBlocked } from '../embedding-disabled.ts';
 import { submissionAuthority } from './authority.ts';
 import { currentVerifiedLocalWriter, registerLocalWriter } from './identity.ts';
 import { getWorktreeBinding, managedPersistenceEnabled } from './ownership.ts';
@@ -77,7 +78,7 @@ export async function reindexCodeProjection(engine: BrainEngine, slug: string, s
       return { status: 'imported' as const, chunks: projection.chunks.length };
     });
   }
-  if (!opts.noEmbed && result.status === 'imported') {
+  if (!opts.noEmbed && result.status === 'imported' && !await embeddingSendBlocked(engine)) {
     const prepared = await readProjectionSnapshot(engine, slug, sourceId);
     if (!prepared) throw opError('revision_conflict', 'Code changed before embedding preparation.',
       `Code page ${slug} in source ${sourceId} changed after its text was reindexed, so no vectors were computed; the reindexed text is committed. Run gbrain reindex-code --source ${sourceId} again to embed the current revision.`,
@@ -93,8 +94,8 @@ export async function reindexCodeProjection(engine: BrainEngine, slug: string, s
       const installed = await installPageEmbeddings(engine, prepared, chunks.map((c, i) => ({
         chunk_index: c.chunk_index, chunk_text: c.chunk_text, chunk_source: c.chunk_source,
         model: prepared.embeddingModel ?? undefined, embedding: vectors[i] })));
-      if (!installed) throw opError('revision_conflict', 'Code changed while embedding; text remains queued or searchable without new vectors.',
-        `Code page ${slug} in source ${sourceId} changed while its vectors were computed, so they were discarded. Run gbrain reindex-code --source ${sourceId} again to embed the current revision.`,
+      if (!installed.complete) throw opError('revision_conflict', 'Code changed while embedding; text remains queued or searchable without new vectors.',
+        `Code page ${slug} in source ${sourceId} changed while its vectors were computed, so only the ${installed.installed} of ${chunks.length} vectors whose chunks are unchanged were installed. Run gbrain reindex-code --source ${sourceId} again to embed the current revision.`,
         { fix: previewFix(sourceId) });
     }
   }

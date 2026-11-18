@@ -3,20 +3,28 @@
  * edges when their target appears, stay private, and never loop the stale
  * sweep. Postgres arm: test/e2e/wanted-links-postgres.test.ts.
  */
-import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
+import { afterAll, beforeAll, describe, expect, spyOn, test } from 'bun:test';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
-import { extractStaleFromDB } from '../src/commands/extract.ts';
-import { collectWantedLinks } from '../src/core/wanted-links.ts';
-import type { LinkCandidate } from '../src/core/link-extraction.ts';
-import { bareNameReferenceSettles, disabledClearsRows, forwardReferenceHeals, onlyUnresolvedAuthoredReferences,
-  privateOriginsStayPrivate, restoredTargetHeals } from './helpers/wanted-links-scenarios.ts';
+import { extractStaleFromDB, runExtract } from '../src/commands/extract.ts';
+import { collectWantedLinks, possibleWantedRows } from '../src/core/wanted-links.ts';
+import { LINK_EXTRACTOR_VERSION_TS, type LinkCandidate } from '../src/core/link-extraction.ts';
+import { bareNameReferenceSettles, BRACKETED_CODE, disabledClearsRows, FOREIGN_PREFIXES, forwardReferenceHeals,
+  impossibleTargetsNeverAbortTheSweep, impossibleTargetsStayOutOfWrites, onlyUnresolvedAuthoredReferences, POSSIBLE_WANTED,
+  privateOriginsStayPrivate, restoredTargetHeals, basenameRowPublishedAfterItsTargetWasWrittenWakesItsOrigin, nameRowPublishedAfterItsTargetWasWrittenWakesItsOrigin,
+  topLevelSlugNamePageEditWakesOnce, topLevelSlugNameReferenceSettles, wantedKeys } from './helpers/wanted-links-scenarios.ts';
 
 test('a link written before its target exists becomes an edge after the target is created', () => forwardReferenceHeals(), 120_000);
 test('resolved references, prose paths and code spans are never wanted', () => onlyUnresolvedAuthoredReferences(), 120_000);
 test('a bare-name reference matched only by basename settles after one re-extraction', () => bareNameReferenceSettles(), 120_000);
+test('#9140: a bare-name reference equal to a top-level slug settles after one re-extraction', () => topLevelSlugNameReferenceSettles(), 120_000);
+test('#9140: editing the top-level page wakes that origin once, and one extraction settles it again', () => topLevelSlugNamePageEditWakesOnce(), 120_000);
+test('GST-2460: a bare name\'s exact-slug page first written during an extraction wakes its origin', () => nameRowPublishedAfterItsTargetWasWrittenWakesItsOrigin(), 120_000);
+test('GST-2460: a basename match first written during an extraction wakes its origin', () => basenameRowPublishedAfterItsTargetWasWrittenWakesItsOrigin(), 120_000);
 test('remote callers never see targets or counts from private origins', () => privateOriginsStayPrivate(), 120_000);
 test('restoring a deleted target heals links written while it was deleted', () => restoredTargetHeals(), 120_000);
 test('wanted_pages.enabled=false clears an origin\'s rows on its next extraction', () => disabledClearsRows(), 120_000);
+test('#6228/#6225: the stale sweep skips targets no page can have and finishes', () => impossibleTargetsNeverAbortTheSweep(), 120_000);
+test('#6228/#6225: a put_page records and reports only targets a page can have', () => impossibleTargetsStayOutOfWrites(), 120_000);
 
 describe('collectWantedLinks', () => {
   const candidate = (targetSlug: string, key: string, extra: Partial<LinkCandidate> = {}): LinkCandidate => ({
@@ -80,5 +88,65 @@ describe('unmanaged brain', () => {
     expect(await engine.executeRaw(`SELECT f.slug FROM links l JOIN pages f ON f.id=l.from_page_id JOIN pages t ON t.id=l.to_page_id
       WHERE t.slug='people/carol-example'`)).toEqual([{ slug: 'notes/lunch' }]);
     expect(await engine.executeRaw('SELECT target_ref FROM wanted_links')).toEqual([]);
+  }, 120_000);
+});
+
+describe('frontmatter links to dotted slugs and Obsidian paths (#6623, #6701)', () => {
+  let engine: PGLiteEngine;
+  beforeAll(async () => {
+    engine = new PGLiteEngine();
+    await engine.connect({});
+    await engine.initSchema();
+  }, 60_000);
+  afterAll(async () => { await engine.disconnect(); }, 60_000);
+
+  test('related: to existing targets creates the edges, leaves no wanted row and the sweep settles', async () => {
+    // Titles are unrelated to the slugs so the title fuzzy step cannot mask the exact-slug step.
+    const targets = ['requests/x/template-1.0.0-alignment', 'companies/acme.io', 'sources/voice/2030-01-01-1200-call-with-mira'];
+    await engine.putPage(targets[0]!, { type: 'note', title: 'Roadmap notes', compiled_truth: 'Target.', timeline: '' });
+    await engine.putPage(targets[1]!, { type: 'company', title: 'Example Co', compiled_truth: 'Target.', timeline: '' });
+    await engine.putPage(targets[2]!, { type: 'note', title: 'Quarterly sync', compiled_truth: 'Target.', timeline: '' });
+    await engine.putPage('products/p1', { type: 'note', title: 'P1', compiled_truth: 'P1.', timeline: '',
+      frontmatter: { related: [targets[0], targets[1], 'sources/voice/2030-01-01 1200 Call with Mira'] } });
+    await extractStaleFromDB(engine, { dryRun: false, jsonMode: true, quiet: true, catchUp: true, includeFrontmatter: true });
+    expect(await engine.executeRaw(`SELECT t.slug AS target FROM links l JOIN pages f ON f.id=l.from_page_id JOIN pages t ON t.id=l.to_page_id
+      WHERE f.slug='products/p1' ORDER BY t.slug`)).toEqual([...targets].sort().map(target => ({ target })));
+    expect(await engine.executeRaw('SELECT target_ref FROM wanted_links')).toEqual([]);
+    expect(await engine.countStalePagesForExtraction({ versionTs: LINK_EXTRACTOR_VERSION_TS })).toBe(0);
+  }, 120_000);
+});
+
+describe('#6228/#6225 targets no page can have, unmanaged brain', () => {
+  let engine: PGLiteEngine;
+  beforeAll(async () => {
+    engine = new PGLiteEngine();
+    await engine.connect({});
+    await engine.initSchema();
+    await engine.executeRaw("INSERT INTO sources (id, name) VALUES ('archive', 'archive')");
+    await engine.setConfig('link_resolution.cross_source', 'true');
+  }, 60_000);
+  afterAll(async () => { await engine.disconnect(); }, 60_000);
+
+  test('possibleWantedRows keeps valid slugs, names and registered sources only', async () => {
+    const row = (ref_kind: 'slug' | 'name', target_source_id: string, target_ref: string) => ({ ref_kind, target_source_id, target_ref });
+    const kept = await possibleWantedRows(engine, 'default', [row('slug', 'default', '/api\\.example/, x'), row('slug', 'default', 'a/../b'),
+      row('slug', 'default', 'people/bob-example'), row('name', 'default', 'bob-example'), row('slug', 'memory', '4242'),
+      row('name', 'nowhere', 'erin'), row('slug', 'archive', 'people/erin-example')]);
+    expect(kept).toEqual([row('slug', 'default', 'people/bob-example'), row('name', 'default', 'bob-example'),
+      row('slug', 'archive', 'people/erin-example')]);
+  });
+
+  test('extract links --source db and the stale sweep both finish and land every valid link', async () => {
+    await engine.putPage('people/alice-example', { type: 'person', title: 'Alice', compiled_truth: 'Alice.', timeline: '' });
+    await engine.putPage('src/routes.test.ts', { type: 'code', title: 'Routes', compiled_truth: BRACKETED_CODE, timeline: '' });
+    await engine.putPage('notes/citations', { type: 'note', title: 'Citations', compiled_truth: FOREIGN_PREFIXES, timeline: '' });
+    const quiet = spyOn(console, 'log').mockImplementation(() => {});
+    const exit = spyOn(process, 'exit').mockImplementation(code => { throw new Error(`extract exited ${code}`); });
+    try { await runExtract(engine, ['links', '--source', 'db']); } finally { exit.mockRestore(); quiet.mockRestore(); }
+    expect(await wantedKeys(engine)).toEqual(POSSIBLE_WANTED);
+    await extractStaleFromDB(engine, { dryRun: false, jsonMode: true, quiet: true, catchUp: true });
+    expect(await engine.countStalePagesForExtraction({ versionTs: LINK_EXTRACTOR_VERSION_TS })).toBe(0);
+    expect(await engine.executeRaw(`SELECT f.slug FROM links l JOIN pages f ON f.id = l.from_page_id JOIN pages t ON t.id = l.to_page_id
+      WHERE t.slug = 'people/alice-example' ORDER BY f.slug`)).toEqual([{ slug: 'notes/citations' }, { slug: 'src/routes.test.ts' }]);
   }, 120_000);
 });

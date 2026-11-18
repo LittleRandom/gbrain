@@ -95,9 +95,12 @@ export async function runLongMemEvalForProbe(args: LongMemEvalProbeArgs): Promis
  * `--model` and the extractor `RunOpts.extractorModel`. `--no-embed-cache`
  * (C-N5): the cache swaps the gateway's process-global embed transport for
  * the run, which inside the daemon would also catch every other embed call.
+ * `--reader-mode direct` (#6627): the judge grades DIRECTNESS, and the notes
+ * reader's whole notes-plus-reasoning text becomes the hypothesis, so the
+ * probe uses the original terse reader. The shared reader prompts stay as-is.
  */
 export function buildLongMemEvalProbeCall(args: LongMemEvalProbeArgs): { argv: string[]; runOpts: RunOpts } {
-  const argv = [args.fixturePath, '--output', args.outputPath, '--no-embed-cache'];
+  const argv = [args.fixturePath, '--output', args.outputPath, '--no-embed-cache', '--reader-mode', 'direct'];
   const runOpts: RunOpts = { searchConfigSnapshot: args.searchConfigSnapshot, exitOnError: false };
   if (args.modelRoutes) {
     argv.push('--model', args.modelRoutes.reader.model);
@@ -148,7 +151,11 @@ const SLOT_FLAGS: ReadonlyArray<readonly [NightlyProbeSlotId, string]> = [
  * `--slot-<x>-model` flag, which wins over the #4636 substitution, and with
  * routes the batch keeps the gateway the caller refreshed from the brain
  * (`useConfiguredGateway`) instead of rebuilding it from the file plane.
- * With no routes the call is the pre-#5872 one.
+ * With no routes the call is the pre-#5872 one. `--concurrent 1` (#7534):
+ * every judge call reserves its worst case against the run cap until it
+ * settles, so questions run one at a time (each question's judges still run
+ * together) and a cap that pays for the probe is not refused for holding
+ * several questions' worst cases at once.
  */
 export function buildCrossModalProbeCall(args: CrossModalProbeArgs): { argv: string[]; opts: RunCrossModalOpts } {
   const argv = [
@@ -158,6 +165,8 @@ export function buildCrossModalProbeCall(args: CrossModalProbeArgs): { argv: str
     args.summaryPath,
     '--max-usd',
     String(args.maxUsd),
+    '--concurrent',
+    '1',
     '--dimensions',
     PROBE_QA_DIMENSIONS.join(','),
     '--yes',

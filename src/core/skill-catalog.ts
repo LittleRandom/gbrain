@@ -38,7 +38,8 @@
 
 import { existsSync, readFileSync, realpathSync, statSync } from 'fs';
 import { basename, join, relative, resolve } from 'path';
-import { FAILSAFE_SCHEMA, load } from 'js-yaml';
+import { FAILSAFE_SCHEMA } from 'js-yaml';
+import { loadBoundedYaml as load } from './data-frontmatter.ts';
 import {
   autoDetectSkillsDir,
   autoDetectSkillsDirReadOnly,
@@ -47,8 +48,11 @@ import {
   type SkillsDirSource,
 } from './repo-root.ts';
 import { loadOrDeriveManifest, type ManifestEntry } from './skill-manifest.ts';
+import { relativeEscapesRoot } from './path-confine.ts';
 import { loadSkillTriggerIndex, FRONTMATTER_SECTION } from './skill-trigger-index.ts';
 import { parseSkillFrontmatter } from './skill-frontmatter.ts';
+import { oneLineDescription } from './skill-description.ts';
+import { splitWords } from './skills/resolver/tokenize.ts';
 import { operationScopesAllowed } from './scope.ts';
 import { currentVerifiedLocalWriter } from './persistence/identity.ts';
 import { disabledOpsForPublishGates } from '../mcp/publish-gates.ts';
@@ -97,6 +101,14 @@ export interface SkillCatalogEntry {
   unavailable_tools: string[];
   writes_pages: boolean;
   mutating: boolean;
+  /** #6471: present only when the call carried `query`; see `scoreSkillMatch`. */
+  match?: SkillMatch;
+}
+
+/** #6471: lexical relevance of a skill to a task. `matched_on` names the strongest contributor. */
+export interface SkillMatch {
+  score: number;
+  matched_on: 'trigger' | 'name' | 'description';
 }
 
 export interface ListSkillsResult {
@@ -276,7 +288,7 @@ export function confineManifestPath(skillsDir: string, entry: ManifestEntry): st
     throw new OperationError('page_not_found', `Skill file not found: ${entry.name}`, `The skills manifest lists ${entry.name} but its SKILL.md is missing on the brain host. Call list_skills for the skills that are available; the host's operator restores the file or regenerates the manifest.`);
   }
   const rel = relative(realRoot, realCandidate);
-  if (rel.startsWith('..') || resolve(realRoot, rel) !== realCandidate) {
+  if (relativeEscapesRoot(rel) || resolve(realRoot, rel) !== realCandidate) { // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal -- rel comes from relative() of two realpaths; resolve only re-joins it to confirm containment, no file is opened here
     throw new OperationError('invalid_params', `Skill path escapes skills dir: ${entry.name}`,
       `The manifest entry for ${entry.name} points outside the skills directory, so it is refused. Pick another skill from list_skills; the brain host's operator fixes the manifest.`);
   }
@@ -369,72 +381,13 @@ function resolveSkillTools(
 // Frontmatter projection + description
 // ---------------------------------------------------------------------------
 
-/**
- * Parse a `description:` from raw frontmatter (best-effort).
- *
- * #1711: handles YAML block scalars. `description: |` (literal) and
- * `description: >` (folded), with optional chomping/indent indicators
- * (`|-`, `>+`, `|2`), are parsed by reading the following indented lines and
- * folding them into a single line for the one-line catalog. Pre-fix the regex
- * captured the bare `|`/`>` indicator as the description, so block-scalar skills
- * showed a literal "|" in the catalog instead of their text.
- */
-function parseDescriptionField(raw: string): string | undefined {
-  const lines = raw.split('\n');
-  for (let i = 0; i < lines.length; i++) {
-    const m = lines[i].match(/^description:[ \t]*(.*)$/);
-    if (!m) continue;
-    const inline = m[1].trim();
-
-    // Block scalar indicator (`|`, `>`, with optional chomp `+`/`-` and indent digit).
-    if (/^[|>][+-]?\d*$/.test(inline)) {
-      const block: string[] = [];
-      let baseIndent: number | null = null;
-      for (let j = i + 1; j < lines.length; j++) {
-        const line = lines[j];
-        if (line.trim().length === 0) { block.push(''); continue; }
-        const indent = line.length - line.trimStart().length;
-        if (baseIndent === null) {
-          if (indent === 0) break;   // no indented continuation
-          baseIndent = indent;
-        }
-        if (indent < baseIndent) break;  // dedent ends the block
-        block.push(line.slice(baseIndent));
-      }
-      // Catalog descriptions are one line; collapse literal/folded whitespace.
-      const folded = block.join(' ').replace(/\s+/g, ' ').trim();
-      return folded.length > 0 ? folded : undefined;
-    }
-
-    // Inline scalar: strip a matching pair of surrounding quotes.
-    const unq = inline.replace(/^(['"])([\s\S]*)\1$/, '$2').trim();
-    return unq.length > 0 ? unq : undefined;
-  }
-  return undefined;
-}
-
 /** Strip the leading `---\n...\n---` fence; return the prose body. */
 function stripFrontmatterFence(content: string): string {
   const m = content.match(/^---\n[\s\S]*?\n---\n?/);
   return m ? content.slice(m[0].length) : content;
 }
 
-/** First non-empty, non-heading prose line of the body (description fallback). */
-function firstProseLine(body: string): string {
-  for (const line of body.split('\n')) {
-    const t = line.trim();
-    if (t.length === 0) continue;
-    if (t.startsWith('#')) continue;
-    if (t.startsWith('<!--')) continue;
-    return t.replace(/^[*_>`-]+\s*/, '').trim();
-  }
-  return '';
-}
-
-/** description = frontmatter `description:` or first prose line, else ''. */
-export function oneLineDescription(raw: string, body: string): string {
-  return parseDescriptionField(raw) ?? firstProseLine(body);
-}
+export { oneLineDescription };
 
 // ---------------------------------------------------------------------------
 // Catalog assembly
@@ -473,21 +426,62 @@ function dirNameOf(entry: ManifestEntry): string {
   return entry.path.split('/')[0] ?? entry.name;
 }
 
+const QUERY_STOPWORDS = new Set(['a', 'an', 'the', 'and', 'or', 'of', 'to', 'for', 'in', 'on', 'at', 'by', 'with', 'my', 'me', 'is', 'it', 'be', 'this', 'that', 'from', 'as']);
+const QUERY_RESULT_LIMIT_DEFAULT = 10;
+const QUERY_RESULT_LIMIT_MAX = 100;
+
+/** Lowercased word tokens; hyphens and punctuation split, so `meeting-prep` is `meeting` + `prep`. */
+function queryTokens(text: string): string[] {
+  return splitWords(text).filter(t => t.length >= 2 && !QUERY_STOPWORDS.has(t));
+}
+
+/**
+ * #6471: lexical token overlap between a task and one catalog entry. Trigger
+ * tokens count 2 each and a whole trigger phrase inside the query counts
+ * double again; name tokens count 3; description tokens count 1. Null when
+ * nothing overlaps (the entry is dropped from a ranked list). No model call:
+ * the catalog is ~100 entries and `list_skills` must stay keyless and fast.
+ */
+export function scoreSkillMatch(entry: Pick<SkillCatalogEntry, 'name' | 'description' | 'triggers'>, query: string): SkillMatch | null {
+  const queryWords = queryTokens(query);
+  if (queryWords.length === 0) return null;
+  const inQuery = new Set(queryWords);
+  const queryText = ` ${queryWords.join(' ')} `;
+  const overlap = (text: string): number => new Set(queryTokens(text).filter(t => inQuery.has(t))).size;
+  let trigger = 0;
+  for (const phrase of entry.triggers) {
+    const words = queryTokens(phrase);
+    if (words.length === 0) continue;
+    trigger += queryText.includes(` ${words.join(' ')} `) ? 4 * words.length : 2 * overlap(phrase);
+  }
+  const name = 3 * overlap(entry.name);
+  const description = overlap(entry.description);
+  const score = trigger + name + description;
+  if (score === 0) return null;
+  const matched_on = trigger >= name && trigger >= description ? 'trigger' : name >= description ? 'name' : 'description';
+  return { score, matched_on };
+}
+
 /**
  * Build the flat host-repo skill catalog + the instructional envelope. Resilient:
  * a single malformed/escaping skill is skipped, never throws the whole call.
+ * With `opts.query` (#6471) the section-filtered catalog is ranked by
+ * `scoreSkillMatch`, zero-score entries are dropped, ties break by name and
+ * `opts.limit` (default 10, max 100) caps the list; without it the output is
+ * unchanged.
  */
 export function buildSkillCatalog(
   ctx: OperationContext,
   skillsDir: string,
   source: ResolvedSkillsDirSource,
-  opts: { section?: string; gateDisabled?: ReadonlySet<string> } = {},
+  opts: { section?: string; gateDisabled?: ReadonlySet<string>; query?: string; limit?: number } = {},
 ): ListSkillsResult {
   const { skills: manifest } = loadOrDeriveManifest(skillsDir);
   const triggerMap = buildTriggerMap(skillsDir);
   const sectionFilter = opts.section?.trim();
+  const query = opts.query?.trim();
 
-  const skills: SkillCatalogEntry[] = [];
+  let skills: SkillCatalogEntry[] = [];
   for (const entry of manifest) {
     let path: string;
     try {
@@ -529,6 +523,13 @@ export function buildSkillCatalog(
   }
 
   skills.sort((a, b) => a.name.localeCompare(b.name));
+  if (query) {
+    const limit = Math.min(QUERY_RESULT_LIMIT_MAX, Math.max(1, Math.floor(opts.limit ?? QUERY_RESULT_LIMIT_DEFAULT)));
+    skills = skills
+      .flatMap(entry => { const match = scoreSkillMatch(entry, query); return match ? [{ ...entry, match }] : []; })
+      .sort((a, b) => b.match!.score - a.match!.score || a.name.localeCompare(b.name))
+      .slice(0, limit);
+  }
 
   return {
     schema_version: 1,

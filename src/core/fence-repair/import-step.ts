@@ -11,14 +11,15 @@
  * number is never reused and a stored row keeps its number.
  */
 import type { BrainEngine } from '../engine.ts';
-import { parseFactsFence } from '../facts-fence.ts';
+import { parseFactsFenceFor } from '../facts-fence.ts';
 import { parseTakesFence } from '../takes-fence.ts';
 import { screenFenceCtx, type ContentRefusal, type FenceScreen, type ImportScreenResult } from '../import-screen.ts';
 import type { ParsedMarkdown, ParseOpts } from '../markdown.ts';
 import { VERSION } from '../../version.ts';
+import { fenceBody } from '../page-body/page-shape.ts';
 import { fencesNormalizeEnabled } from './config.ts';
 import { fenceRefusal, scanCanonicalFences, targetFenceRefusal } from './refusal.ts';
-import { effectiveVisibility } from '../search/private-visibility.ts';
+import { effectiveVisibility, folderRestricted } from '../search/private-visibility.ts';
 import { fenceIssuesWire, fenceStep, residualLocation, type FenceIssueWire, type FenceStep } from './tier1.ts';
 import type { FenceCtx, FenceFix, FenceKind, FencePage, StoredRowMap } from './types.ts';
 
@@ -26,7 +27,7 @@ import type { FenceCtx, FenceFix, FenceKind, FencePage, StoredRowMap } from './t
 export function hiddenFenceRows(existing: FencePage): Set<number> {
   const rows = new Set<number>();
   for (const text of [existing.compiled_truth ?? '', existing.timeline ?? '']) {
-    for (const fact of parseFactsFence(text).facts) if (fact.visibility !== 'world') rows.add(fact.rowNum);
+    for (const fact of parseFactsFenceFor(text, existing).facts) if (fact.visibility !== 'world') rows.add(fact.rowNum);
     for (const take of parseTakesFence(text).takes) rows.add(take.rowNum);
   }
   return rows;
@@ -86,7 +87,7 @@ export async function applyImportFences(input: Omit<Parameters<typeof resolveImp
   screen: ImportScreenResult; parsed: { compiled_truth: string; timeline: string; type: ParsedMarkdown['type']; frontmatter: ParsedMarkdown['frontmatter'] };
   existing: { id: number; compiled_truth: string; timeline?: string | null; deleted_at?: Date | null } | null;
 }): Promise<{ refused?: { slug: string; status: 'error'; chunks: 0; error: string; refusal: ContentRefusal; skip_reason: 'invalid_fence' }; fields: { fences_normalized?: FenceFix[]; fence_issues?: FenceIssueWire[] } }> {
-  const existing = input.existing && input.existing.deleted_at == null ? { id: input.existing.id, compiled_truth: input.existing.compiled_truth, timeline: input.existing.timeline ?? '' } : null;
+  const existing = input.existing && input.existing.deleted_at == null ? { id: input.existing.id, ...fenceBody(input.existing) } : null;
   const fences = await resolveImportFences({ ...input, screen: (input.screen as { fences?: FenceScreen }).fences, existing });
   if (fences.refusal) return { refused: { slug: input.slug, status: 'error', chunks: 0, error: fences.refusal.message, refusal: fences.refusal, skip_reason: 'invalid_fence' }, fields: {} };
   if (fences.page) ({ compiled_truth: input.parsed.compiled_truth, timeline: input.parsed.timeline } = fences.page);
@@ -100,14 +101,14 @@ export async function applyImportFences(input: Omit<Parameters<typeof resolveImp
  * when it has something to rewrite.
  */
 export async function resolveImportFences(input: {
-  engine: Pick<BrainEngine, 'executeRaw' | 'getConfig'>; sourceId: string; slug: string; mode: 'coordinated' | 'lenient';
+  engine: Pick<BrainEngine, 'executeRaw' | 'getConfig' | 'isFolderRestricted'>; sourceId: string; slug: string; mode: 'coordinated' | 'lenient';
   screened: FenceScreen | null | undefined; screen: FenceScreen | undefined;
   parsed: Pick<ParsedMarkdown, 'compiled_truth' | 'timeline' | 'type' | 'frontmatter'>; activePack?: ParseOpts['activePack'];
   existing: (FencePage & { id: number }) | null; remote: boolean;
 }): Promise<ImportFences> {
   const verdict = input.screened !== undefined ? input.screened ?? undefined : input.screen;
   if (!verdict) return { fixes: [], warnings: [] };
-  const ctx = screenFenceCtx(input.parsed, input.activePack);
+  const ctx = screenFenceCtx({ ...input.parsed, folder_restricted: await folderRestricted(input.engine, input.sourceId, input.slug) }, input.activePack);
   const refuse = (step: Extract<FenceStep<FencePage>, { status: 'residual' }>): ImportFences => {
     const issues = fenceIssuesWire([...step.issues, ...step.fixable]);
     if (step.issues.some(issue => issue.reason === 'normalizer_failed')) console.warn(`[gbrain] #6188 fence normalizer failed on ${input.slug} (gbrain ${VERSION}); the fence was not rewritten.`);
@@ -133,7 +134,7 @@ export async function resolveImportFences(input: {
  * and the issues; a residual only in the other kind leaves the page as it is,
  * as the verb never reads that fence.
  */
-export async function normalizeTargetFences(engine: Pick<BrainEngine, 'executeRaw' | 'getConfig'>, input: StoredPageInput & { kind: FenceKind }): Promise<{ page: FencePage; fixes: FenceFix[] }> {
+export async function normalizeTargetFences(engine: Pick<BrainEngine, 'executeRaw' | 'getConfig' | 'isFolderRestricted'>, input: StoredPageInput & { kind: FenceKind }): Promise<{ page: FencePage; fixes: FenceFix[] }> {
   const { page, step } = await storedPageStep(engine, input);
   if (step.status === 'normalized') return { page: step.page, fixes: step.fixes };
   if (step.status === 'clean') return { page, fixes: [] };
@@ -147,9 +148,10 @@ export async function normalizeTargetFences(engine: Pick<BrainEngine, 'executeRa
 interface StoredPageInput { sourceId: string; slug: string; page: FencePage & { id: number; type?: string | null; frontmatter?: unknown } }
 
 /** Tier 1 over a page body the caller is about to write (switch read only when there is a fix; stored rows only for `renumber`). */
-async function storedPageStep(engine: Pick<BrainEngine, 'executeRaw' | 'getConfig'>, input: StoredPageInput): Promise<{ page: FencePage; step: FenceStep<FencePage> }> {
-  const page = { compiled_truth: input.page.compiled_truth ?? '', timeline: input.page.timeline ?? '' };
-  const ctx: FenceCtx = { pageVisibility: effectiveVisibility({ kind: 'page', page: { type: input.page.type ?? null, frontmatter: input.page.frontmatter } }) };
+async function storedPageStep(engine: Pick<BrainEngine, 'executeRaw' | 'getConfig' | 'isFolderRestricted'>, input: StoredPageInput): Promise<{ page: FencePage; step: FenceStep<FencePage> }> {
+  const page = { compiled_truth: input.page.compiled_truth ?? '', timeline: input.page.timeline ?? '', slug: input.slug };
+  const ctx: FenceCtx = { pageVisibility: effectiveVisibility({ kind: 'page', page: { type: input.page.type ?? null, frontmatter: input.page.frontmatter,
+    folder_restricted: await folderRestricted(engine, input.sourceId, input.slug) } }) };
   let step = fenceStep(page, ctx, { normalize: true });
   if (step.status === 'normalized' && !await fencesNormalizeEnabled(engine)) step = fenceStep(page, ctx, { normalize: false });
   if (step.status === 'normalized' && step.fixes.some(f => f.class === 'renumber')) {
@@ -159,7 +161,7 @@ async function storedPageStep(engine: Pick<BrainEngine, 'executeRaw' | 'getConfi
 }
 
 /** #6188: Tier 1 before a maintenance writer compiles a body (synthesize verify); null when nothing changed or a fence stays residual. */
-export async function normalizePageFences(engine: Pick<BrainEngine, 'executeRaw' | 'getConfig'>, input: StoredPageInput): Promise<{ page: FencePage; fixes: FenceFix[] } | null> {
+export async function normalizePageFences(engine: Pick<BrainEngine, 'executeRaw' | 'getConfig' | 'isFolderRestricted'>, input: StoredPageInput): Promise<{ page: FencePage; fixes: FenceFix[] } | null> {
   const { step } = await storedPageStep(engine, input);
   return step.status === 'normalized' ? { page: step.page, fixes: step.fixes } : null;
 }

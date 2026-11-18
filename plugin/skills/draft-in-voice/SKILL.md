@@ -62,7 +62,8 @@ is worse than asking.
 1. **The validated voice profile** — `gbrain get people/<slug>-voice`. The
    fingerprint, quantitative stats (median length, diction, rhythm), and the
    "how to write as this person" directive block. **This is binding.** If the
-   page is missing, or its `status` is anything other than `validated`, STOP
+   page is missing, or its `status` is anything other than `validated` (a
+   `status: stub` page, such as the empty me/voice form setup writes, is missing), STOP
    drafting and go to the builder appendix.
 2. **First-party context** — the subject's main page (`gbrain get
    people/<slug>`) plus timeline and backlinks (`gbrain timeline <slug>`,
@@ -284,7 +285,7 @@ one-line report of corpus size, span, and validation status.
 
 ## When it fails
 
-Follow the [agent operator protocol](../../docs/protocol/AGENT_OPERATOR_v1.md) for any gbrain error `code`, exit code, `[AGENT]` block or notice block. Specific to this skill:
+Follow the [agent operator protocol](../conventions/agent-operator-protocol.md) for any gbrain error `code`, exit code, `[AGENT]` block or notice block. Specific to this skill:
 
 - No consent recorded on the voice profile, or `status: draft`: the skill refuses to draft by design. Ask the user to confirm who authorized the ghostwriting and for what scope.
 - The profile page returns `page_not_found` or the corpus search is empty with a degraded notice: do not draft from general knowledge; tell the user the voice memory is missing or the search was keyword-only.

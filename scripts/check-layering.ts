@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 /**
- * Layering guard (refactor wave 1, EO10; docs/TESTING.md#layering-guard).
+ * Layering guard (refactor wave 1, EO10; docs/ci-guards.md#layering-guard).
  *
  * The wave's new directories sit BELOW the modules that load them, so an
  * import back up would create an ESM cycle that can hit a temporal-dead-zone
@@ -8,7 +8,7 @@
  *
  *   src/core/engine-sql/**         imports no engine façade
  *                                  (pglite-engine.ts, postgres-engine.ts,
- *                                  engine-factory.ts); types come from engine.ts
+ *                                  engine-factory.ts, engine-construct.ts); types come from engine.ts
  *   src/core/schema-migrations/**  imports no src/core/migrate.ts; shared
  *                                  helpers live in schema-migrations/helpers.ts
  *                                  and the Migration type in schema-migrations/types.ts
@@ -25,7 +25,7 @@ import { dirname, join, normalize, relative } from 'node:path';
 import ts from 'typescript';
 
 const ROOT = process.env.GBRAIN_GUARD_ROOT ?? join(import.meta.dir, '..');
-const ANCHOR = 'docs/TESTING.md#layering-guard';
+const ANCHOR = 'docs/ci-guards.md#layering-guard';
 
 interface Rule {
   dir: string;
@@ -36,7 +36,7 @@ interface Rule {
 const RULES: Rule[] = [
   {
     dir: 'src/core/engine-sql',
-    banned: ['src/core/pglite-engine.ts', 'src/core/postgres-engine.ts', 'src/core/engine-factory.ts'],
+    banned: ['src/core/pglite-engine.ts', 'src/core/postgres-engine.ts', 'src/core/engine-factory.ts', 'src/core/engine-construct.ts'],
     fix: 'take the connection/executor as a parameter and import types from src/core/engine.ts',
   },
   {

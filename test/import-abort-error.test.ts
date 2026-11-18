@@ -21,7 +21,7 @@ import type { BrainEngine } from '../src/core/engine.ts';
 // empty sets.
 const engineStub = {
   kind: 'pglite',
-  executeRaw: async () => [],
+  executeRaw: async (sql: string) => sql.includes('FROM persistence_brain') ? [{ enabled: false }] : [], // #6482: the strict mode reader needs one well-formed unmanaged row.
   getConfig: async () => null,
 } as unknown as BrainEngine;
 
@@ -71,7 +71,7 @@ test('unreadable import target → typed abort', async () => {
 const answering = (match: string, rows: unknown[] | Error): BrainEngine => ({
   ...engineStub,
   executeRaw: async (sql: string) => {
-    if (!sql.includes(match)) return [];
+    if (!sql.includes(match)) return sql.includes('FROM persistence_brain') ? [{ enabled: false }] : [];
     if (rows instanceof Error) throw rows;
     return rows;
   },
@@ -102,7 +102,9 @@ const directoryCases: Array<{
   {
     name: 'lock admission fails on a non-operation error',
     setup: root => join(root, 'notes'),
-    engine: answering("local_path <> ''", new Error('synthetic sources lookup failure')),
+    // The source-path lookup is the typed `listSourceLocalPaths` read.
+    engine: ({ ...answering('no SQL statement matches this', []),
+      listSourceLocalPaths: async () => { throw new Error('synthetic sources lookup failure'); } }) as unknown as BrainEngine,
     reason: 'synthetic sources lookup failure',
     stderr: () => ['Error: synthetic sources lookup failure', 'Fix: gbrain doctor --json'],
     cause: 'synthetic sources lookup failure',

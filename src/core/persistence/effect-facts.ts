@@ -1,16 +1,23 @@
 import type { BrainEngine } from '../engine.ts';
 import type { ParsedPage } from '../import-file.ts';
+import { factsAbsorbWriteKey } from '../facts/dead-absorb-retry.ts';
 import { isFactsBackstopEligible } from '../facts/eligibility.ts';
 import { isFactsExtractionEnabled } from '../facts/extract.ts';
+import { resolvePageWriteNotabilityFilter } from '../facts/notability-filter.ts';
 import { MinionQueue } from '../minions/queue.ts';
 import type { MinionJobStatus } from '../minions/types.ts';
 import type { PageSnapshot } from '../page-state/types.ts';
 import { OperationError, opError } from '../ops/contract.ts';
 import { readFix } from '../ops/op-fix.ts';
+import { readManagedMode } from './managed-mode.ts';
+import { isConnectorIntentKind } from './connector-identity.ts';
+import { connectorFactsSession } from '../facts/retire.ts';
 import { authorizeStoredRequest, authorizeWrite } from './authority.ts';
 import { completeEffect } from './effect-journal.ts';
 import { guardEffectSource } from './effect-recovery.ts';
 import { derivedExtractionSkip } from './derived-extraction-gate.ts';
+import { isGuestWrite, skipsGuestNote } from '../guests/derived.ts';
+import { bodyUnread, isSegmentedPage } from '../page-body/page-shape.ts';
 import type { PersistenceEffect } from './effect-model.ts';
 import type { WriteRequest } from './model.ts';
 
@@ -59,7 +66,8 @@ async function extractionPendingForPage(engine: BrainEngine, pageId: number): Pr
 async function extractionCompletedForPage(engine: BrainEngine, pageId: number): Promise<boolean> {
   const [row] = await engine.executeRaw<{ done: boolean }>(
     `SELECT EXISTS (SELECT 1 FROM minion_jobs
-                     WHERE name = 'facts-absorb' AND status = 'completed' AND data->>'page_id' = $1) AS done`,
+                     WHERE name = 'facts-absorb' AND status = 'completed' AND data->>'page_id' = $1
+                       AND result->>'skipped' IS NULL) AS done`,
     [String(pageId)]);
   return row?.done === true;
 }
@@ -76,7 +84,8 @@ async function extractionCompletedForPage(engine: BrainEngine, pageId: number): 
  */
 async function bodyAlreadyOffered(engine: BrainEngine, slug: string, page: ParsedPage, before: PageSnapshot | null): Promise<boolean> {
   const live = before && !before.page.deleted_at ? before.page : null;
-  if (!live || live.compiled_truth !== page.compiled_truth) return false;
+  // A segmented prior body is not compared; the extraction's watermark finds nothing appended and calls no model.
+  if (!live || isSegmentedPage(live) || bodyUnread(page) || live.compiled_truth !== page.compiled_truth) return false;
   if (!isFactsBackstopEligible(slug, live).ok) return false;
   if (!(await extractionCompletedForPage(engine, live.id))) return false;
   return !(await extractionPendingForPage(engine, live.id));
@@ -89,6 +98,7 @@ async function bodyAlreadyOffered(engine: BrainEngine, slug: string, page: Parse
 export async function prepareFactsBackstop(engine: BrainEngine, row: WriteRequest, page: ParsedPage, before: PageSnapshot | null = null): Promise<FactsBackstopStatus> {
   const confined = derivedExtractionSkip(row.authority);
   if (confined) return { skipped: confined };
+  if (skipsGuestNote('facts_backstop', await isGuestWrite(engine, row.source_id, row.intent))) return { skipped: 'guest_source' };
   if (!(await isFactsExtractionEnabled(engine))) return { skipped: 'extraction_disabled' };
   const eligible = isFactsBackstopEligible(row.slug, page);
   if (!eligible.ok) return { skipped: eligible.reason };
@@ -100,8 +110,7 @@ export async function prepareFactsBackstop(engine: BrainEngine, row: WriteReques
 export async function readFactsBackstopJobPage(engine: BrainEngine, data: Record<string, unknown>) {
   const slug = typeof data.slug === 'string' ? data.slug : '';
   const sourceId = typeof data.sourceId === 'string' ? data.sourceId : 'default';
-  const [brain] = await engine.executeRaw<{ enabled: boolean }>('SELECT enabled FROM persistence_brain WHERE singleton=1');
-  if (brain?.enabled && data.persistence_request_id === undefined) return { skipped: 'missing_write_authority' } as const;
+  if (await readManagedMode(engine) && data.persistence_request_id === undefined) return { skipped: 'missing_write_authority' } as const;
   const snapshot = await engine.readPageSnapshot(slug, { sourceId });
   if (!snapshot) return { skipped: 'page_missing' } as const;
   if (data.persistence_request_id !== undefined) {
@@ -112,7 +121,7 @@ export async function readFactsBackstopJobPage(engine: BrainEngine, data: Record
       || snapshot.revision !== data.revision) return { skipped: 'superseded' } as const;
     try { await authorizeFactsBackstop(engine, row); }
     catch (error) {
-      if (error instanceof OperationError && ['permission_denied', 'source_changed'].includes(error.code)) return { skipped: error.code } as const;
+      if (error instanceof OperationError && ['permission_denied', 'source_changed', 'page_not_found'].includes(error.code)) return { skipped: error.code } as const;
       throw error;
     }
   }
@@ -130,7 +139,7 @@ export async function dispatchFactsBackstopEffect(engine: BrainEngine, effect: P
     if (row && !skipped) {
       try { await authorizeFactsBackstop(tx, row, true); }
       catch (error) {
-        if (error instanceof OperationError && ['permission_denied', 'source_changed'].includes(error.code)) skipped = error.code;
+        if (error instanceof OperationError && ['permission_denied', 'source_changed', 'page_not_found'].includes(error.code)) skipped = error.code;
         else throw error;
       }
     }
@@ -141,11 +150,18 @@ export async function dispatchFactsBackstopEffect(engine: BrainEngine, effect: P
     if (!snapshot || snapshot.page.id !== effect.data.page_id || snapshot.revision !== effect.revision) skipped ??= 'superseded';
     if (!(await isFactsExtractionEnabled(tx))) skipped ??= 'extraction_disabled';
     if (skipped) { await completeEffect(tx, effect, { facts: 'skipped', reason: skipped }); return; }
+    // #6231: the page-write filter in force when the effect dispatches; the job keeps it across retries.
+    const notabilityFilter = await resolvePageWriteNotabilityFilter(tx);
+    // #9552: a connector page keeps the connector path's session (its facts are retired with the item) and its high-only filter.
+    const connector = isConnectorIntentKind(row!.intent?.kind);
     const job = await new MinionQueue(tx).add('facts-absorb', {
-      slug: effect.data.slug, sourceId: effect.source_id, source: 'mcp:put_page', notabilityFilter: 'all',
+      // #6333: a stable per-page session (mirrors sync's `sync:<slug>`) so a re-extraction feeds the same-page shadow counter.
+      slug: effect.data.slug, sourceId: effect.source_id, source: connector ? 'sync:import' : 'mcp:put_page',
+      sessionId: connector ? connectorFactsSession(effect.source_id, effect.data.slug!) : `put_page:${effect.data.slug}`,
+      notabilityFilter: connector ? 'high-only' : notabilityFilter,
       visibility: effect.data.visibility === 'world' ? 'world' : 'private',
       persistence_request_id: effect.request_id, page_id: effect.data.page_id, revision: effect.revision,
-    }, { queue: 'default', idempotency_key: `facts-absorb:write:${effect.request_id}`, max_attempts: 5, backoff_delay: 60_000 });
+    }, { queue: 'default', idempotency_key: factsAbsorbWriteKey(effect.request_id), max_attempts: 5, backoff_delay: 60_000 });
     await completeEffect(tx, effect, { facts: 'queued', job_id: job.id });
   });
 }

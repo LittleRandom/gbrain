@@ -54,13 +54,10 @@ test('an admission database failure racing caller cancellation remains a failure
   await reset();
   const controller = new AbortController();
   const failure = new Error('fixture admission connection failure');
-  const original = engine.executeRaw.bind(engine);
-  const querySpy = spyOn(engine, 'executeRaw').mockImplementation((sql, params) => {
-    if (sql === "SELECT local_path FROM sources WHERE local_path IS NOT NULL AND local_path <> ''") {
-      controller.abort();
-      return Promise.reject(failure);
-    }
-    return original(sql, params);
+  // The admission read of the registered source paths (withSourceFilesystemLock's lock-root read) fails as the caller aborts.
+  const querySpy = spyOn(engine, 'listSourceLocalPaths').mockImplementation(() => {
+    controller.abort();
+    return Promise.reject(failure);
   });
   try {
     await expect(performSync(engine, { repoPath: root, sourceId: 'default', noPull: true, noEmbed: true, signal: controller.signal })).rejects.toBe(failure);
@@ -127,6 +124,9 @@ for (const mode of ['caller', 'job', 'log-ingest', 'lease', 'caller-and-lease'] 
       const result = await originalImport(...args); calls++;
       if (mode === 'lease' || mode === 'caller-and-lease') {
         if (mode === 'caller-and-lease') controller.abort();
+        // The lease is lost after the first import (another holder's token, already expired so the next test can take it);
+        // the next renewal sees it.
+        await engine.executeRaw("UPDATE gbrain_cycle_locks SET acquisition_token=gen_random_uuid(), ttl_expires_at=now() - interval '1 hour', last_refreshed_at=now() - interval '1 hour' WHERE id LIKE 'gbrain-fs:%'");
         await new Promise(resolve => setTimeout(resolve, 80));
       } else if (mode !== 'log-ingest') controller.abort();
       return result;
@@ -137,7 +137,7 @@ for (const mode of ['caller', 'job', 'log-ingest', 'lease', 'caller-and-lease'] 
       return result;
     });
     const lockSpy = spyOn(locks, 'withRefreshingLock').mockImplementation((eng, key, fn, opts) =>
-      originalLock(eng, key, fn, key.startsWith('gbrain-fs:') && mode.includes('lease') ? { ...opts, ttlMinutes: 0.0005 } : opts));
+      originalLock(eng, key, fn, key.startsWith('gbrain-fs:') && mode.includes('lease') ? { ...opts, refreshIntervalMs: 5 } : opts));
     const sync = () => performSync(engine, { repoPath: root, sourceId: 'default', noPull: true, noEmbed: true, noExtract: true, concurrency: 1, signal: controller.signal });
     try {
       if (mode === 'job') {

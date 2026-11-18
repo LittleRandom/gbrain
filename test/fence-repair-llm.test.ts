@@ -24,7 +24,7 @@
  */
 import { afterAll, afterEach, beforeAll, describe, expect, test } from 'bun:test';
 import { createHash } from 'node:crypto';
-import { __setChatTransportForTests, configureGateway, resetGateway, type ChatOpts, type ChatResult } from '../src/core/ai/gateway.ts';
+import { __setChatTransportForTests, configureGateway, resetGateway, thinkingOffOutputCap, type ChatOpts, type ChatResult } from '../src/core/ai/gateway.ts';
 import { dailyLedger, FENCE_REPAIR_LEDGER } from '../src/core/budget/daily-ledger.ts';
 import { attemptStore } from '../src/core/fence-repair/attempts.ts';
 import { buildTier3Prompt, callTier3, correctionMessage, extractSingleTable, FENCE_REPAIR_PROMPT_VERSION, spliceTier3, tier3Requests, tier3TokenBudget, TIER3_REASONING_TOKENS } from '../src/core/fence-repair/llm.ts';
@@ -108,6 +108,11 @@ describe('Tier 3 requests and prompt', () => {
     const table = tier3TokenBudget(req, 'anthropic:claude-opus-4-7').maxOutputTokens;
     expect(tier3TokenBudget(req, 'anthropic:claude-fable-5-1').maxOutputTokens).toBe(table + TIER3_REASONING_TOKENS);
     expect(tier3TokenBudget(req, 'openai:gpt-6.1-sol').maxOutputTokens).toBe(table + TIER3_REASONING_TOKENS);
+    expect(tier3TokenBudget(req, 'google:gemini-2.5-flash').maxOutputTokens).toBe(table);
+    expect(tier3TokenBudget(req, 'google:gemini-3.8-flash').maxOutputTokens).toBe(32000);
+    for (const model of ['anthropic:claude-fable-5-1', 'openai:gpt-6.1-sol', 'google:gemini-2.5-flash', 'google:gemini-3.8-flash']) {
+      expect(tier3TokenBudget(req, model).maxOutputTokens).toBe(thinkingOffOutputCap(model, tier3TokenBudget(req, model).maxOutputTokens));
+    }
     expect(tier3TokenBudget(req, 'claude-cli:claude-fable-5-1').maxOutputTokens).toBe(32000);
   });
 
@@ -202,7 +207,7 @@ describe('runTier3: the re-ask and the decline', () => {
   });
   afterAll(async () => { await engine.disconnect(); });
 
-  async function attempt(slug: string, answers: ChatResult[]) {
+  async function attempt(slug: string, answers: Array<ChatResult | Error>) {
     const page = { compiled_truth: rowLevel, timeline: '' };
     const target: FenceTarget = { mode: 'db', sourceId: 'default', key: slug, slug, path: null, sourcePath: null, page, content: null, before: pageSha(page), snapshot: null, hold: null,
       ctx: { pageVisibility: 'private' } } as FenceTarget;
@@ -241,7 +246,25 @@ describe('runTier3: the re-ask and the decline', () => {
     expect(again.calls).toHaveLength(0);
     expect(again.out).toMatchObject({ ok: false, reason: 'llm_declined', memoHit: true, spentUsd: 0 });
   });
+
+  test('a provider refusal raised as an error is held as llm_refused and consumes the memo; a plain provider error stays transient', async () => {
+    const first = await attempt('t3/policy', [policyRefusal()]);
+    expect(first.calls).toHaveLength(1);
+    expect(first.out).toMatchObject({ ok: false, reason: 'llm_refused' });
+    const again = await attempt('t3/policy', [result(fixed)]);
+    expect(again.calls).toHaveLength(0);
+    expect(again.out).toMatchObject({ ok: false, reason: 'llm_refused', memoHit: true, spentUsd: 0 });
+    expect((await attempt('t3/down', [Object.assign(new Error('rate limited'), { status: 429 })])).out).toMatchObject({ ok: false, reason: 'llm_unavailable' });
+    const retried = await attempt('t3/down', [result(fixed)]);
+    expect(retried.calls).toHaveLength(1);
+    expect(retried.out.ok).toBe(true);
+    expect(await reasonOf(residualOf(rowLevel).requests[0]!, Object.assign(new Error('This model maximum context length is 8192 tokens'), { status: 400 }))).toBe('llm_refused');
+  });
 });
+
+function policyRefusal(): Error {
+  return Object.assign(new Error('Bad Request'), { name: 'AI_APICallError', statusCode: 400, responseBody: JSON.stringify({ error: { code: 'content_policy_violation', message: 'flagged' } }) });
+}
 
 async function reasonOf(req: Parameters<typeof callTier3>[0], answer: ChatResult | Error): Promise<string> {
   stub([answer]);

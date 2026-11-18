@@ -5,7 +5,8 @@
  */
 import { describe, expect, test } from 'bun:test';
 import { spawnSync } from 'node:child_process';
-import { normalizeRelationType, parseEffectiveQualifier, parseLineGrammar } from '../src/core/line-grammar.ts';
+import { findLinks, normalizeRelationType, parseEffectiveQualifier, parseLineGrammar } from '../src/core/line-grammar.ts';
+import { fileURLToPath } from 'node:url';
 
 const facts = (text: string) => parseLineGrammar(text).facts;
 const relations = (text: string, declared?: string[]) =>
@@ -179,11 +180,55 @@ describe('@effective qualifier', () => {
 
 test('adversarial input stays linear (bounded child process)', () => {
   const script = `
-    const { parseLineGrammar } = await import(${JSON.stringify(new URL('../src/core/line-grammar.ts', import.meta.url).pathname)});
+    const { parseLineGrammar } = await import(${JSON.stringify(fileURLToPath(new URL('../src/core/line-grammar.ts', import.meta.url)))});
+    const { cpuMs } = await import(${JSON.stringify(fileURLToPath(new URL('./helpers/cpu-time.ts', import.meta.url)))});
     const evil = ['- ' + '['.repeat(20000) + 'x', '- works_at ' + '('.repeat(20000), '- [a] ' + '(('.repeat(10000) + ')',
       '- t ' + '[[a]] '.repeat(5000), '- [idea] @effective[' + ','.repeat(20000)].join('\\n');
-    const t = performance.now(); parseLineGrammar(evil.repeat(5)); console.log(Math.round(performance.now() - t));`;
+    console.log(Math.round(cpuMs(() => parseLineGrammar(evil.repeat(5)))));`;
   const run = spawnSync(process.execPath, ['-e', script], { timeout: 20_000, encoding: 'utf-8' });
   expect(run.status, run.stderr).toBe(0);
   expect(Number(run.stdout.trim())).toBeLessThan(5_000);
 }, 30_000);
+
+test('long comma, bracket and space runs are parsed in linear time (#6186)', () => {
+  const script = `
+    const { parseLineGrammar } = await import(${JSON.stringify(fileURLToPath(new URL('../src/core/line-grammar.ts', import.meta.url)))});
+    const lines = (n) => ['- [idea] @effective[' + ','.repeat(n), '- t ' + '[['.repeat(n / 2), '- t ' + '[x]('.repeat(n / 4),
+      '- [idea] a' + ' '.repeat(n) + 'b', '- [idea] a [Source:' + ' '.repeat(n) + 'b'].join('\\n');
+    // Process CPU, not cpuMs: thread CPU advances in ~4 ms steps here (small side read 4.0 or 8.0 ms, ratio 3.0-7.0 over 10 idle runs;
+    // process CPU 6.5 ms vs 27.6 ms, ratio 4.2-4.8), and 8 parses per window to clear 40 ms overran the 5 s child timeout under load.
+    const processCpuMs = (fn) => { const s = process.cpuUsage(); fn(); const u = process.cpuUsage(s); return (u.user + u.system) / 1000; };
+    const time = (n) => { const text = lines(n); return processCpuMs(() => parseLineGrammar(text)); };
+    time(1000);
+    // Interleaved samples so CPU contention hits both sizes alike; n vs 4n so linear (x4) and quadratic (x16)
+    // sit a factor of 2 either side of the bound. CPU time measures the work rather than how long the scheduler made it wait.
+    const smalls = [], larges = [];
+    for (let i = 0; i < 5; i++) { smalls.push(time(50_000)); larges.push(time(200_000)); }
+    console.log(JSON.stringify({ small: Math.min(...smalls), large: Math.min(...larges) }));`;
+  const run = spawnSync(process.execPath, ['-e', script], { timeout: 5_000, encoding: 'utf-8' });
+  expect(run.error?.message ?? '', 'the 200k-character lines did not finish within 5 s').toBe('');
+  expect(run.status, run.stderr).toBe(0);
+  const { small, large } = JSON.parse(run.stdout.trim()) as { small: number; large: number };
+  expect(large / Math.max(small, 1)).toBeLessThan(8);
+}, 30_000);
+
+test('a qualifier with more than one comma is refused as a range (#6186)', () => {
+  const r = parseEffectiveQualifier('@effective[2020,2021,2022) rest');
+  expect(r).toMatchObject({ kind: 'refused', reason: 'invalid_range' });
+  expect(r.kind === 'refused' && r.message).toContain('exactly one comma');
+  expect(parseEffectiveQualifier('@effective[2020,2022) rest')).toMatchObject({ kind: 'ok', range: { from: '2020-01-01', until: '2022-01-01' } });
+  expect(parseEffectiveQualifier('@effective[,) rest')).toMatchObject({ kind: 'ok', range: { from: null, until: null } });
+});
+
+
+test('findLinks returns exactly the matches of the link pattern it replaced', () => {
+  const pattern = /\[\[[^\]\n]+\]\]|\[[^\][\n]+\]\([^)\n]+\)/g;
+  const alphabet = ['[', ']', '(', ')', '\n', 'a', ' ', '[[', ']]', '](' ];
+  let seed = 6186;
+  const rand = (n: number) => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed % n; };
+  const samples = ['[[people/alice-example]]', '[a](b) [[c]]', '[[a]b]]', '[[]]', '[](x)', '[a]()', '[[a\nb]]', '[x](y\n)', '[[a]] [b](c)'];
+  for (let n = 0; n < 4000; n++) samples.push(Array.from({ length: 1 + rand(14) }, () => alphabet[rand(alphabet.length)]).join(''));
+  for (const text of samples) {
+    expect(findLinks(text)).toEqual([...text.matchAll(pattern)].map(m => ({ index: m.index!, text: m[0] })));
+  }
+});

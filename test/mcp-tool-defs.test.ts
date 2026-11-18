@@ -28,7 +28,7 @@ import type { Operation, ParamDef } from '../src/core/operations.ts';
 // every existing operation, but new ops that add a default get it on the
 // wire automatically.
 type ParamDefLike = {
-  type: 'string' | 'number' | 'boolean' | 'object' | 'array';
+  type: 'string' | 'number' | 'integer' | 'boolean' | 'object' | 'array';
   description?: string;
   enum?: string[];
   default?: unknown;
@@ -283,7 +283,7 @@ describe('buildToolDefs strictParams emission (WP3/D14.1)', () => {
     expect(props.dry_run.description).toBe(op.params.dry_run.description);
   });
 
-  test('strict mode changes ONLY additionalProperties + the two passthrough keys', () => {
+  test('strict mode changes ONLY additionalProperties + the passthrough keys (_meta, dry_run, room)', () => {
     const base = buildToolDefs(operations);
     for (let i = 0; i < base.length; i++) {
       const strict = strictDefs[i];
@@ -295,7 +295,7 @@ describe('buildToolDefs strictParams emission (WP3/D14.1)', () => {
       }
       const extraKeys = Object.keys(strict.inputSchema.properties)
         .filter(k => !(k in loose.inputSchema.properties));
-      expect(extraKeys.sort()).toEqual(['_meta', 'dry_run'].filter(k => !(k in loose.inputSchema.properties)).sort());
+      expect(extraKeys.sort()).toEqual(['_meta', 'dry_run', 'room'].filter(k => !(k in loose.inputSchema.properties)).sort());
       expect(strict.inputSchema.required).toEqual(loose.inputSchema.required);
     }
   });
@@ -332,7 +332,7 @@ describe('param description completeness (WP3)', () => {
 
   // WP4 (amendment 22): every non-localOnly op must carry an `area` — the
   // request_tools catalog groups by it, and an op missing from the central
-  // OP_AREAS map in operations.ts would silently land in the 'other' bucket.
+  // OP_AREAS map in operation-load.ts would silently land in the 'other' bucket.
   // Area NAMES are non-contractual; presence is not.
   test('every non-localOnly op carries a non-empty area (WP4)', () => {
     const violations: string[] = [];

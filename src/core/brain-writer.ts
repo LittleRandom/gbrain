@@ -18,9 +18,11 @@ import { assertManagedFilesystemWrite } from './persistence/filesystem-guard.ts'
  */
 
 import { createHash } from 'crypto';
+import { loadBoundedYaml as yamlLoad } from './data-frontmatter.ts';
 import { existsSync, readFileSync, readdirSync, copyFileSync, writeFileSync, mkdirSync, lstatSync } from 'fs';
-import { join, relative, resolve, dirname, basename, isAbsolute } from 'path';
+import { join, relative, resolve, dirname, basename } from 'path';
 import type { BrainEngine } from './engine.ts';
+import { isConnectorSourceKind } from './persistence/connector-kinds.ts';
 import type { ProgressReporter } from './progress.ts';
 import { gbrainPath } from './config.ts';
 import { collectGitVisibleFiles } from './git-visible-files.ts';
@@ -30,14 +32,24 @@ import {
   type ParseValidationCode,
   type ParseValidationError,
   type ParseWarningCode,
+  yamlAliasesWithinLimit,
+  yamlBlockError,
 } from './markdown.ts';
-import { isMarkdownFilePath, isSyncable, pruneDir, slugifyPath } from './sync.ts';
+import { DEFAULT_METAFILE_PAGES_MODE, isMarkdownFilePath, isSyncable, pruneDir, readMetafilePagesMode, slugifyPath, type MetafilePagesMode } from './sync.ts';
+import { diskMetafileHeads, metafilePagePredicate } from './sync-metafile-pages.ts';
+import { relativeEscapesRoot } from './path-confine.ts';
 
 export type { ParseValidationCode };
 
 /** Frontmatter validation is defined only for Markdown page files. */
-export function isFrontmatterScannablePath(path: string): boolean {
-  return isMarkdownFilePath(path) && isSyncable(path, { strategy: 'markdown' });
+export function isFrontmatterScannablePath(path: string, metafilePage?: (path: string) => boolean): boolean {
+  return isMarkdownFilePath(path) && isSyncable(path, { strategy: 'markdown', metafilePage });
+}
+
+/** GBRA-150: `isFrontmatterScannablePath` for paths relative to `root`, where a typed nested metafile is a page under `mode`. */
+export function frontmatterScannableUnder(root: string, mode: MetafilePagesMode = DEFAULT_METAFILE_PAGES_MODE): (path: string) => boolean {
+  const metafilePage = metafilePagePredicate(mode, diskMetafileHeads(root));
+  return path => isFrontmatterScannablePath(path, metafilePage);
 }
 
 export interface AuditFix {
@@ -84,8 +96,9 @@ export interface PerSourceReport {
   /** Did this source finish the walk, get interrupted, or never start?
    * 'scanned' = full walk completed.
    * 'partial' = deadline/abort fired mid-walk; counts reflect prefix only.
-   * 'skipped' = source was never visited (outer loop broke before reaching it). */
-  status: 'scanned' | 'partial' | 'skipped';
+   * 'skipped' = source was never visited (outer loop broke before reaching it).
+   * 'missing' = the registered local_path does not exist, so nothing was checked (#7889). */
+  status: 'scanned' | 'partial' | 'skipped' | 'missing';
   /** Count of .md files actually parsed (numerator for "scanned ~N of M" doctor message).
    * Distinct from `total` (which counts ERRORS) and `ignoredMissingOpen`. */
   files_scanned: number;
@@ -107,6 +120,8 @@ export interface AuditReport {
    * this to render the warn message and to ensure `ok` is false even when the
    * scanned prefix happened to be clean (codex C2 fix). */
   partial: boolean;
+  /** Ids of sources whose registered directory is missing (`status: 'missing'`); `ok` is false when any is. */
+  missing_sources?: string[];
   /** Source id where deadline/abort fired mid-walk, or null when no partial. */
   aborted_at_source: string | null;
 }
@@ -139,7 +154,7 @@ export function createFrontmatterBackup(filePath: string, opts: FrontmatterBacku
   const resolvedFile = resolve(filePath);
   const resolvedSource = resolve(opts.sourcePath ?? dirname(resolvedFile));
   const rel = relative(resolvedSource, resolvedFile);
-  const safeRel = rel && !rel.startsWith('..') && !isAbsolute(rel) ? rel : basename(resolvedFile);
+  const safeRel = rel && !relativeEscapesRoot(rel) ? rel : basename(resolvedFile);
   const root = opts.backupRoot ?? defaultFrontmatterBackupRoot(opts.runId);
   const backupPath = join(root, sourceKey(resolvedSource), safeRel + '.bak');
   mkdirSync(dirname(backupPath), { recursive: true });
@@ -150,6 +165,27 @@ export function createFrontmatterBackup(filePath: string, opts: FrontmatterBacku
 // ---------------------------------------------------------------------------
 // autoFixFrontmatter
 // ---------------------------------------------------------------------------
+
+/**
+ * A cosmetic line rewrite is kept only when it reads back as the same value
+ * (#6157). A line that does not parse on its own is a repair target, so the
+ * rewrite is allowed. A line over the alias limit is never rewritten: its
+ * value could expand exponentially when compared.
+ */
+function rewriteKeepsYamlValue(before: string, after: string): boolean {
+  if (!yamlAliasesWithinLimit(before)) return false;
+  let original: unknown;
+  try {
+    original = yamlLoad(before);
+  } catch {
+    return true;
+  }
+  try {
+    return JSON.stringify(yamlLoad(after)) === JSON.stringify(original);
+  } catch {
+    return false;
+  }
+}
 
 /**
  * Mechanical auto-repair for the fixable subset of validation codes:
@@ -283,7 +319,9 @@ export function autoFixFrontmatter(
           if (!clean) return "''";
           return clean.includes("'") ? `"${clean}"` : `'${clean}'`;
         });
-        lines[i] = `${prefix}[${reQuoted.join(', ')}]`;
+        const rewritten = `${prefix}[${reQuoted.join(', ')}]`;
+        if (!rewriteKeepsYamlValue(lines[i], rewritten)) continue;
+        lines[i] = rewritten;
         fixedAny = true;
       }
       if (fixedAny) {
@@ -299,7 +337,9 @@ export function autoFixFrontmatter(
 
   // 3. NESTED_QUOTES — rewrite `key: "...inner..."` lines that have 3+ unescaped
   //    double-quotes by switching the outer wrapper to single quotes and
-  //    leaving inner quotes alone.
+  //    leaving inner quotes alone. Only when the closed block fails to parse
+  //    (#6157): valid YAML, such as a block-scalar continuation line shaped
+  //    like `Key: "a", then "b"`, is never rewritten.
   {
     const lines = working.split('\n');
     let firstNonEmpty = -1;
@@ -311,8 +351,10 @@ export function autoFixFrontmatter(
       for (let i = firstNonEmpty + 1; i < lines.length; i++) {
         if (lines[i].trim() === '---') { closeIdx = i; break; }
       }
+      const block = lines.slice(firstNonEmpty + 1, closeIdx).join('\n');
+      const blockParses = closeIdx < lines.length && yamlBlockError(block) === null && yamlAliasesWithinLimit(block);
       let fixedAny = false;
-      for (let i = firstNonEmpty + 1; i < closeIdx; i++) {
+      for (let i = firstNonEmpty + 1; !blockParses && i < closeIdx; i++) {
         const m = lines[i].match(/^(\s*[A-Za-z_][\w-]*\s*:\s*)"(.*)"\s*(.*)$/);
         if (!m) continue;
         const [, prefix, inner, trailing] = m;
@@ -538,6 +580,7 @@ export function writeBrainPage(
 interface SourceRow {
   id: string;
   local_path: string | null;
+  kind: string | null;
 }
 
 export interface ScanOpts {
@@ -572,6 +615,34 @@ export interface ScanOpts {
    * (post-pruneDir). Production callers don't pass this; the regression
    * suite uses it to assert descent-time pruning directly. */
   visitDir?: (dirPath: string) => void;
+  /** Parse only each file's frontmatter head (`frontmatterScanHead`) when that
+   * provably yields the same findings; the doctor scan sets it. */
+  frontmatterOnly?: boolean;
+}
+
+/**
+ * The prefix of `content` through its closing frontmatter fence line, when
+ * validating that prefix yields exactly the errors, warnings, recovery and
+ * slug of the whole file; otherwise `content` itself. Proven only for the
+ * plain shape every frontmatter reader agrees on: the file starts with a
+ * `---` line (no BOM, blank lines or language selector), no line before the
+ * first `---` close starts with `---`, the close is a bare `---` line after
+ * at least one block line, and the file has no NUL byte (NULL_BYTES reads
+ * the whole file). Everything after the close is body, which the findings
+ * never read.
+ */
+export function frontmatterScanHead(content: string): string {
+  if (!content.startsWith('---') || content.includes('\0')) return content;
+  const first = content.indexOf('\n');
+  if (first < 0 || (first !== 3 && content.slice(0, first) !== '---\r')) return content;
+  for (let start = first + 1, line = 1; ; line++) {
+    const end = content.indexOf('\n', start);
+    if (end < 0) return content;
+    const text = content.slice(start, end);
+    if (text.trim() === '---') return line >= 2 && (text === '---' || text === '---\r') ? content.slice(0, end + 1) : content;
+    if (text.startsWith('---')) return content;
+    start = end + 1;
+  }
 }
 
 /** Timeout-arm winner for the COUNT-vs-deadline race in scanBrainSources.
@@ -584,6 +655,7 @@ export async function scanBrainSources(
   opts: ScanOpts = {},
 ): Promise<AuditReport> {
   const sources = await listSources(engine, opts.sourceId);
+  const metafilePages = await readMetafilePagesMode(engine);
   const totals: Partial<Record<ParseValidationCode, number>> = {};
   const recoverabilityTotals: RecoverabilityByCode = {};
   const perSource: PerSourceReport[] = [];
@@ -631,8 +703,8 @@ export async function scanBrainSources(
     }
     if (!src.local_path) continue;
     if (!existsSync(src.local_path)) {
-      // Source registered but path is missing on disk; surface as a zero-row
-      // entry with a synthetic SCAN_PATH_MISSING note via warn-and-skip.
+      // #5673: a connector syncs from its provider, so a gone local_path is a leftover pointer with nothing on disk to scan.
+      if (isConnectorSourceKind(src.kind)) continue;
       perSource.push({
         source_id: src.id,
         source_path: src.local_path,
@@ -640,7 +712,7 @@ export async function scanBrainSources(
         errors_by_code: {},
         sample: [],
         ignoredMissingOpen: 0,
-        status: 'scanned',
+        status: 'missing',
         files_scanned: 0,
       });
       continue;
@@ -709,7 +781,7 @@ export async function scanBrainSources(
       break;
     }
 
-    const report = scanOneSource(src.id, src.local_path, opts);
+    const report = scanOneSource(src.id, src.local_path, opts, metafilePages);
     report.db_page_count = dbPageCount;
     perSource.push(report);
     grandTotal += report.total;
@@ -729,12 +801,13 @@ export async function scanBrainSources(
   }
 
   const hasPartialOrSkipped = perSource.some(r => r.status === 'partial' || r.status === 'skipped');
+  const missingSources = perSource.filter(r => r.status === 'missing').map(r => r.source_id);
 
   return {
     // Partial scans can never be 'ok' even when the scanned prefix is clean
     // (codex outside-voice C2 — a clean prefix doesn't speak for the
     // unscanned suffix).
-    ok: grandTotal === 0 && !hasPartialOrSkipped,
+    ok: grandTotal === 0 && !hasPartialOrSkipped && missingSources.length === 0,
     total: grandTotal,
     errors_by_code: totals,
     recoverability_by_code: recoverabilityTotals,
@@ -742,6 +815,7 @@ export async function scanBrainSources(
     scanned_at: new Date().toISOString(),
     ignored_missing_open: ignoredMissingOpen || undefined,
     partial: hasPartialOrSkipped,
+    ...(missingSources.length ? { missing_sources: missingSources } : {}),
     aborted_at_source: abortedAtSource,
   };
 }
@@ -750,12 +824,14 @@ function scanOneSource(
   sourceId: string,
   sourcePath: string,
   opts: ScanOpts,
+  metafilePages: MetafilePagesMode,
 ): PerSourceReport {
   const errorsByCode: Partial<Record<ParseValidationCode, number>> = {};
   const recoverability: RecoverabilityByCode = {};
   const sample: PerSourceReport['sample'] = [];
   const repairable: RepairableReport = { files: 0, by_code: {}, sample: [] };
   const rootResolved = resolve(sourcePath);
+  const scannable = frontmatterScannableUnder(rootResolved, metafilePages);
   let scanned = 0;
   let total = 0;
   let ignoredMissingOpen = 0;
@@ -779,7 +855,7 @@ function scanOneSource(
     // Frontmatter is a Markdown-only contract. Multimodal sync deliberately
     // admits images under the markdown strategy, but parsing JPEG/PNG bytes as
     // UTF-8 turns ordinary binary NULs into false NULL_BYTES findings.
-    if (!isFrontmatterScannablePath(relPath)) return true;
+    if (!scannable(relPath)) return true;
     scanned++;
     let content: string;
     try {
@@ -788,7 +864,7 @@ function scanOneSource(
       return true; // skip unreadable
     }
     const expectedSlug = slugifyPath(relPath);
-    const parsed = parseMarkdown(content, relPath, { validate: true, expectedSlug });
+    const parsed = parseMarkdown(opts.frontmatterOnly ? frontmatterScanHead(content) : content, relPath, { validate: true, expectedSlug });
     const errs = (parsed.errors ?? []).filter((e) => {
       if (e.code !== 'MISSING_OPEN') return true;
       if (opts.strictMissingOpen) return true;
@@ -831,7 +907,7 @@ function scanOneSource(
     return true;
   };
 
-  const gitFiles = collectGitVisibleFiles(rootResolved, (rel) => isSyncable(rel, { strategy: 'markdown' }));
+  const gitFiles = collectGitVisibleFiles(rootResolved, scannable);
   if (gitFiles) {
     if (opts.visitDir) opts.visitDir(rootResolved);
     for (const absPath of gitFiles) {
@@ -933,7 +1009,7 @@ export function walkDir(
 async function listSources(engine: BrainEngine, sourceId?: string): Promise<SourceRow[]> {
   if (sourceId) {
     const rows = await engine.executeRaw<SourceRow>(
-      `SELECT id, local_path FROM sources WHERE id = $1`,
+      `SELECT id, local_path, config->>'kind' AS kind FROM sources WHERE id = $1`,
       [sourceId],
     );
     return rows;
@@ -943,11 +1019,11 @@ async function listSources(engine: BrainEngine, sourceId?: string): Promise<Sour
   // pickSoleNonDefaultSource).
   try {
     return await engine.executeRaw<SourceRow>(
-      `SELECT id, local_path FROM sources WHERE local_path IS NOT NULL AND archived IS NOT TRUE ORDER BY id`,
+      `SELECT id, local_path, config->>'kind' AS kind FROM sources WHERE local_path IS NOT NULL AND archived IS NOT TRUE ORDER BY id`,
     );
   } catch {
     return engine.executeRaw<SourceRow>(
-      `SELECT id, local_path FROM sources WHERE local_path IS NOT NULL ORDER BY id`,
+      `SELECT id, local_path, config->>'kind' AS kind FROM sources WHERE local_path IS NOT NULL ORDER BY id`,
     );
   }
 }

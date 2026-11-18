@@ -201,6 +201,36 @@ describe('routeThinClientCommand — (a) op name + param mapping per route', () 
   });
 });
 
+describe('routeThinClientCommand — beliefs changes runs through the host delta', () => {
+  const window = { source_id: 'default', since: '2026-10-01T00:00:00.000Z', until: '2026-10-08T00:00:00.000Z', coverage_from: null, truncated: false,
+    changes: [{ kind: 'fact', slug: 'companies/acme-example', change: 'added', subject: { claim: 'Acme sells gadgets' }, before: null, after: { fact: 'Acme sells gadgets' },
+      before_known: true, cause: { event: 'fact.asserted', op: 'put_page' }, evidence: { event_id: 7, recorded_at: '2026-10-02T00:00:00.000Z', slug: 'companies/acme-example', row: 1 }, trust_tier: 'agent' }] };
+  const reply = (body: unknown) => callSpy.mockImplementationOnce(async (_cfg: GBrainConfig, tool: string, args: Record<string, unknown> = {}) => {
+    calls.push({ tool, args });
+    return { content: [{ type: 'text', text: JSON.stringify(body) }] };
+  });
+
+  test('entities and --since map onto delta {since, beliefs, entities}; the text is the host renderer', async () => {
+    reply({ pages: [], beliefs: window });
+    expect(await routeThinClientCommand(cfg, 'beliefs', ['changes', 'companies/acme-example', 'people/alice-example', '--since', '2026-10-01'])).toBe(true);
+    expect(soleCall()).toEqual({ tool: 'delta', args: { since: '2026-10-01T00:00:00.000Z', beliefs: true, entities: 'companies/acme-example,people/alice-example' } });
+    expect(logs.join('\n')).toBe(['Belief changes on default from 2026-10-01T00:00:00.000Z to 2026-10-08T00:00:00.000Z: 1',
+      '- [2026-10-02] fact on companies/acme-example: added "Acme sells gadgets" (put_page, event 7, row 1)'].join('\n'));
+  });
+
+  test('a host whose delta has no beliefs is reported, not printed as empty', async () => {
+    reply({ pages: [] });
+    const stderr: string[] = [];
+    const write = spyOn(process.stderr, 'write').mockImplementation(((chunk: unknown) => { stderr.push(String(chunk)); return true; }) as never);
+    try {
+      expect(await routeThinClientCommand(cfg, 'beliefs', ['changes'])).toBe(true);
+    } finally { write.mockRestore(); }
+    expect(currentExitCode()).not.toBe(0);
+    expect(stderr.join('')).toContain('Error [unavailable]: The remote brain\'s delta does not return belief changes');
+    expect(logs).toEqual([]);
+  });
+});
+
 describe('routeThinClientCommand — (b) host-bound forms return false', () => {
   const hostBound: Array<[string, string[]]> = [
     ['search', ['modes', '--reset']],
@@ -208,6 +238,16 @@ describe('routeThinClientCommand — (b) host-bound forms return false', () => {
     ['quarantine', ['scan']],
     ['quarantine', ['clear']],
     ['takes', ['extract']],
+    ['takes', ['grades']],
+    ['beliefs', ['changes', '--source', 'notes']],
+    ['beliefs', ['status']],
+    ['takes', ['horizon', 'scan']],
+    ['takes', ['horizon', 'set', 'companies/acme-example', '--row', '1', '--date', '2025-06-30']],
+    ['takes', ['horizon', 'clear', 'companies/acme-example', '--row', '1']],
+    ['takes', ['journal']],
+    ['takes', ['journal', '--holder', 'alice-example', '--json']],
+    ['takes', ['scorecard', '--group-by', 'holder']],
+    ['takes', ['scorecard', 'alice-example', '--min-n', '5']],
   ];
 
   for (const [command, args] of hostBound) {
@@ -266,5 +306,72 @@ describe('routeThinClientCommand — (c) malformed routable forms print usage + 
 
   test('takes supersede missing --claim', async () => {
     await expectUsageExit('takes', ['supersede', 'people/alice-example', '--row', '1']);
+  });
+});
+
+describe('routeThinClientCommand — wakeshift watch (Wakeshift report-back over MCP)', () => {
+  const TAIL = 'Wakeshift: run \`wakeshift wait --session sk-example\` in the background to be woken.';
+  function respond(result: unknown, extra: Array<{ type: string; text: string }>): void {
+    callSpy.mockImplementationOnce(async (_cfg: GBrainConfig, tool: string, args: Record<string, unknown> = {}) => {
+      calls.push({ tool, args });
+      return { content: [{ type: 'text', text: JSON.stringify(result) }, ...extra] };
+    });
+  }
+  const watching = { watching: true, watch: 3, job: 812, event: 'gbrain.job.finished', status: 'active', already_finished: false, expires_in: '7d', fallback: 'If no wake arrives, call wait_job 812 (or run gbrain jobs wait 812).' };
+
+  test('watch job routes to watch_job with the caller params as given, and the tail is the last stdout line', async () => {
+    respond(watching, [{ type: 'text', text: TAIL }]);
+    expect(await routeThinClientCommand(cfg, 'wakeshift', ['watch', 'job', '812', '--session-key', 'sk-example', '--harness', 'grok-bot', '--conversation-id', 'conv-1'])).toBe(true);
+    expect(soleCall()).toEqual({ tool: 'watch_job', args: { id: 812, session_key: 'sk-example', harness: 'grok-bot', conversation_id: 'conv-1' } });
+    expect(logs.at(-1)).toBe(TAIL);
+    expect(logs.join('\n')).toContain('wait_job 812');
+    expect(errs.join('\n')).not.toContain('sk-example');
+  });
+
+  test('no --harness sends no harness; write and cron route to their own ops', async () => {
+    respond(watching, []);
+    expect(await routeThinClientCommand(cfg, 'wakeshift', ['watch', 'job', '9'])).toBe(true);
+    expect(calls.at(-1)).toEqual({ tool: 'watch_job', args: { id: 9 } });
+    respond({ watching: true, request_id: 'req-example' }, []);
+    expect(await routeThinClientCommand(cfg, 'wakeshift', ['watch', 'write', 'req-example', '--harness', 'muse'])).toBe(true);
+    expect(calls.at(-1)).toEqual({ tool: 'watch_write_request', args: { request_id: 'req-example', harness: 'muse' } });
+    respond({ watching: true, name: 'nightly-digest' }, []);
+    expect(await routeThinClientCommand(cfg, 'wakeshift', ['watch', 'cron', 'nightly-digest'])).toBe(true);
+    expect(calls.at(-1)).toEqual({ tool: 'watch_cron', args: { name: 'nightly-digest' } });
+  });
+
+  test('--json prints the result as one JSON line, then the tail last; a gbrain notice block is never taken for the tail', async () => {
+    respond(watching, [{ type: 'text', text: TAIL }]);
+    expect(await routeThinClientCommand(cfg, 'wakeshift', ['watch', 'job', '812', '--json'])).toBe(true);
+    expect(JSON.parse(logs[0]!)).toEqual(watching);
+    expect(logs.at(-1)).toBe(TAIL);
+    logs.length = 0;
+    respond(watching, [{ type: 'text', text: '[gbrain notice no_worker kind=info]\nwhy: no worker' }]);
+    expect(await routeThinClientCommand(cfg, 'wakeshift', ['watch', 'job', '812', '--json'])).toBe(true);
+    expect(logs).toHaveLength(1);
+    expect(JSON.parse(logs[0]!)).toEqual(watching);
+  });
+
+  test('accept-terms routes to accept_wakeshift_terms with the terms_version and prints what to do next', async () => {
+    respond({ accepted: true, terms_version: '0123456789abcdef', next: 'Call the watch tool again.' }, []);
+    expect(await routeThinClientCommand(cfg, 'wakeshift', ['accept-terms', '0123456789abcdef'])).toBe(true);
+    expect(soleCall()).toEqual({ tool: 'accept_wakeshift_terms', args: { terms_version: '0123456789abcdef' } });
+    expect(logs.join('\n')).toContain('Run the watch again');
+  });
+
+  test('only watch routes: every other wakeshift subcommand is host-bound', async () => {
+    for (const sub of ['status', 'enable', 'disable', 'test']) {
+      expect(await routeThinClientCommand(cfg, 'wakeshift', [sub])).toBe(false);
+    }
+    expect(calls).toHaveLength(0);
+  });
+
+  test('a malformed watch is a usage error with nothing sent', async () => {
+    for (const args of [['watch'], ['watch', 'job'], ['watch', 'job', 'abc'], ['watch', 'page', 'x'], ['watch', 'job', '1', '--harness']]) {
+      expect(await routeThinClientCommand(cfg, 'wakeshift', args)).toBe(true);
+      expect(currentExitCode()).toBe(2);
+      _resetCliExitVerdictForTests();
+    }
+    expect(calls).toHaveLength(0);
   });
 });

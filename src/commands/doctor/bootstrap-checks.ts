@@ -5,7 +5,7 @@
  */
 import { join } from 'path';
 import { existsSync } from 'fs';
-import { execFileSync } from 'child_process';
+import { localProbe } from './local-probe.ts';
 import type { BrainEngine } from '../../core/engine.ts';
 import { LATEST_VERSION } from '../../core/migrate.ts';
 // Agent-bootstrap doctor group (plan B2/B4/ENG-4 + one-live-serve note).
@@ -16,6 +16,7 @@ import { resolveGbrainHome } from '../../core/gbrain-home.ts';
 import { isManagedFilesystemPath } from '../../core/persistence/filesystem-guard.ts';
 import { withoutPhysicalRootMetadata } from '../../core/persistence/root-metadata.ts';
 import { agentFix } from './check-fix.ts';
+import type { PushStatusEntry } from '../../core/workspace-push.ts';
 import { VERSION as GBRAIN_BINARY_VERSION } from '../../version.ts';
 import type { Check } from '../doctor.ts';
 
@@ -43,14 +44,17 @@ async function pushSupersededEnrollmentCheck(checks: Check[], engine: BrainEngin
   return true;
 }
 
+/** #8990: `git -C <cwd> ...` stdout, or null on failure or past its 10 s bound (clipped to the entry deadline). */
+type GitProbe = (cwd: string, ...args: string[]) => Promise<string | null>;
+
+function gitProbe(entryDeadlineAt: number | undefined): GitProbe {
+  return (cwd, ...args) => localProbe(entryDeadlineAt, 'git', ['-C', cwd, ...args], { ownTimeoutMs: 10_000, windowsShell: false });
+}
+
 /** #5063: commits on the workspace's named branch that origin/<branch> lacks, counted whatever the push age (0 when unknown). */
-function commitsAheadOfOrigin(ws: string, branch: string): number {
+async function commitsAheadOfOrigin(git: GitProbe, ws: string, branch: string): Promise<number> {
   if (!branch) return 0;
-  try {
-    return parseInt(execFileSync('git', ['-C', ws, 'rev-list', '--count', `origin/${branch}..HEAD`], {
-      stdio: ['ignore', 'pipe', 'ignore'], timeout: 10_000,
-    }).toString().trim(), 10) || 0;
-  } catch { return 0; }
+  return parseInt((await git(ws, 'rev-list', '--count', `origin/${branch}..HEAD`))?.trim() ?? '', 10) || 0;
 }
 
 /**
@@ -70,8 +74,38 @@ function pushHealthCheck(root: string | null | undefined, status: 'warn' | 'fail
   };
 }
 
-export async function bootstrapDoctorChecks(engine: BrainEngine | null): Promise<Check[]> {
+/** #6083: a tree with nothing uncommitted (ownership metadata aside) on a named branch, 0 commits ahead of a configured origin. */
+async function treeMatchesOrigin(git: GitProbe, root: string): Promise<boolean> {
+  if ((await git(root, 'remote', 'get-url', 'origin')) === null) return false;
+  const branch = (await git(root, 'branch', '--show-current'))?.trim();
+  if (!branch) return false;
+  const status = await git(root, 'status', '--porcelain');
+  if (status === null || withoutPhysicalRootMetadata(status.trim()) !== '') return false;
+  return (await git(root, 'rev-list', '--count', `origin/${branch}..HEAD`))?.trim() === '0';
+}
+
+/**
+ * #6083: the recorded push failure finding. A failure whose tree now matches
+ * its origin is superseded (nothing is unpushed, and on a managed worktree
+ * nothing ever clears a refusal record); the first live failure decides.
+ */
+async function recordedPushFailureCheck(git: GitProbe, failing: PushStatusEntry[], ws: string | null): Promise<Check> {
+  const live: PushStatusEntry[] = [];
+  for (const s of failing) if (!s.repoRoot || !(await treeMatchesOrigin(git, s.repoRoot))) live.push(s);
+  if (live.length === 0) {
+    return { name: 'bootstrap_push_health', status: 'ok',
+      message: `last recorded push failed for ${failing.map((s) => s.repoRoot).join(', ')} (${failing[0]!.ts ?? 'unknown'}), but the tree matches its origin branch with nothing uncommitted; nothing to push` };
+  }
+  const s = live[0]!;
+  const target = s.repoRoot ?? ws ?? undefined;
+  const rest = live.length > 1 ? ` [+${live.length - 1} more workspace(s)]` : '';
+  return pushHealthCheck(target, 'warn', `last workspace push FAILED${target ? ` for ${target}` : ''} (${s.ts ?? 'unknown'}): ${s.reason ?? 'unknown'}${rest}`,
+    ` — run \`gbrain sources push${target ? ` --path ${target}` : ''}\``);
+}
+
+export async function bootstrapDoctorChecks(engine: BrainEngine | null, entryDeadlineAt?: number): Promise<Check[]> {
   const checks: Check[] = [];
+  const git = gitProbe(entryDeadlineAt);
   let home: string;
   try {
     home = resolveGbrainHome();
@@ -88,33 +122,13 @@ export async function bootstrapDoctorChecks(engine: BrainEngine | null): Promise
   // sole owner. "Enabled" is a CONFIG signal, not a health signal — the row
   // says so. Fail-soft like every probe in this group.
   try {
-    const {
-      codexPluginProvidesName,
-      claudePluginProvidesName,
-      codexAnyRegistrationExists,
-      claudeAnyRegistrationExists,
-    } = await import('../../core/bootstrap/harness.ts');
-    const { codexConfigPath, claudeUserSettingsPath, claudeUserMcpConfigPath } = await import('../../core/bootstrap/host-specs.ts');
-    const claudeUserMcpConfig = claudeUserMcpConfigPath();
-    const lanes: Array<{ harness: string; plugin: string; dup: boolean; disambiguate: string }> = [];
-    const codexPlugin = codexPluginProvidesName(codexConfigPath(), 'gbrain');
-    if (codexPlugin) {
-      lanes.push({
-        harness: 'codex',
-        plugin: codexPlugin,
-        dup: codexAnyRegistrationExists(codexConfigPath(), 'gbrain'),
-        disambiguate: 'keep one owner: `codex mcp remove gbrain` (drop the hand-wired entry) or `codex plugin remove gbrain@gbrain` (drop the plugin)',
-      });
-    }
-    const claudePlugin = claudePluginProvidesName(claudeUserSettingsPath(), 'gbrain');
-    if (claudePlugin) {
-      lanes.push({
-        harness: 'claude-code',
-        plugin: claudePlugin,
-        dup: claudeAnyRegistrationExists(claudeUserMcpConfig, 'gbrain', process.cwd()),
-        disambiguate: 'keep one owner: `claude mcp remove gbrain` (drop the hand-wired entry) or disable the plugin in Claude Code',
-      });
-    }
+    const { enabledPluginLanes, codexAnyRegistrationExists, claudeAnyRegistrationExists } = await import('../../core/bootstrap/plugin-lanes.ts');
+    const { codexConfigPath, claudeUserMcpConfigPath } = await import('../../core/bootstrap/host-specs.ts');
+    const lanes = enabledPluginLanes('gbrain').map((lane) => lane.harness === 'codex'
+      ? { ...lane, dup: codexAnyRegistrationExists(codexConfigPath(), 'gbrain'),
+          disambiguate: 'keep one owner: `codex mcp remove gbrain` (drop the hand-wired entry) or `codex plugin remove gbrain@gbrain` (drop the plugin)' }
+      : { ...lane, dup: claudeAnyRegistrationExists(claudeUserMcpConfigPath(), 'gbrain', process.cwd()),
+          disambiguate: 'keep one owner: `claude mcp remove gbrain` (drop the hand-wired entry) or disable the plugin in Claude Code' });
     for (const lane of lanes) {
       checks.push(
         lane.dup
@@ -139,7 +153,7 @@ export async function bootstrapDoctorChecks(engine: BrainEngine | null): Promise
 
   const receipt = readReceipt(home);
   // One reader for every push-status surface [D8]; per-root files [D13].
-  const { readPushStatuses, pushStatusFilesExist, pushStatusForWorkspace } = await import('../../core/workspace-push.ts');
+  const { readPushStatuses, pushStatusFilesExist, pushStatusForWorkspace, pushStatusRecordCounts } = await import('../../core/workspace-push.ts');
   const pushStatuses = readPushStatuses();
   const statusFilesOnDisk = pushStatusFilesExist();
   const heartbeatFile = join(home, 'integrations', 'hooks', 'heartbeat.jsonl');
@@ -162,6 +176,8 @@ export async function bootstrapDoctorChecks(engine: BrainEngine | null): Promise
   // --status`'s job; doctor stays offline-cheap.
   if (harnessState.state === 'ok') {
     const hr = harnessState.receipt;
+    const { cleanupDoctorMessage, harnessCleanupReport, tokenStatesWith } = await import('../../core/bootstrap/harness-cleanup.ts');
+    let cleanup: Awaited<ReturnType<typeof harnessCleanupReport>> = [];
     const failed = hr.targets.filter((t) => t.state === 'failed');
     const pending = hr.targets.filter((t) => t.state === 'pending');
     if (failed.length > 0 || pending.length > 0) {
@@ -172,11 +188,13 @@ export async function bootstrapDoctorChecks(engine: BrainEngine | null): Promise
           `harness wiring incomplete: ${failed.length} failed / ${pending.length} pending target(s)` +
           ` — re-run \`gbrain bootstrap harness\` to converge (details: gbrain bootstrap harness --status).`,
       });
-    } else if (hr.token.previous_ids && hr.token.previous_ids.length > 0) {
+    } else if ((cleanup = await harnessCleanupReport(hr, ids => engine ? tokenStatesWith(engine, ids) : Promise.resolve({}))).length > 0) {
+      // #6743: per id, a revoked credential awaiting enrollment cleanup reads apart from an active one (leave before revoke).
       checks.push({
         name: 'bootstrap_harness_health',
         status: 'fail',
-        message: `${hr.token.previous_ids.length} previous harness token(s) were never revoked (ids ${hr.token.previous_ids.join(', ')}) — re-run \`gbrain bootstrap harness\`, or run \`gbrain auth revoke\` with the id flag per id.`,
+        message: cleanupDoctorMessage(cleanup),
+        details: { code: 'bootstrap_cleanup_pending', cleanup },
       });
     } else if (hr.targets.length === 0 && hr.token.minted && hr.token.id !== undefined) {
       // Half-removed state: a remove under a live PGLite serve strips every
@@ -215,6 +233,8 @@ export async function bootstrapDoctorChecks(engine: BrainEngine | null): Promise
         });
       }
     }
+    const { harnessHookCarrierChecks } = await import('./harness-hook-checks.ts');
+    checks.push(...harnessHookCarrierChecks(hr));
   } else if (harnessState.state !== 'absent') {
     checks.push({
       name: 'bootstrap_harness_health',
@@ -278,11 +298,7 @@ export async function bootstrapDoctorChecks(engine: BrainEngine | null): Promise
       const { PUSH_STALE_MS } = await import('../hook.ts'); // hook.ts owns the threshold (single source)
       const failing = pushStatuses.filter((s) => s.ok === false);
       if (failing.length > 0) {
-        const s = failing[0]!;
-        const target = s.repoRoot ?? ws ?? undefined;
-        const rest = failing.length > 1 ? ` [+${failing.length - 1} more workspace(s)]` : '';
-        checks.push(pushHealthCheck(target, 'warn', `last workspace push FAILED${target ? ` for ${target}` : ''} (${s.ts ?? 'unknown'}): ${s.reason ?? 'unknown'}${rest}`,
-          ` — run \`gbrain sources push${target ? ` --path ${target}` : ''}\``));
+        checks.push(await recordedPushFailureCheck(git, failing, ws));
       } else {
         const stamps = pushStatuses.map((s) => Date.parse(s.ts ?? '')).filter((t) => Number.isFinite(t));
         const stalest = stamps.length > 0 ? Math.min(...stamps) : NaN;
@@ -306,61 +322,46 @@ export async function bootstrapDoctorChecks(engine: BrainEngine | null): Promise
         // itself failed): unverified must NOT be treated as clean below.
         let dirty = false, known = false, ahead = 0;
         if (ws) {
-          try {
-            const statusOut = withoutPhysicalRootMetadata(execFileSync('git', ['-C', ws, 'status', '--porcelain'], {
-              stdio: ['ignore', 'pipe', 'ignore'], timeout: 10_000,
-            }).toString());
-            const branch = execFileSync('git', ['-C', ws, 'branch', '--show-current'], { stdio: ['ignore', 'pipe', 'ignore'], timeout: 10_000 }).toString().trim();
-            ahead = commitsAheadOfOrigin(ws, branch);
+          const statusRaw = await git(ws, 'status', '--porcelain');
+          const branch = statusRaw === null ? null : (await git(ws, 'branch', '--show-current'))?.trim() ?? null;
+          if (statusRaw !== null && branch !== null) {
+            const statusOut = withoutPhysicalRootMetadata(statusRaw);
+            ahead = await commitsAheadOfOrigin(git, ws, branch);
             if (statusOut.trim() !== '') {
               dirty = true;
               known = true;
+            } else if (branch) {
+              // origin/<branch> doesn't resolve — e.g. never pushed. Any
+              // local commit on top of an empty tree still counts as
+              // needing a push (this fallback only applies to a NAMED
+              // branch with no upstream; see the detached-HEAD branch
+              // below for why the same trick is unsafe there). Mirrors
+              // treeNeedsPush's [hook.ts] existing "never pushed" fallback
+              // as-is: a topic branch already fully contained in another
+              // remote branch (e.g. origin/main) but never itself fetched
+              // as origin/<branch> can over-report as dirty here — an
+              // inherited, pre-existing edge case, left as a false FAIL
+              // rather than a false OK, which is the safer direction for
+              // this specific check.
+              const countOut = (await git(ws, 'rev-list', '--count', `origin/${branch}..HEAD`)) ?? (await git(ws, 'rev-list', '--count', 'HEAD'));
+              if (countOut !== null) {
+                dirty = (parseInt(countOut.trim(), 10) || 0) > 0;
+                known = true;
+              }
             } else {
-              const branchOut = branch;
-              if (branchOut) {
-                try {
-                  const aheadOut = execFileSync(
-                    'git', ['-C', ws, 'rev-list', '--count', `origin/${branchOut}..HEAD`],
-                    { stdio: ['ignore', 'pipe', 'ignore'], timeout: 10_000 },
-                  ).toString().trim();
-                  dirty = (parseInt(aheadOut, 10) || 0) > 0;
-                  known = true;
-                } catch {
-                  // origin/<branch> doesn't resolve — e.g. never pushed. Any
-                  // local commit on top of an empty tree still counts as
-                  // needing a push (this fallback only applies to a NAMED
-                  // branch with no upstream; see the detached-HEAD branch
-                  // below for why the same trick is unsafe there). Mirrors
-                  // treeNeedsPush's [hook.ts] existing "never pushed" fallback
-                  // as-is: a topic branch already fully contained in another
-                  // remote branch (e.g. origin/main) but never itself fetched
-                  // as origin/<branch> can over-report as dirty here — an
-                  // inherited, pre-existing edge case, left as a false FAIL
-                  // rather than a false OK, which is the safer direction for
-                  // this specific check.
-                  const haveOut = execFileSync('git', ['-C', ws, 'rev-list', '--count', 'HEAD'], {
-                    stdio: ['ignore', 'pipe', 'ignore'], timeout: 10_000,
-                  }).toString().trim();
-                  dirty = (parseInt(haveOut, 10) || 0) > 0;
-                  known = true;
-                }
-              } else {
-                // Detached HEAD: `rev-list --count HEAD` counts ALL history
-                // reachable from HEAD, not just unpushed commits, so it is
-                // NOT a safe "never pushed" fallback here (unlike the named-
-                // branch case above) — it would flag any non-trivial repo as
-                // dirty even when HEAD is already contained by origin. If
-                // `@{u}` doesn't resolve, tree state is simply unverifiable.
-                try {
-                  const aheadOut = execFileSync('git', ['-C', ws, 'rev-list', '--count', '@{u}..HEAD'], {
-                    stdio: ['ignore', 'pipe', 'ignore'], timeout: 10_000,
-                  }).toString().trim();
-                  dirty = (parseInt(aheadOut, 10) || 0) > 0;
-                  known = true;
-                } catch { known = false; }
+              // Detached HEAD: `rev-list --count HEAD` counts ALL history
+              // reachable from HEAD, not just unpushed commits, so it is
+              // NOT a safe "never pushed" fallback here (unlike the named-
+              // branch case above) — it would flag any non-trivial repo as
+              // dirty even when HEAD is already contained by origin. If
+              // `@{u}` doesn't resolve, tree state is simply unverifiable.
+              const aheadOut = await git(ws, 'rev-list', '--count', '@{u}..HEAD');
+              if (aheadOut !== null) {
+                dirty = (parseInt(aheadOut.trim(), 10) || 0) > 0;
+                known = true;
               }
             }
-          } catch { dirty = false; known = false; }
+          }
         }
         if (dirty && ws && Date.now() - Date.parse(pushStatusForWorkspace(pushStatuses, ws)?.ts ?? '') > PUSH_STALE_MS) { // #5432: this root's own receipt
           checks.push(pushHealthCheck(ws, 'fail', `last successful push ${pushStatusForWorkspace(pushStatuses, ws)?.ts} (>48h) with a DIRTY workspace tree — recent agent memory is unpushed [B4]`,
@@ -396,7 +397,11 @@ export async function bootstrapDoctorChecks(engine: BrainEngine | null): Promise
     } else if (statusFilesOnDisk) {
       // Files exist but none parsed — the tolerant reader skips corrupt
       // records; doctor must not let that read as "no news is good news".
-      checks.push({ name: 'bootstrap_push_health', status: 'warn', message: 'push status unreadable' });
+      // #7377: records kept for workspaces that no longer exist are history.
+      const counts = pushStatusRecordCounts();
+      checks.push(counts.unreadable === 0 && counts.gone > 0
+        ? { name: 'bootstrap_push_health', status: 'ok', message: `push status is kept only for ${counts.gone} workspace(s) that no longer exist; no tracked workspace to check` }
+        : { name: 'bootstrap_push_health', status: 'warn', message: 'push status unreadable' });
     }
   } catch {
     checks.push({ name: 'bootstrap_push_health', status: 'warn', message: 'push status unreadable' });

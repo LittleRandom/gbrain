@@ -14,12 +14,12 @@ import { closeSync, constants, existsSync, fsyncSync, lstatSync, openSync, readF
 import { basename, dirname, join, resolve } from 'node:path';
 import type { OperationError } from '../ops/contract.ts';
 import { engineGraduatedError, inProgressError, interruptedError, splitBrainError } from './graduation-errors.ts';
-import { inspectLockHolder, isProcessAlive, readBootId, readPidNs, type LockHandle } from '../pglite-lock.ts';
+import { inspectLockHolder, isProcessAlive, processStartTime, readBootId, readPidNs, type LockHandle } from '../pglite-lock.ts';
 import { moveHeldPglite } from './maintenance.ts';
 import { withFilesystemPublication } from './filesystem-guard.ts';
 import { flushDirectory } from '../fs-durable.ts';
 import type { BrainEngine } from '../engine.ts';
-import { GRADUATION_RUN_SETTING, graduationTablePresent, readGraduationRow } from './graduation-schema.ts';
+import { GRADUATION_RUN_SETTING, graduationTablePresent, readGraduationConnectRow } from './graduation-schema.ts';
 import type { GraduationPathState, IntentMarker, ManifestState, TargetIdentity, Tombstone } from './engine-graduation.types.ts';
 
 
@@ -89,14 +89,7 @@ export function allowGraduationInspection(dataDir: string): () => void {
 
 // ── process identity (marker liveness) ─────────────────────────────────────
 
-/** Kernel start time of `pid` (Linux /proc clock ticks), or null when unknowable. */
-export function processStartTime(pid: number): string | null {
-  try {
-    const stat = readFileSync(`/proc/${pid}/stat`, 'utf8');
-    const fields = stat.slice(stat.lastIndexOf(')') + 2).split(' ');
-    return fields[19] ?? null;
-  } catch { return null; }
-}
+export { processStartTime };
 
 export function currentProcessIdentity(): Pick<IntentMarker, 'pid' | 'bootId' | 'pidNs' | 'processStart'> {
   return { pid: process.pid, bootId: readBootId(), pidNs: readPidNs(), processStart: processStartTime(process.pid) };
@@ -105,14 +98,15 @@ export function currentProcessIdentity(): Pick<IntentMarker, 'pid' | 'bootId' | 
 /**
  * Whether the marker's requesting process is still running. `unknown` when
  * the marker comes from another boot or PID namespace (another host on a
- * shared filesystem, or a container); callers then treat the kernel lock as
- * the authority (an acquirable lock means the run is gone).
+ * shared filesystem, or a container), or recorded a boot id / PID namespace
+ * this process cannot read for itself (#6774: an unavailable probe proves no
+ * match); callers then treat the kernel lock as the authority (an acquirable
+ * lock means the run is gone). A marker that recorded neither keeps the pid check.
  */
 export function markerLiveness(marker: IntentMarker): 'alive' | 'dead' | 'unknown' {
   if (marker.pid === process.pid) return isGraduationRunInProcess(marker.runId) ? 'alive' : 'dead';
-  const bootId = readBootId(), pidNs = readPidNs();
-  if (marker.bootId && bootId && marker.bootId !== bootId) return 'unknown';
-  if (marker.pidNs && pidNs && marker.pidNs !== pidNs) return 'unknown';
+  if (marker.bootId && marker.bootId !== readBootId()) return 'unknown';
+  if (marker.pidNs && marker.pidNs !== readPidNs()) return 'unknown';
   if (!isProcessAlive(marker.pid)) return 'dead';
   if (marker.processStart) {
     const start = processStartTime(marker.pid);
@@ -340,7 +334,7 @@ function exemptRun(runId: string, env: NodeJS.ProcessEnv): boolean {
  * otherwise `graduation_interrupted`.
  */
 export async function assertGraduationConnectAllowed(engine: BrainEngine, env: NodeJS.ProcessEnv = process.env): Promise<void> {
-  const row = await readGraduationRow(engine);
+  const row = await readGraduationConnectRow(engine);
   if (!row || exemptRun(row.run_id, env)) return;
   if (row.role === 'target') {
     if (row.state === 'authoritative') return;
@@ -368,7 +362,7 @@ function cutoverSourceRefusal(runId: string, sourceDataDir: string | null): Oper
  * (the verify-step replay probe sets it).
  */
 export async function assertGraduationAdmission(tx: BrainEngine): Promise<void> {
-  if (!await graduationTablePresent(tx)) return;
+  if (!await graduationTablePresent(tx, { cached: true })) return;
   const [row] = await tx.executeRaw<{ role: string; run_id: string; state: string; source_data_dir: string | null; run: string | null }>(
     `SELECT role, run_id::text AS run_id, state, source_data_dir, NULLIF(current_setting('${GRADUATION_RUN_SETTING}', true), '') AS run
      FROM persistence_graduation WHERE singleton = 1`);

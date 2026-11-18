@@ -16,10 +16,11 @@ import { cliRenderContext, toAgentError, type Action } from '../core/agent-outpu
 import { grantFromTokenRow } from '../core/grants/model.ts';
 import { opError } from '../core/ops/contract.ts';
 import { sqlQueryForEngine } from '../core/sql-query.ts';
-import { ALLOWED_SCOPES_LIST, isScope } from '../core/scope.ts';
+import { ALLOWED_SCOPES_LIST, isScope, localCliOnlyScopeViolation } from '../core/scope.ts';
 import { isValidSourceId } from '../core/source-id.ts';
 import { isValidHolder } from '../core/takes-fence.ts';
 import { mintLegacyToken, revokeLegacyTokenById, TOKEN_ID_RE } from '../core/token-mint.ts';
+import { assertCredentialScoped } from '../core/access/requester-scope.ts';
 
 export const API_KEY_NAME_MAX = 128;
 export const API_KEY_DEFAULT_SCOPES: readonly string[] = ['read', 'write'];
@@ -31,6 +32,8 @@ export interface ApiKeyMintRequest {
   scopes: string[];
   /** undefined = no source grant (the `gbrain auth create` default). */
   sources?: string[];
+  /** GST-2898: also read every shared source, now and later; needs sources. */
+  readShared?: boolean;
   takesHolders: string[];
   defaultsApplied: Array<'scopes' | 'sources' | 'takes_holders'>;
 }
@@ -75,6 +78,12 @@ export async function parseApiKeyMintRequest(engine: BrainEngine, body: unknown)
       `Resubmit with scopes from: ${valid}.`, 'A misspelled scope is refused at mint time so it never mints a key with a different grant than asked.',
       createFix(['--scopes', 'read,write'], 'Mints the same key with the default read,write scopes.'));
   }
+  const localOnly = localCliOnlyScopeViolation(scopesParam ?? []);
+  if (localOnly) {
+    throw invalid(localOnly, 'Resubmit without memory_confirm, or ask the user to mint the key on the brain host with gbrain auth create.',
+      'Confirming memory as the owner is granted only by the local CLI, never by the admin API.',
+      { ...createFix(['--scopes', 'read,write,memory_confirm'], 'Mints the key with memory_confirm from the local CLI on the brain host.'), actor: 'user' });
+  }
   const scopes = scopesParam ?? (defaultsApplied.push('scopes'), [...API_KEY_DEFAULT_SCOPES]);
 
   const sourcesParam = listParam(raw.sources);
@@ -101,7 +110,15 @@ export async function parseApiKeyMintRequest(engine: BrainEngine, body: unknown)
       createFix(['--takes-holders', 'world'], 'Mints the same key with the default world takes holder.'));
   }
   const takesHolders = holdersParam ?? (defaultsApplied.push('takes_holders'), [...API_KEY_DEFAULT_TAKES_HOLDERS]);
-  return { name, scopes, ...(sourcesParam ? { sources: sourcesParam } : {}), takesHolders, defaultsApplied };
+  if (raw.read_shared !== undefined && typeof raw.read_shared !== 'boolean') {
+    throw invalid('read_shared must be true or false.', 'Resubmit with read_shared true (also read every shared source, now and later) or omit it.',
+      'The switch adds every shared source to the key\'s reads; it never changes where the key writes.', listAction('Lists existing keys and their read_shared value.'));
+  }
+  if (raw.read_shared === true && !sourcesParam) {
+    throw invalid('read_shared needs sources: a key with no sources already reads every shared source.', 'Resubmit with sources naming the write source first, or omit read_shared.',
+      'The switch adds shared reads to a key that writes to one named source.', listAction('Lists existing keys and their sources.'));
+  }
+  return { name, scopes, ...(sourcesParam ? { sources: sourcesParam } : {}), ...(raw.read_shared === true ? { readShared: true } : {}), takesHolders, defaultsApplied };
 }
 
 function grantView(row: Record<string, unknown>) {
@@ -112,6 +129,8 @@ function grantView(row: Record<string, unknown>) {
     scopes_grandfathered: row.scopes == null,
     sources: s.kind === 'default' ? 'default' : s.kind === 'none' ? [] : s.kind === 'scalar' ? [s.writeSource] : [...s.readSources],
     takes_holders: grant.takesHolders ?? ['world'],
+    private_pages: grant.privatePages,
+    read_shared: grant.readShared === true,
   };
 }
 
@@ -135,16 +154,18 @@ export function mountAdminApiKeys(app: Express, requireAdmin: RequestHandler, en
     let request: ApiKeyMintRequest;
     try {
       request = await parseApiKeyMintRequest(engine, req.body);
+      await assertCredentialScoped(engine, null, 'token', request.name);
     } catch (e) {
       sendError(res, 400, e);
       return;
     }
     try {
-      const minted = await mintLegacyToken(engine, { name: request.name, scopes: request.scopes, takesHolders: request.takesHolders, ...(request.sources ? { sourceGrant: request.sources } : {}) });
+      const minted = await mintLegacyToken(engine, { name: request.name, scopes: request.scopes, takesHolders: request.takesHolders, ...(request.sources ? { sourceGrant: request.sources } : {}), ...(request.readShared ? { readShared: true } : {}) });
       res.json({
         id: minted.id, name: minted.name, token: minted.token,
         scopes_applied: request.scopes,
         sources_applied: request.sources ?? 'default',
+        read_shared: request.readShared === true,
         takes_holders_applied: request.takesHolders,
         defaults_applied: request.defaultsApplied,
       });

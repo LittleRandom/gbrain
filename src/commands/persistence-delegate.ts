@@ -1,14 +1,15 @@
 /** CLI-only commands may parse/read input before lazily connecting to a local engine. */
 import type { BrainEngine } from '../core/engine.ts';
 import type { GBrainConfig } from '../core/config.ts';
+import type { EngineConnectOptions } from '../core/engine-connect.ts';
 import { OperationError } from '../core/ops/contract.ts';
 import { finishCliTeardown, noteRenderedErrorCode, setCliExitVerdict, writeStdoutFinal } from '../core/cli-force-exit.ts';
 import { maybeDelegateLocalOperation } from '../core/persistence/local-client.ts';
 import { PersistenceIpcTransportError } from '../core/persistence/ipc.ts';
-import { RemoteMcpError } from '../core/mcp-client.ts';
+import { RemoteMcpError } from '../core/remote-mcp-error.ts';
 import { getCliOptions } from '../core/cli-options.ts';
 import { PENDING_WRITE_EXIT_CODE } from '../core/exit-codes.ts';
-import { acceptPendingRequested, pendingReceiptOf, pollCommand, WRITE_EXIT_DOCS, writeErrorExitCode } from '../core/persistence/write-wait.ts';
+import { acceptPendingCovers, acceptPendingRequested, pendingReceiptOf, pollCommand, WRITE_EXIT_DOCS, writeErrorExitCode } from '../core/persistence/write-wait.ts';
 import { cliRenderContext, toAgentError } from '../core/agent-output.ts';
 import { cliCommandOf } from '../cli/cli-error.ts';
 
@@ -21,12 +22,15 @@ export async function reportPersistenceCliError(error: unknown, json = false,
   // PENDING_WRITE_EXIT_CODE (0 with --accept-pending) and names how to poll.
   const pending = pendingReceiptOf(error);
   const acceptPending = acceptPendingRequested(getCliOptions().acceptPending);
+  const render = cliRenderContext();
+  const envelope = toAgentError(error, { transport: 'cli', command: cliCommandOf(), render, ...(pending ? { mutating: true, outcome: 'pending' as const } : {}) });
+  // #6255: one source for the poll command: the envelope's receipt fix, pinned like every CLI fix.
+  const poll = pending ? pollCommand(pending.request_id, envelope.fix, render.routing) : undefined;
   if (json) {
     // Legacy keys lead and keep their values; the v1 envelope fields (code, fix, docs_cmd, class, retryable,
     // notices, contract_version) come from the shared renderer, as renderCliError writes them (cli-error.ts pattern).
     const legacy: Record<string, unknown> = pending ? { ...detail, request_id: pending.request_id, state: pending.state,
-      poll_command: pollCommand(pending.request_id) } : { ...detail };
-    const envelope = toAgentError(error, { transport: 'cli', command: cliCommandOf(), render: cliRenderContext() });
+      poll_command: poll } : { ...detail };
     noteRenderedErrorCode(envelope.code);
     const doc = { ...legacy, ...Object.fromEntries(Object.entries(envelope).filter(([, v]) => v !== undefined)), ...legacy };
     await out(JSON.stringify(doc, null, 2) + '\n');
@@ -39,8 +43,9 @@ export async function reportPersistenceCliError(error: unknown, json = false,
   const requestId = receipt?.request_id ?? ('request_id' in detail ? detail.request_id : undefined);
   if (requestId) console.error(`Request: ${requestId}${receipt ? ` (${receipt.state})` : ''}`);
   if (pending) {
-    console.error(`Poll: ${pollCommand(pending.request_id)}`);
+    console.error(`Poll: ${poll}`);
     if (!acceptPending) console.error(`Exit ${PENDING_WRITE_EXIT_CODE}: accepted, not yet committed. Wait longer with --wait <seconds>, or pass --accept-pending to exit 0 (${WRITE_EXIT_DOCS}).`);
+    else if (!acceptPendingCovers(pending)) console.error(`Exit ${PENDING_WRITE_EXIT_CODE}: accepted, but queued for an owner host that runs no consumer and has been quiet past the stale window (the receipt's diagnostic.owner); --accept-pending does not cover it. Run gbrain doctor --only owner_host_stale --json (${WRITE_EXIT_DOCS}).`);
   }
   setCliExitVerdict(writeErrorExitCode(error, acceptPending));
   return true;
@@ -51,12 +56,13 @@ export async function runDelegatedCliOperation(
   operation: string,
   params: Record<string, unknown>,
   config: GBrainConfig | null,
-  options: { brain?: string | null; timeoutMs?: number },
+  options: { brain?: string | null; timeoutMs?: number; room?: string },
   render: (operation: string, result: unknown, params: Record<string, unknown>) => string,
 ): Promise<boolean> {
   try {
     const delegated = await maybeDelegateLocalOperation(operation, params, config, options);
     if (!delegated.handled) return false;
+    if (options.room !== undefined) return await printDelegatedRoom(operation, delegated, options.room, params, render);
     const output = render(operation, delegated.result, params);
     if (output) await writeStdoutFinal(output);
     if ((delegated.result as { status?: unknown } | null)?.status === 'error') setCliExitVerdict(1);
@@ -67,10 +73,25 @@ export async function runDelegatedCliOperation(
   }
 }
 
+/** GBRA-498: a delegated answer for --room: the owner's marks (or every item unknown), the notices, then the room summary. */
+async function printDelegatedRoom(operation: string, delegated: { result: unknown; room?: { meta: unknown; notices: unknown[] } }, room: string,
+  params: Record<string, unknown>, render: (operation: string, result: unknown, params: Record<string, unknown>) => string): Promise<true> {
+  const roomCli = await import('../cli/room.ts');
+  const marked = await roomCli.delegatedRoom(operation, delegated, room);
+  const { applyCliOpNotices } = await import('../cli/op-notices.ts');
+  const { result, stderr } = applyCliOpNotices(roomCli.cliRoomResult(marked, params.json === true), params.json === true, { op: operation, retrieval: null });
+  const output = render(operation, result, params);
+  if (output) await writeStdoutFinal(output);
+  if (stderr) process.stderr.write(stderr);
+  if (params.json !== true) process.stderr.write(roomCli.roomSummaryLine(marked.meta));
+  if ((marked.result as { status?: unknown } | null)?.status === 'error') setCliExitVerdict(1);
+  return true;
+}
+
 export async function runDeferredPersistenceCommand(
   command: 'capture' | 'forget' | 'call' | 'sources' | 'takes',
   args: string[],
-  connect: () => Promise<BrainEngine>,
+  connect: (opts?: EngineConnectOptions) => Promise<BrainEngine>,
 ): Promise<void> {
   // A3: refusing to remove or archive the default source is invalid input (exit 2), as on
   // the unmanaged lane; the write lane's verdict would be 1.
@@ -81,11 +102,12 @@ export async function runDeferredPersistenceCommand(
       { fix: { argv: ['gbrain', 'sources', 'list', '--json'], consent: [], actor: 'agent', requires_exclusive: false, why: 'Lists the named sources that can be removed or archived.' } }), 'sources');
   }
   let connected: BrainEngine | null = null;
-  const getEngine = async () => connected ??= await connect();
+  const getEngine = async (opts?: EngineConnectOptions) => connected ??= await connect(opts);
   try {
     if (command === 'takes') {
-      const { runTakesMutation } = await import('./takes-mutation.ts');
-      await runTakesMutation(getEngine, args);
+      const { runTakesMutation, runTakesRebuild } = await import('./takes-mutation.ts');
+      if (args[0] === 'rebuild') await runTakesRebuild(getEngine, args.slice(1));
+      else await runTakesMutation(getEngine, args);
     } else if (command === 'sources') {
       if (args[0] === 'reconcile') {
         const { runReconcileCli } = await import('./source-reconcile.ts');

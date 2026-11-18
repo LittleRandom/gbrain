@@ -90,6 +90,17 @@ export async function assertBrainEmbeddingEnabled(engine: BrainEngine, cfg?: GBr
   assertEmbeddingEnabled({ engine: engine.kind, ...(cfg ?? loadConfig() ?? {}), embedding_disabled: true });
 }
 
+/**
+ * Refuse `gbrain embed` on a brain whose config file (`cfg`, the caller's) or own `embedding_disabled` row opts out (a failed row read
+ * counts as disabled), the planes the cycle's embed phase reads. A write consumer's config governs that consumer's fact
+ * writes only, so it is not consulted here.
+ */
+export async function assertBrainRowEmbeddingEnabled(engine: BrainEngine, cfg: GBrainConfig | null): Promise<void> {
+  assertEmbeddingEnabled(cfg);
+  const { embeddingSendBlocked } = await import('./embedding-disabled.ts');
+  if (await embeddingSendBlocked(engine)) assertEmbeddingEnabled({ engine: engine.kind, ...(cfg ?? {}), embedding_disabled: true });
+}
+
 export function assertEmbeddingEnabled(cfg: GBrainConfig | null): void {
   if (!cfg?.embedding_disabled) return;
   const fix = embeddingEnablement(cfg);
@@ -268,7 +279,7 @@ export function embeddingMismatchMessage(opts: EmbeddingMismatchOpts): string {
     `  DROP INDEX IF EXISTS idx_chunks_embedding;`,
     `  -- NULL embeddings BEFORE the alter: pgvector refuses to cast existing`,
     `  -- vectors across dimensions and aborts the transaction. NULLs cast fine.`,
-    `  UPDATE content_chunks SET embedding = NULL, embedded_at = NULL;`,
+    `  UPDATE content_chunks SET embedding = NULL, embedded_at = NULL, embedding_pending_since = now();`,
     `  ALTER TABLE content_chunks ALTER COLUMN embedding TYPE vector(${requestedDims});`,
     `  ${reindexLine.split('\n').join('\n  ')}`,
     `  COMMIT;`,

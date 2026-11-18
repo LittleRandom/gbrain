@@ -26,7 +26,7 @@ import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { withEnv } from './helpers/with-env.ts';
-import { makeContext } from '../src/cli.ts';
+import { makeContext } from '../src/cli/main.ts';
 import { isEvalCaptureEnabled, isEvalScrubEnabled } from '../src/core/eval-capture.ts';
 import type { BrainEngine } from '../src/core/engine.ts';
 import { surfaceSource } from './helpers/source-surface.ts';
@@ -109,7 +109,7 @@ describe('eval.capture set on the DB plane reaches the runtime gate (#1475)', ()
     // that lacks the export, which would collapse the other cases' signal to a
     // single load error. Deferring it keeps each case independently
     // meaningful when someone reverts half the fix to see what breaks.
-    const { __testing } = await import('../src/cli.ts');
+    const { __testing } = await import('../src/cli/main.ts');
 
     let keysRead: string[] = [];
     const counting = {
@@ -162,7 +162,7 @@ describe('eval.capture set on the DB plane reaches the runtime gate (#1475)', ()
     // state) — the same provenance-follows-the-engine binding
     // MERGED_CONFIG_BY_ENGINE already uses, so this stays correct even if a
     // process ever holds a host engine and a mount engine at once.
-    const { __testing } = await import('../src/cli.ts');
+    const { __testing } = await import('../src/cli/main.ts');
     let keysRead: string[] = [];
     const counting = {
       kind: 'pglite',
@@ -197,8 +197,16 @@ describe('eval.capture set on the DB plane reaches the runtime gate (#1475)', ()
     const cli = surfaceSource('cli');
     expect(cli).toContain('MERGED_CONFIG_BY_ENGINE.set(engine, merged)');
     // Guard the guard: if the map is ever renamed, the assertion above must
-    // not keep passing against a stale literal that no longer exists.
-    expect(cli).toContain('const MERGED_CONFIG_BY_ENGINE = new WeakMap');
+    // not keep passing against a stale literal that no longer exists. The map
+    // lives in src/core/published-config.ts (serve reads it too); the CLI must
+    // import that one map, and the publish seam must write into it.
+    expect(cli).toContain("MERGED_CONFIG_BY_ENGINE } from '../core/config.ts'");
+    const { __testing } = await import('../src/cli/main.ts');
+    const { MERGED_CONFIG_BY_ENGINE } = await import('../src/core/published-config.ts');
+    const probe = {} as unknown as BrainEngine;
+    const published = { engine: 'pglite' as const };
+    __testing.publishMergedConfig(probe, published);
+    expect(MERGED_CONFIG_BY_ENGINE.get(probe)).toBe(published);
   });
 
   test('connectMountEngine still marks its engine as a mount engine', async () => {

@@ -43,8 +43,9 @@ import {
   deriveDirectUrl,
   deriveSessionPoolerUrl,
   isSupabasePoolerUrl,
-} from './connection-manager.ts';
+} from './supabase-pooler-url.ts';
 import { extractProjectRef } from './supabase-admin.ts';
+import { CODES } from './error-registry.ts';
 
 /**
  * APPEND-ONLY. Consumers switch exhaustively with a `never` sentinel
@@ -68,6 +69,7 @@ export type PgAccessReason =
   | 'schema_missing'      // 42P01 / 42703 missing relation or column
   | 'pgvector_missing'    // vector extension absent
   | 'storage_corrupt'     // XX000/XX001/XX002: torn TOAST value, catalog/tuple damage (#5216, #4738)
+  | 'tls_required_default' // postgres_tls_required: gbrain's TLS default met a non-local server without TLS
   | 'unknown';
 
 export type PgAccessFix =
@@ -163,7 +165,8 @@ interface ReasonRow {
   /** Code-prefix matches (e.g. every 08xxx connection SQLSTATE). */
   codePrefixes?: string[];
   patterns?: RegExp[];
-  remediation: string;
+  /** Left out only on a row for a gbrain-coded error: its advice is that code's error-registry suggestion. */
+  remediation?: string;
   /** E10: the same advice without Supabase specifics, used when the configured URL is not a Supabase host. */
   plainRemediation?: string;
   fix?: PgAccessFix;
@@ -179,6 +182,11 @@ interface ReasonRow {
  * second person, never preachy.
  */
 const REASON_ROWS: ReadonlyArray<ReasonRow> = [
+  {
+    reason: 'tls_required_default',
+    transient: false,
+    codes: ['postgres_tls_required'],
+  },
   {
     reason: 'storage_corrupt',
     transient: false,
@@ -285,11 +293,16 @@ const REASON_ROWS: ReadonlyArray<ReasonRow> = [
   {
     reason: 'conn_dropped',
     transient: true,
-    codes: ['CONNECTION_ENDED', 'CONNECTION_CLOSED'],
+    // #6355: the server's own session ends (pg_terminate_backend, a crash or a failover: 57P01/57P02/57P03) and the
+    // socket errnos a pooler drop surfaces are the same class; before this row they fell through to `unknown`.
+    codes: ['CONNECTION_ENDED', 'CONNECTION_CLOSED', 'CONNECTION_DESTROYED', '57P01', '57P02', '57P03'],
     codePrefixes: ['08'],
     patterns: [
       /Connection terminated unexpectedly/i,
+      /terminating connection due to administrator command/i,
       /ECONNRESET/i,
+      /ECONNABORTED/i,
+      /EPIPE/i,
       /connection.*closed/i,
       /server closed the connection/i,
       /could not connect to server/i,
@@ -401,7 +414,8 @@ export function classifyPgAccessError(err: unknown, ctx?: PgAccessContext): PgAc
       transient: row.transient,
       sqlstate: looksLikeSqlstate(code),
       message,
-      remediation: ctx?.url && !looksLikeSupabase(ctx.url) && row.plainRemediation ? row.plainRemediation : row.remediation,
+      remediation: ctx?.url && row.plainRemediation && (!looksLikeSupabase(ctx.url) || (row.reason === 'dns_failed' && isSupabasePoolerUrl(ctx.url))) ? row.plainRemediation
+        : row.remediation ?? (CODES as Record<string, { suggestion?: string }>)[code ?? '']?.suggestion ?? UNKNOWN_REMEDIATION,
       fix: contextualFix(row.reason, ctx?.url) ?? row.fix,
       supabase: supabaseHints(ctx?.url, row.reason),
       brainId: ctx?.brainId,

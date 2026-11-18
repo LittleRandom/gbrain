@@ -7,7 +7,7 @@ import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import type { OperationContext } from '../src/core/ops/contract.ts';
 import { submissionAuthority } from '../src/core/persistence/authority.ts';
 import { admitWrite, claimNextWrite, getWriteRequestById } from '../src/core/persistence/journal.ts';
-import { localHostId, registerLocalWriter } from '../src/core/persistence/identity.ts';
+import { localHostId, registerLocalWriter, withVerifiedLocalRegistration } from '../src/core/persistence/identity.ts';
 import { preparePageMutation } from '../src/core/persistence/page-prepare.ts';
 import { publishMutation } from '../src/core/persistence/coordinator.ts';
 import { claimPersistenceEffect, publicEffectsForRequest } from '../src/core/persistence/effect-journal.ts';
@@ -16,6 +16,7 @@ import type { WriteRequest } from '../src/core/persistence/model.ts';
 import { MinionQueue } from '../src/core/minions/queue.ts';
 import { resetPgliteState } from './helpers/reset-pglite.ts';
 import { withEnv } from './helpers/with-env.ts';
+import { LATEST_SCHEMA_VERSION } from '../src/core/schema-migrations/latest.generated.ts';
 
 let engine: PGLiteEngine;
 const config = { engine: 'pglite' as const, embedding_disabled: true };
@@ -25,7 +26,7 @@ afterAll(async () => { await engine.disconnect(); });
 
 async function fixture(run: () => Promise<void>) {
   const home = mkdtempSync(join(tmpdir(), 'gbrain-facts-effect-'));
-  try { await withEnv({ GBRAIN_HOME: home }, async () => { await resetPgliteState(engine); await engine.setConfig('version', '156'); await registerLocalWriter(engine, 'cli'); await run(); }); }
+  try { await withEnv({ GBRAIN_HOME: home }, async () => { await resetPgliteState(engine); await engine.setConfig('version', String(LATEST_SCHEMA_VERSION)); await registerLocalWriter(engine, 'cli'); await run(); }); }
   finally { rmSync(home, { force: true, recursive: true }); }
 }
 async function prepare(overrides: Partial<OperationContext> = {}, params: Record<string, unknown> = {}) {
@@ -235,8 +236,70 @@ test('#6071: an extraction that did not complete does not count as extracted', (
   expect(await rewrite(retitled('Renamed after a failed extraction'))).toEqual({ status: { queued: true }, effectQueued: true });
 }));
 
+test.each(['superseded', 'page_missing', 'extraction_disabled'])('#9248: a completed facts-absorb job whose result is skipped %s does not count as extracted', (reason) => fixture(async () => {
+  await publish();
+  await finishExtractions();
+  await engine.executeRaw("UPDATE minion_jobs SET result = jsonb_build_object('skipped', $1::text) WHERE name = 'facts-absorb'", [reason]);
+  expect(await rewrite(retitled('Renamed after a skipped extraction'))).toEqual({ status: { queued: true }, effectQueued: true });
+}));
+
+test('#9248 control: a completed facts-absorb job with an extraction result still counts as extracted', () => fixture(async () => {
+  await publish();
+  await finishExtractions();
+  await engine.executeRaw(`UPDATE minion_jobs SET result = '{"mode":"inline","inserted":2,"duplicate":0,"superseded":0,"fact_ids":[1,2]}'::jsonb WHERE name = 'facts-absorb'`);
+  expect(await rewrite(retitled('Renamed after a real extraction'))).toEqual({ status: { skipped: 'body_unchanged' }, effectQueued: false });
+}));
+
 test('a slug-bound writer\'s backstop refusal says the page was written and who widens the grant', async () => {
   const row = { slug: 'notes/a', authority: { slugPrefixes: ['notes/'] } } as unknown as WriteRequest;
   await expect(authorizeFactsBackstop(engine, row)).rejects.toMatchObject({ code: 'permission_denied',
     suggestion: expect.stringContaining('the page itself is written') });
 });
+
+test.each([
+  [null, 'all'], ['medium-and-up', 'medium-and-up'], ['high-only', 'high-only'], ['all', 'all'], ['  Medium-And-Up ', 'medium-and-up'], ['low', 'all'],
+])('#6231: facts.page_write_notability_filter=%p queues the page-write extraction with %p', (setting, expected) => fixture(async () => {
+  const row = await publish();
+  const effect = await claimFacts(row);
+  // Read at dispatch, after the claim: a change before the job is queued still applies.
+  if (setting !== null) await engine.setConfig('facts.page_write_notability_filter', setting);
+  await dispatchFactsBackstopEffect(engine, effect, localHostId());
+  const work = await jobs();
+  expect(work).toHaveLength(1);
+  expect(work[0].data.notabilityFilter).toBe(expected);
+}));
+
+test('#6232: a page that sets facts_backstop: false queues no extraction, and removing the line queues it with the same body', () => fixture(async () => {
+  await publish();
+  await finishExtractions();
+  const optedOut = content.replace('title: Field notes', 'title: Field notes\nfacts_backstop: false');
+  expect(await rewrite(optedOut)).toEqual({ status: { skipped: 'opted_out' }, effectQueued: false });
+  expect(await rewrite(content)).toEqual({ status: { queued: true }, effectQueued: true });
+}));
+
+async function publishRemote() {
+  const registration = await registerLocalWriter(engine, 'stdio', { sourceIds: ['*'], operations: null, scopes: ['read', 'write'], slugPrefixes: null });
+  return withVerifiedLocalRegistration(engine, registration, async () => {
+    const input = await prepare({ remote: true, auth: { token: 'fixture', clientId: 'fixture-client', scopes: ['read', 'write'], sourceId: 'default' } } as Partial<OperationContext>,
+      { content: content.replace('type: note\n', 'type: note\nvisibility: private\n') });
+    return publishMutation(engine, input.row, input.prepared);
+  });
+}
+
+test('#6322: a private page the stored remote principal can no longer see settles as skipped page_not_found, at dispatch and at durable job read', () => fixture(async () => {
+  await engine.setConfig('search.remote_private_pages', 'visible');
+  const row = await publishRemote();
+  expect(row.state).toBe('committed');
+  const effect = await claimFacts(row);
+  await engine.setConfig('search.remote_private_pages', 'hidden');
+  await dispatchFactsBackstopEffect(engine, effect, localHostId());
+  expect(await jobs()).toHaveLength(0);
+  expect((await publicEffectsForRequest(engine, row.id)).find(e => e.kind === 'facts-backstop')).toMatchObject({ state: 'skipped', reason: 'page_not_found' });
+  await engine.setConfig('search.remote_private_pages', 'visible');
+  await engine.executeRaw("DELETE FROM pages WHERE slug='notes/example'");
+  const visible = await publishRemote();
+  await dispatchFactsBackstopEffect(engine, await claimFacts(visible), localHostId());
+  const data = (await jobs())[0].data;
+  await engine.setConfig('search.remote_private_pages', 'hidden');
+  expect(await readFactsBackstopJobPage(engine, data)).toEqual({ skipped: 'page_not_found' });
+}));

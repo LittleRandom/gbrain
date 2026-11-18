@@ -6,7 +6,7 @@
 #
 # BUN_IMAGE is overridable so the harness can track CI's pinned bun version
 # (see .github/workflows/heavy-tests.yml setup-bun) without editing this file.
-ARG BUN_IMAGE=oven/bun:1.4.2
+ARG BUN_IMAGE=oven/bun:1.4.4
 FROM ${BUN_IMAGE}
 
 # git drives the interview/render/repo phases; ca-certificates is build-time
@@ -18,13 +18,11 @@ RUN apt-get update \
 WORKDIR /app
 
 # Dependency layer first for build caching. Lifecycle scripts stay on
-# (@electric-sql/pglite is a trustedDependency), so postinstall.ts must be
-# present before `bun install`; it loads every repo module dynamically and
-# exits 0 on every path, so it needs nothing else from src/. patches/ is
-# copied so a future `patchedDependencies` entry cannot break this layer.
+# (@electric-sql/pglite is a trustedDependency); gbrain itself ships none, so
+# the layer needs nothing from scripts/ or src/. patches/ is copied so a
+# future `patchedDependencies` entry cannot break this layer.
 COPY package.json bun.lock bunfig.toml ./
 COPY patches/ patches/
-COPY scripts/postinstall.ts scripts/postinstall.ts
 RUN bun install --frozen-lockfile
 
 # The repo itself. node_modules/.git/bin are excluded via

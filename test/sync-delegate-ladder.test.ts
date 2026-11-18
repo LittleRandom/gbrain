@@ -66,7 +66,8 @@ function captureConsoleError(): { lines: string[]; restore: () => void } {
 }
 
 describe('parseDelegatedSyncArgs (default-deny)', () => {
-  test('bare sync → empty options, no explicit source', () => {
+  // #6712 PR 1: no explicit-processing list crosses the wire any more; a resume inherits the cursor's opt-outs on either side.
+  test('bare sync → no options, no explicit source', () => {
     expect(parseDelegatedSyncArgs([])).toEqual({ ok: true, options: {}, explicitSource: null });
   });
 
@@ -92,12 +93,22 @@ describe('parseDelegatedSyncArgs (default-deny)', () => {
 
   test.each([
     ['--repo'], ['--watch'], ['--all'], ['--workers'], ['--concurrency'],
-    ['--json'], ['--exclude'], ['--src-subpath'], ['--break-lock'],
+    ['--exclude'], ['--src-subpath'], ['--break-lock'],
     ['--force-break-lock'], ['--max-age'], ['--missing-path'], ['--parallel'],
     ['--interval'], ['--serial'], ['--strategy'], ['trigger'],
     ['--some-flag-added-in-2027'],
   ])('refuses %s by name (default-deny)', (tok) => {
     expect(parseDelegatedSyncArgs([tok])).toEqual({ ok: false, refused: tok });
+  });
+
+  test('#6317: the managed catch-up flags are admitted explicitly (--json is rendered by this client, never forwarded)', () => {
+    const r = parseDelegatedSyncArgs(['--source', 'notes', '--no-pull', '--json', '--no-bulk', '--lanes', '4', '--no-embed']);
+    expect(r).toEqual({ ok: true, explicitSource: 'notes', options: { noPull: true, noBulk: true, lanes: 4, noEmbed: true } });
+    expect(parseDelegatedSyncArgs(['--no-lanes'])).toEqual({ ok: true, explicitSource: null, options: { lanes: 1 } });
+    expect(parseDelegatedSyncArgs(['--lanes', '0'])).toEqual({ ok: false, refused: '--lanes (invalid value)' });
+    expect(parseDelegatedSyncArgs(['--lanes', '17'])).toEqual({ ok: false, refused: '--lanes (invalid value)' });
+    expect(parseDelegatedSyncArgs(['--lanes', 'four'])).toEqual({ ok: false, refused: '--lanes (invalid value)' });
+    expect(parseDelegatedSyncArgs(['--lanes'])).toEqual({ ok: false, refused: '--lanes (missing value)' });
   });
 
   test('a value flag with a missing/flag-shaped value refuses loudly', () => {
@@ -211,6 +222,23 @@ describe('maybeDelegateSyncToServe brain + source gates (F3)', () => {
     // normal direct-connect path.
     const dir = mkdtempSync(join(tmpdir(), 'sdl-badbrain-'));
     expect(await withBrainOption('Not-A-Valid-Id!', () => maybeDelegateSyncToServe(dir, []))).toBe(false);
+  });
+
+  test('a live serve with no sync IPC is not told to restart on this version: the PGLite lock records no build to compare', async () => {
+    const savedExitCode = process.exitCode;
+    _resetCliExitVerdictForTests();
+    const cap = captureConsoleError();
+    try {
+      expect(await maybeDelegateSyncToServe(dirWithLiveServeLock(), [])).toBe(true);
+      const text = cap.lines.join('\n');
+      expect(text).toContain('exposes no sync IPC');
+      expect(text).not.toContain('Restart that serve on this gbrain version.');
+      expect(text).toContain('If that serve runs an older gbrain, restart it on this version.');
+    } finally {
+      cap.restore();
+      _resetCliExitVerdictForTests();
+      process.exitCode = savedExitCode ?? 0;
+    }
   });
 
   test('brain resolver throw + live serve → the ladder CONTINUES as if host (fail open to old behavior)', async () => {

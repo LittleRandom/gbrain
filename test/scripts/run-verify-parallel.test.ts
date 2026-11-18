@@ -72,8 +72,6 @@ describe("guard registration ⇒ execution coverage", () => {
   const EXECUTION_EXEMPT: Record<string, string> = {
     "check-bun-test-timeout.sh":
       "runs directly as a test.yml verify-job step (not via CHECKS — avoids a package.json edit)",
-    "check-admin-embedded.sh":
-      "duplicates check:admin-build's vite+tsc build; embed freshness covered there",
     "check-bash32.sh":
       "needs Docker or a native bash 3.2: runs as a test.yml verify-job step (bash:3.2 image) and in macos-validation.yml (/bin/bash), never in verify",
     "check-test-discriminates.sh":
@@ -353,6 +351,25 @@ exit 0
     }
   });
 
+  it("#9316: creates its default temp log directory under TMPDIR", () => {
+    const { root, env } = makeFallbackHarness();
+    const { GBRAIN_VERIFY_LOG_DIR: _unused, ...defaults } = env;
+    const tmp = join(root, "tmp");
+    mkdirSync(tmp);
+    try {
+      const r = spawnSync("bash", [join(root, "scripts", "run-verify-parallel.sh")], {
+        encoding: "utf8",
+        env: { ...defaults, TMPDIR: tmp, STUB_FAIL_CHECK: "check:jsonb" },
+      });
+      expect(r.status).toBe(1);
+      const kept = /per-check logs kept in (\S+)/.exec(r.stderr)?.[1];
+      if (kept && !kept.startsWith(`${tmp}/`)) rmSync(kept, { recursive: true, force: true });
+      expect(kept?.startsWith(`${tmp}/gbrain-verify-`)).toBe(true);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it("a self-timed SOLO check starts only after every pool check has finished, and fails like any other", () => {
     const { root, env } = makeFallbackHarness();
     try {
@@ -397,7 +414,8 @@ exit 0
     expect(readFileSync(SCRIPT, "utf8")).not.toContain("TYPECHECK_COVERED_BY");
     expect(readFileSync(SCRIPT, "utf8")).toContain('TIMEOUT="${GBRAIN_VERIFY_TIMEOUT:-120}"');
     const testYml = read("test.yml");
-    const verifyJob = testYml.slice(testYml.indexOf("\n  verify:\n"), testYml.indexOf("\n  verify:\n") + 4000);
+    const verifyStart = testYml.indexOf("\n  verify:\n");
+    const verifyJob = testYml.slice(verifyStart, testYml.indexOf("\n  serial-tests:\n", verifyStart));
     expect(verifyJob).toContain("- run: bun run verify");
     expect(verifyJob).toMatch(/runs-on: ubicloud-standard-\d+-ubuntu/);
     const dry = spawnSync("bash", [SCRIPT, "--dry-list"], { encoding: "utf8" }).stdout.split("\n");

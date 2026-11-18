@@ -5,7 +5,9 @@ export const help: CliHelpSpec = {
   summary: 'Check brain health; preview and run remediation.',
   usage: [
     'gbrain doctor [--fast] [--json] [--fix [--dry-run]] [--scope=brain] [--source <id>] [--no-migrate] [--locks]',
-    'gbrain doctor --only <check>[,<check>…] [--json]',
+    'gbrain doctor --tier ops|quick|standard|deep [--budget-ms <n>] [--json]',
+    'gbrain doctor --only <check>[,<check>…] [--tier ops] [--json]',
+    'gbrain doctor --alert [--tier <t>] [--budget-ms <n>] [--json]',
     'gbrain doctor --remediation-plan [--target-score <n>] [--no-embed] [--json]',
     'gbrain doctor --remediate [--yes [--expect <plan_hash>]] [--include-repairs] [--max-usd <n>] [--target-score <n>]',
     '              [--max-jobs <n>] [--no-embed] [--dry-run] [--resume [<plan_hash>]] [--json]',
@@ -13,7 +15,10 @@ export const help: CliHelpSpec = {
   flags: [
     { name: '--json', type: 'boolean', desc: 'Print one JSON document (checks, score, findings) on stdout.' },
     { name: '--only', type: 'string', desc: 'Read-only: run just the named checks (comma-separated or repeated; no migrations). The usual fix.verify. An unknown name exits 2 with the valid list.' },
+    { name: '--alert', type: 'boolean', desc: 'What an agent cron pages on: runs only the page-class checks (database, writes, migrations, builds, sync and maintenance stalls, corrupt rows, schema exposure, paid-loop breaker), fresh, under a 30 s budget, and exits 0 (alert none), 17 (act: alert.items carry each fix) or 18 (unknown: a page-class check did not run fresh; alert.consecutive_unknown counts the runs in a row). Read-only. With --tier, grades that tier\'s full run instead.' },
     { name: '--fast', type: 'boolean', desc: 'Skip database checks; filesystem and config checks only.' },
+    { name: '--tier', type: 'enum', values: ['ops', 'quick', 'standard', 'deep'], desc: 'ops: only the operational sections (capacity, write failures, embedding state, sync movement, compaction, serve build, schema pack) under a 4 s deadline, observational (no migrations). quick: the health gate for agents on large brains: the ops sections plus schema version, sync failures, queue health and partial embeddings under a 10 s deadline; every other check is reported from its last known result with its age, checks with none from the last 24 h are named as unknown, and a background doctor-refresh job is queued to measure them. standard (default): ops first, then the rest; a brain-wide run records each finished check as its last known result. deep: adds full scans (orphan_ratio on brains over 50,000 pages).' },
+    { name: '--budget-ms', type: 'number', desc: 'Absolute end-to-end deadline in ms, counted from before the connect (default 4000 with --tier ops; 0: none). A plain non-interactive --json run caps its check run at doctor.default_budget_ms (file plane, default 90000, 0 off) instead. With --only, the named checks get the whole budget. Checks past it report health unknown (reason budget, which budget in details.limit); the report says complete: false.' },
     { name: '--fix', type: 'boolean', desc: 'Apply the local fixes doctor knows (skill files, stale locks); pair with --dry-run to preview.' },
     { name: '--dry-run', type: 'boolean', desc: 'Preview --fix or --remediate without changing anything.' },
     { name: '--scope', type: 'enum', values: ['all', 'brain'], desc: 'Pass --scope=brain to skip the skill-file check group (default all).' },

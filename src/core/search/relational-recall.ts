@@ -29,15 +29,17 @@ import type { SearchResult, PageType, RelationalFanoutRow, PageReadPolicy } from
 import { createAuditWriter } from '../audit/audit-writer.ts';
 import { listSources } from '../sources-ops.ts';
 import { ALL_SOURCES } from '../source-id.ts';
-import { resolveEntitySlugWithSource } from '../entities/resolve.ts';
+import { resolveEntitySlugWithSource, retiredPageSql } from '../entities/resolve.ts';
 import { buildVisibilityClause } from './sql-ranking.ts';
 import { hasReadPolicy, pageReadFilter } from './read-policy-sql.ts';
-import { sanitizeRemoteBody } from '../remote-body.ts';
+import { boundedProjectedPrefix } from '../page-window/document.ts';
+import { boundedBodyPrefixSql, overlaidBoundedRows } from '../page-window/bounded-lead.ts';
 import { parseRelationalQuery, type RelationalQuery, type RelationVocab } from './relational-intent.ts';
 import { edgeValidityEnabled, type EdgeTemporalOpts } from '../link-validity.ts';
 import { stampEvidence, type EvidenceOpts } from './evidence.ts';
 import { parseRelationalPlan } from './relational-plan.ts';
-import { LINK_SIGNATURES, presentEdgeContext, resolveChainAnchors, runRelationalChain, type ChainAnchor, type ChainDiagnostics, type ChainStatus, type RelationalChainRow } from './relational-chain.ts';
+import { chainStoredEdge, LINK_SIGNATURES, presentEdgeContext, resolveChainAnchors, runRelationalChain, type ChainAnchor, type ChainDiagnostics, type ChainStatus, type RelationalChainRow } from './relational-chain.ts';
+import { worldLinkContexts } from '../eligibility/fence-overlay.ts';
 import { requiresSafeChunks } from './safe-chunks.ts';
 
 export interface RelationalArmOpts extends PageReadPolicy {
@@ -150,7 +152,7 @@ async function resolveSeedScoped(
     if (r?.source === 'fallback_slugify' && titleTypes.length) {
       const titled = await engine.executeRaw<{ slug: string }>(
         `SELECT slug FROM pages WHERE source_id = $1 AND deleted_at IS NULL AND type = ANY($2::text[])
-           AND lower(title) = lower($3) LIMIT 2`, [sid, titleTypes, phrase.trim()]);
+           AND lower(title) = lower($3) AND NOT ${retiredPageSql('pages')} LIMIT 2`, [sid, titleTypes, phrase.trim()]);
       if (titled.length === 1) r = { slug: titled[0].slug, source: 'exact_page' };
     }
     if (!r || r.source === 'fallback_slugify') continue;
@@ -189,7 +191,7 @@ async function hydrate(
     page_id: number; slug: string; source_id: string; title: string; type: string; synopsis: string | null;
   }>(
     `SELECT p.id AS page_id, p.slug, p.source_id, p.title, p.type,
-            p.compiled_truth AS synopsis
+            ${boundedBodyPrefixSql('p')} AS synopsis
      FROM pages p
      JOIN sources s ON s.id = p.source_id
      JOIN unnest($1::text[], $2::text[]) AS refs(source_id, slug)
@@ -197,8 +199,10 @@ async function hydrate(
      WHERE ${filter} ${buildVisibilityClause('p', 's', { excludePrivate: policy.excludePrivate, requireSafeChunks: false })}`,
     params,
   );
+  // Large pages: a bounded, withdrawal-overlaid prefix per row is sanitized, never the whole body.
+  const leads = await overlaidBoundedRows(engine, pageRows.map(pr => ({ slug: pr.slug, source_id: pr.source_id, compiled_truth: pr.synopsis })));
   const byKey = new Map<string, typeof pageRows[number]>();
-  for (const pr of pageRows) byKey.set(`${pr.source_id}:${pr.slug}`, pr);
+  pageRows.forEach((pr, i) => byKey.set(`${pr.source_id}:${pr.slug}`, { ...pr, synopsis: leads[i].compiled_truth }));
 
   const out: SearchResult[] = [];
   for (const r of rows) {
@@ -209,7 +213,7 @@ async function hydrate(
       page_id: pr.page_id,
       title: pr.title,
       type: pr.type as PageType,
-      chunk_text: sanitizeRemoteBody(pr.synopsis ?? r.slug).slice(0, 240),
+      chunk_text: boundedProjectedPrefix(pr.synopsis ?? r.slug).slice(0, 240),
       chunk_source: 'compiled_truth',
       // E1: reinforce the page's REAL canonical chunk; F3: chunkless entity
       // pages key page-level (chunk_id 0 → rrfKey `source:slug:0`, stable and
@@ -406,6 +410,8 @@ export async function buildRelationalArm(
       excludePrivate: opts.excludePrivate,
       requireSafeChunks: opts.requireSafeChunks,
       takesHoldersAllowList: opts.takesHoldersAllowList,
+      minTrust: opts.minTrust,
+      suppressFlagged: opts.suppressFlagged,
       linkTypes: parsed.linkTypes,
       direction: parsed.direction,
       depth: opts.depth,
@@ -528,13 +534,17 @@ async function hydrateChain(
   const hydrated = await hydrate(engine, fanoutShaped, seed, opts);
   const remote = requiresSafeChunks(opts);
   const byKey = new Map(picked.map(r => [`${r.source_id}:${r.slug}`, r] as const));
-  return hydrated.map(h => {
-    const r = byKey.get(`${h.source_id}:${h.slug}`)!;
+  const shown = hydrated.map(h => byKey.get(`${h.source_id}:${h.slug}`)!);
+  const contexts = (await worldLinkContexts(engine, remote,
+    shown.flatMap(r => r.best_path.edges.slice(-3).map(e => ({ ...e, source_id: r.source_id }))), chainStoredEdge)).map(e => e.context);
+  let next = 0;
+  return hydrated.map((h, i) => {
+    const r = shown[i]!;
     return {
       ...h,
       relational: {
         role: r.role, seed, hop: r.hop, path_count: r.path_count,
-        edges: r.best_path.edges.slice(-3).map(e => ({ ...e, context: presentEdgeContext(e.context, remote) })),
+        edges: r.best_path.edges.slice(-3).map(e => ({ ...e, context: presentEdgeContext(contexts[next++] ?? null, remote) })),
       },
     };
   });

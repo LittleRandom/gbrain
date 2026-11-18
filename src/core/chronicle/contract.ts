@@ -60,8 +60,21 @@ export interface ChronicleLedgerRow {
   attempts: number;
   /** Earliest next judge attempt for a failed row with backoff; null = not scheduled. */
   next_attempt_at: Date | string | null;
-  /** Recorded spend of the last attempt in USD (null when unpriced or not run). */
+  /** Recorded spend in USD, summed across attempts (null when unpriced or not run). */
   cost_usd: number | null;
+  /** #6199: attempts whose spend cost_usd already includes (a replayed completion adds nothing). */
+  cost_attempts?: number[];
+  /** #6199: the `chronicle-backfill --max-usd` campaign that queued this row; null outside a capped backfill.
+   *  Executors run a stamped row under its stamped cap, attempts and pricing policy, never current settings. */
+  campaign_id?: string | null;
+  /** Per-attempt spend cap stamped at queue time (NUMERIC; a string on Postgres). */
+  attempt_cap_usd?: number | string | null;
+  /** Maximum judge attempts stamped at queue time; null = CHRONICLE_DEFAULTS.maxAttempts. */
+  max_attempts?: number | null;
+  /** 'enforced' = the stamped cap applies even if the model loses its price or settings change. */
+  pricing_policy?: string | null;
+  /** The campaign's --max-usd. */
+  campaign_max_usd?: number | string | null;
   /** The judge model had no price, so cost_usd is unknown. */
   unpriced: boolean;
   /** Event page slugs this content produced (the generation reconciliation reads). */
@@ -69,6 +82,17 @@ export interface ChronicleLedgerRow {
   /** content_hash of each event page as the extractor wrote it, parallel to event_slugs. An event whose
    *  live hash is no longer in any row of its depth page was edited by an operator and is never touched. */
   event_hashes: string[];
+  /** #8972: digest of the whole judge input this row's run read (extract-events.ts `chronicleJudgedInput`, or `cutoffInputHash`
+   *  when the run dropped future-dated proposals); null when not judged, held, superseded after a judged run, or recorded
+   *  before the column existed. */
+  judge_input_hash?: string | null;
+  /** #8972: length and sha256 of the body window the judge read; a later generation covers this row when its own window
+   *  starts with the same text. */
+  judge_window_chars?: number | null;
+  judge_window_hash?: string | null;
+  /** #8972: paid attempts of this row that ended in a failure a re-judge of the same input would repeat (judge_truncated,
+   *  judge_parse_failed, malformed_proposal, budget_exhausted, judge_refused); 0 on rows recorded before the column existed. */
+  judge_input_failures?: number | string | null;
   decided_at: Date | string;
   updated_at: Date | string;
 }
@@ -103,7 +127,7 @@ export interface ChronicleRunDetails {
   reasons: Partial<Record<ChronicleReasonCode, number>>;
   events_written: number;
   events_retired: number;
-  /** Proposed events refused before publication, by reason (`future_dated`, `date_imprecise`); never written. */
+  /** Proposed events refused before publication, by reason (`future_dated`, `date_imprecise`, `over_cap`); never written. */
   events_dropped: ChronicleDropCounts;
   /** Pending automatic rows left for the next run because the daily limit is used up. */
   deferred_daily_limit: number;

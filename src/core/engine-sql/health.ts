@@ -3,12 +3,16 @@
  *
  * Three statements, no per-page rows returned to TypeScript:
  *   1. counters: page, chunk and link counts, embedding coverage, missing
- *      embeddings, dead links, entity link/timeline coverage;
+ *      embeddings, dead links, entity link/timeline coverage. Entity pages
+ *      are the types the active schema pack(s) declare as entities (#4772),
+ *      resolved per source by `HealthDeps.entityTypes` and bound as text[]
+ *      parameters; an unavailable pack binds an empty list and the result
+ *      says so in `entity_types_status`;
  *   2. the linkable scope (live, unquarantined pages the shared orphan policy
  *      keeps, rendered in SQL by `orphanExclusionSql`) grouped by page type,
  *      with islanded and with-timeline counts per type. The brain_score
  *      timeline component's pack-aware grading (#5828) applies per type here;
- *   3. `most_connected`: in-scope link endpoints grouped per entity page.
+ *   3. `most_connected`: live, in-scope link endpoints grouped per entity page.
  * Statement 2 is separate because, folded into statement 1, the combined
  * plan cost crosses Postgres's JIT thresholds on a 20k-page brain and JIT
  * compilation alone costs more than the query.
@@ -39,13 +43,15 @@
  */
 import type { BrainHealth } from '../types.ts';
 import { MIN_ENTITY_PAGES_FOR_COVERAGE } from '../types.ts';
-import { LINK_EXTRACTOR_VERSION_TS } from '../link-extraction.ts';
+import { effectiveLinkExtractorWatermark } from '../link-extraction-watermark.ts';
 import { QUARANTINE_FILTER_FRAGMENT } from '../quarantine.ts';
 import { loadOrphanPolicyOverrides, orphanExclusionSql } from '../orphan-policy.ts';
 import { loadTimelineGradedPredicate } from '../timeline-grading.ts';
 import { quoteIdentifier } from '../search/embedding-column.ts';
+import { entityTypePredicateSql, type EntityTypeFilter, type EntityTypeResolution } from '../schema-pack/entity-types.ts';
 import type { LegacyUnscopedRead } from './brands.ts';
-import { sqlFragment, trustedSql } from './fragment.ts';
+import { renderFragment, sqlFragment, trustedSql } from './fragment.ts';
+import { EMBED_SKIP_FILTER_FRAGMENT } from '../embed-skip.ts';
 import { compileRowNormalizer } from './normalize.ts';
 
 /** What getHealth needs from its engine besides the executor. */
@@ -54,6 +60,12 @@ export interface HealthDeps {
   embeddingColumn(): Promise<string>;
   countStalePagesForExtraction(opts: { sourceId?: string; versionTs: string }): Promise<number>;
   getConfig(key: string): Promise<string | null>;
+  /**
+   * #4772: the entity type lists for the requested scope (null = brain-wide),
+   * resolved per source from the active schema pack(s) by
+   * `schema-pack/entity-types.ts`; `pack_unavailable` carries an empty filter.
+   */
+  entityTypes(scope: readonly string[] | null): Promise<EntityTypeResolution>;
 }
 
 interface LinkableTypeGroup {
@@ -89,12 +101,14 @@ export async function getHealth(
 ): Promise<BrainHealth> {
   const requested = opts?.sourceIds ?? (opts?.sourceId ? [opts.sourceId] : null);
   const scope = requested === null ? null : [...new Set(requested)];
-  const [column, orphanOverrides, isTimelineGraded] = await Promise.all([
+  const [column, orphanOverrides, isTimelineGraded, entityTypes] = await Promise.all([
     deps.embeddingColumn(),
     loadOrphanPolicyOverrides(deps),
     loadTimelineGradedPredicate(deps),
+    deps.entityTypes(scope),
   ]);
   const col = trustedSql(quoteIdentifier(column));
+  const isEntity = entityTypePredicateSql('p', entityTypes.filter);
   const inScope = {
     p: scope === null ? sqlFragment`` : sqlFragment`AND p.source_id = ANY(${scope}::text[])`,
     src: scope === null ? sqlFragment`` : sqlFragment`AND src.source_id = ANY(${scope}::text[])`,
@@ -103,8 +117,6 @@ export async function getHealth(
   // Endpoint checks by primary key; NULL (not true) when the row is missing.
   const liveSrc = sqlFragment`(SELECT src.deleted_at IS NULL ${inScope.src} FROM pages src WHERE src.id = l.from_page_id)`;
   const liveTgt = sqlFragment`(SELECT tgt.deleted_at IS NULL ${inScope.tgt} FROM pages tgt WHERE tgt.id = l.to_page_id)`;
-  const srcInScope = sqlFragment`(SELECT TRUE ${inScope.src} FROM pages src WHERE src.id = l.from_page_id)`;
-  const tgtInScope = sqlFragment`(SELECT TRUE ${inScope.tgt} FROM pages tgt WHERE tgt.id = l.to_page_id)`;
   const deadLinkScope = scope === null
     ? sqlFragment``
     : sqlFragment`AND EXISTS (SELECT 1 FROM pages src WHERE src.id = l.from_page_id ${inScope.src})`;
@@ -116,7 +128,7 @@ export async function getHealth(
   const { rows: [aggregate] } = await exec.run(sqlFragment`
     WITH entity_pages AS (
       SELECT p.id FROM pages p
-      WHERE p.type IN ('entity', 'person', 'company') AND p.deleted_at IS NULL
+      WHERE ${isEntity} AND p.deleted_at IS NULL
         AND ${trustedSql(QUARANTINE_FILTER_FRAGMENT)}
         ${inScope.p}
     ),
@@ -126,8 +138,9 @@ export async function getHealth(
        GROUP BY cc.page_id
     ),
     chunk_totals AS (
-      SELECT COALESCE(sum(c.chunks) FILTER (WHERE f.eligible), 0) AS eligible,
-             COALESCE(sum(c.embedded) FILTER (WHERE f.eligible), 0) AS eligible_embedded,
+      -- #7212: coverage counts the same live, eligible chunks as missing_embeddings; a soft-deleted page's retained chunks count in neither.
+      SELECT COALESCE(sum(c.chunks) FILTER (WHERE f.eligible AND f.live), 0) AS eligible,
+             COALESCE(sum(c.embedded) FILTER (WHERE f.eligible AND f.live), 0) AS eligible_embedded,
              COALESCE(sum(c.chunks - c.embedded) FILTER (WHERE f.eligible AND f.live), 0) AS missing
         FROM chunk_pages c
         CROSS JOIN LATERAL (
@@ -177,14 +190,10 @@ export async function getHealth(
      ORDER BY type
   `);
 
-  const farInScope = {
-    to: scope === null ? sqlFragment`` : sqlFragment`AND ${tgtInScope}`,
-    from: scope === null ? sqlFragment`` : sqlFragment`AND ${srcInScope}`,
-  };
   const { rows: connected } = await exec.run<{ slug: string; link_count: number }>(sqlFragment`
     WITH entity_pages AS (
       SELECT p.id, p.slug FROM pages p
-      WHERE p.type IN ('entity', 'person', 'company') AND p.deleted_at IS NULL
+      WHERE ${isEntity} AND p.deleted_at IS NULL
         AND ${trustedSql(QUARANTINE_FILTER_FRAGMENT)}
         ${inScope.p}
     ),
@@ -192,10 +201,10 @@ export async function getHealth(
       SELECT e.id, e.slug, 0 AS hit FROM entity_pages e
       UNION ALL
       SELECT e.id, e.slug, 1 AS hit FROM entity_pages e
-        JOIN links l ON l.from_page_id = e.id ${farInScope.to}
+        JOIN links l ON l.from_page_id = e.id AND ${liveTgt}
       UNION ALL
       SELECT e.id, e.slug, 1 AS hit FROM entity_pages e
-        JOIN links l ON l.to_page_id = e.id AND l.from_page_id <> l.to_page_id ${farInScope.from}
+        JOIN links l ON l.to_page_id = e.id AND l.from_page_id <> l.to_page_id AND ${liveSrc}
     )
     SELECT slug, sum(hit)::int AS link_count
       FROM endpoints
@@ -204,10 +213,11 @@ export async function getHealth(
      LIMIT 5
   `);
 
+  const watermark = await effectiveLinkExtractorWatermark(deps);
   const stalePages = scope === null
-    ? await deps.countStalePagesForExtraction({ versionTs: LINK_EXTRACTOR_VERSION_TS })
+    ? await deps.countStalePagesForExtraction({ versionTs: watermark })
     : (await Promise.all(scope.map(sourceId =>
-        deps.countStalePagesForExtraction({ sourceId, versionTs: LINK_EXTRACTOR_VERSION_TS }),
+        deps.countStalePagesForExtraction({ sourceId, versionTs: watermark }),
       ))).reduce((a, b) => a + b, 0);
 
   let linkablePageCount = 0;
@@ -251,6 +261,7 @@ export async function getHealth(
     brain_score: embedCoverageScore + linkDensityScore + timelineCoverageScore + noOrphansScore + noDeadLinksScore,
     dead_links: deadLinks,
     entity_page_count: h.entity_page_count,
+    entity_types_status: entityTypes.status,
     link_coverage: coverageGraded ? Number(h.link_coverage) : null,
     timeline_coverage: coverageGraded ? Number(h.timeline_coverage) : null,
     most_connected: connected.map(c => ({ slug: c.slug, link_count: Number(c.link_count) })),
@@ -260,4 +271,31 @@ export async function getHealth(
     no_orphans_score: noOrphansScore,
     no_dead_links_score: noDeadLinksScore,
   };
+}
+
+/** The six brain-wide counts the MCP onboarding coach reads (onboard/mcp-onboarding.ts). */
+export type OnboardSignal = 'stale_chunks' | 'entities' | 'linked_entities' | 'timeline_entities' | 'takes' | 'pages';
+
+/**
+ * One onboarding count, brain-wide and unscoped (master's statements):
+ * chunks with no embedding on live pages outside embed_skip; live entity
+ * pages (types from `entityTypes`), those with an inbound link, those with a
+ * timeline entry; takes; live pages.
+ */
+export async function countOnboardSignal(
+  exec: LegacyUnscopedRead, signal: OnboardSignal, entityTypes: EntityTypeFilter, opts: { signal?: AbortSignal } = {},
+): Promise<number> {
+  const entity = (extra: ReturnType<typeof sqlFragment>) =>
+    sqlFragment`SELECT COUNT(*) AS count FROM pages p WHERE ${entityTypePredicateSql('p', entityTypes)} AND p.deleted_at IS NULL${extra}`;
+  const statement = signal === 'stale_chunks'
+    ? sqlFragment`SELECT COUNT(*) AS count FROM content_chunks cc JOIN pages p ON p.id = cc.page_id
+           WHERE cc.embedding IS NULL AND p.deleted_at IS NULL AND ${trustedSql(EMBED_SKIP_FILTER_FRAGMENT)}`
+    : signal === 'entities' ? entity(sqlFragment``)
+    : signal === 'linked_entities' ? entity(sqlFragment` AND EXISTS (SELECT 1 FROM links l WHERE l.to_page_id = p.id)`)
+    : signal === 'timeline_entities' ? entity(sqlFragment` AND EXISTS (SELECT 1 FROM timeline_entries t WHERE t.page_id = p.id)`)
+    : signal === 'takes' ? sqlFragment`SELECT COUNT(*) AS count FROM takes`
+    : sqlFragment`SELECT COUNT(*) AS count FROM pages WHERE deleted_at IS NULL`;
+  const { text, params } = renderFragment(statement);
+  const rows = await exec.executeRaw<{ count: string | number }>(text, params, { signal: opts.signal });
+  return rows.length > 0 ? Number(rows[0].count) : 0;
 }

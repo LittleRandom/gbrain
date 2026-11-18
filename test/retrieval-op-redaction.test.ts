@@ -22,6 +22,7 @@ import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
 import { randomBytes, randomUUID } from 'node:crypto';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { installFixtureChunks } from './helpers/page-projection.ts';
+import { asOwner } from './helpers/owner-tier.ts';
 import { operations, operationsByName, type Operation, type OperationContext } from '../src/core/operations.ts';
 import { dispatchToolCall } from '../src/mcp/dispatch.ts';
 import { estimateTokens } from '../src/core/search/token-budget.ts';
@@ -69,7 +70,7 @@ beforeAll(async () => {
     timeline: `- ${TODAY}: ${planted('timeline')}`, frontmatter: { summary: planted('summary') },
   }, { sourceId: SRC });
   await engine.putPage('notes/n1', {
-    type: 'note', title: planted('note'), compiled_truth: `${planted('note body')}\nGITHUB_TOKEN=${rand(31)}7`,
+    type: 'note', title: planted('note'), compiled_truth: `${planted('note body')}\n${planted('link')}\nGITHUB_TOKEN=${rand(31)}7`,
     timeline: `- ${TODAY}: ${planted('note timeline')}`, frontmatter: {},
   }, { sourceId: SRC });
   await engine.putPage('misc/orphan', { type: 'note', title: planted('orphan'), compiled_truth: planted('orphan body'), frontmatter: {} }, { sourceId: SRC });
@@ -134,13 +135,20 @@ const SWEEP: Record<string, Row> = {
   entity: { args: { name: 'people/alice-example' } },
   synthesize: { skip: 'LLM-backed; keyless test env returns no composition. Wrapper coverage is the registration test below.' },
   list_pages: { args: { limit: 100 } },
+  find_pages: { args: { pattern: '*', limit: 100 } },
+  storage_find: { skip: 'Cards refuse secret-shaped values when written (storage_record_secret) and the shelf is not federated, so this fixture has no card a remote caller can read; test/storage-manifest.test.ts covers both.' },
+  storage_get: { skip: 'Cards refuse secret-shaped values when written (storage_record_secret) and the shelf is not federated, so this fixture has no card a remote caller can read; test/storage-manifest.test.ts covers both.' },
+  storage_list: { skip: 'Cards refuse secret-shaped values when written (storage_record_secret) and the shelf is not federated, so this fixture has no card a remote caller can read; test/storage-manifest.test.ts covers both.' },
   search: { args: { query: 'PLANTMARK note body', limit: 20 } },
   query: { args: { query: 'PLANTMARK note body', limit: 20 } },
+  search_exact: { args: { phrase: 'PLANTMARK' } },
+  whois: { args: { query: planted('person') } },
   assemble_evidence: { args: { hits: [{ source_id: SRC, slug: 'notes/n1', chunk_id: 0 }], return_unit: 'page' } },
   search_by_image: { skip: 'needs image-embedding infra; cross-modal suites own it. Wrapper coverage is the registration test below.' },
   get_links: { args: { slug: 'notes/n1' } },
   get_backlinks: { args: { slug: 'people/alice-example' } },
   traverse_graph: { args: { slug: 'notes/n1', depth: 2 } },
+  rank_entities: { args: {} },
   get_timeline: { args: { slug: 'people/alice-example' } },
   advisor: { skip: 'aggregate advisory over the installed skill stack; advisor suites own it' },
   get_ingest_log: { args: { limit: 50 } },
@@ -187,6 +195,7 @@ const SWEEP: Record<string, Row> = {
   get_tags: { args: { slug: 'notes/n1' } },
   list_link_sources: { args: {} },
   get_brain_identity: { args: {} },
+  get_brain_health: { args: {} },
   list_skills: { skip: 'bundled skills catalog from the install tree (throws outside an installed skills dir)' },
   join_brain: { skip: 'shared-skills enrollment needs an explicit member grant; returns membership ids' },
   leave_brain: { skip: 'shared-skills membership op; returns membership ids' },
@@ -196,6 +205,7 @@ const SWEEP: Record<string, Row> = {
   whoami: { args: {} },
   sources_list: { args: {} },
   sources_status: { args: { id: SRC } },
+  sources_resolve_path: { skip: 'needs a Git checkout of the source; returns paths, slugs, states and counts, never page text; test/sources-resolve-path.test.ts owns it' },
   sources_inspect: { skip: 'local-only inspection of a committed Git repository directory; returns repo metadata, owned by the sources suites' },
   request_tools: { args: { tools: ['get_page'] } },
   connectors_status: { args: {}, remote: false },
@@ -208,6 +218,8 @@ const SWEEP: Record<string, Row> = {
   schema_graph: { args: {} },
   schema_explain_type: { args: { type: 'note' } },
   schema_review_orphans: { args: { limit: 50 } },
+  list_write_conflicts: { args: {} },
+  get_memory_settings: { args: {} },
   // no_stored_text — write receipts (the planted content is the caller's own
   // input here; the receipt must not echo it)
   remember: { args: { fact: planted('remembered'), provenance: 'test:sweep', request_id: randomUUID() } },
@@ -274,13 +286,13 @@ describe('memory verbs redact query-arm text for everyone and facts for remote c
     }, { sourceId: SRC });
     const p = await engine.getPage('notes/verb-page', { sourceId: SRC });
     await installFixtureChunks(engine, 'notes/verb-page', [{ chunk_index: 0, chunk_text: p!.compiled_truth, chunk_source: 'compiled_truth', token_count: 12 }], { sourceId: SRC });
-    await engine.insertFact({ fact: `verbfact key ${factKey}`, entity_slug: 'companies/acme-example', source: `test:${factKey}`, visibility: 'world', embedding: null } as never, { source_id: SRC });
+    await asOwner(engine, tx => tx.insertFact({ fact: `verbfact key ${factKey}`, entity_slug: 'companies/acme-example', source: `test:${factKey}`, visibility: 'world', embedding: null } as never, { source_id: SRC }));
   });
 
   test('recall over MCP: no page token, assignment value or fact key; identities byte-identical', async () => {
     const { text } = await call('recall', { query: 'verbmark rollout', entity: 'companies/acme-example' });
     for (const secret of [pageToken, assigned, factKey]) expect(text.includes(secret)).toBe(false);
-    const body = JSON.parse(text);
+    const body = JSON.parse(text.split('\n')[0]!);
     const hit = body.results.find((r: { slug: string }) => r.slug === 'notes/verb-page');
     expect(hit.provenance).toBe('notes/verb-page');
     expect(hit.chunk).toContain('<REDACTED:github_token>');

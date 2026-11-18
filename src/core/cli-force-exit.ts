@@ -34,9 +34,11 @@
  *   shouldForceExitAfterMain() && flushThenExit(currentExitCode())
  *     — drain the serialized stdout tail if any interposed write is still in
  *       flight (#4383, ref'd keepalive), then fence stdout+stderr (write-fence
- *       raced with an unref'd guard, EPIPE-safe), hold a short REF'D aliveness
- *       grace for non-TTY stdio (Bun only delivers queued pipe writes while
- *       alive), then process.exit. Stuck sockets become irrelevant.
+ *       raced with an unref'd guard, EPIPE-safe), then process.exit as soon as
+ *       no non-TTY stream has queued bytes: a REF'D aliveness grace bounds the
+ *       wait for a stream still draining (Bun only delivers queued pipe writes
+ *       while alive) and stays a fixed sleep only for a stream whose queue
+ *       this module cannot see. Stuck sockets become irrelevant.
  *
  * The hard-deadline timer is armed at TEARDOWN start, never before the op
  * handler — a slow-but-healthy handler must not erode the teardown budget
@@ -54,7 +56,7 @@
  */
 
 import { writeSync } from 'node:fs';
-import { spawn, type ChildProcess, type SpawnOptions } from 'node:child_process';
+import { spawn, type ChildProcess, type SpawnOptions } from './spawn.ts';
 import { formatWithOptions } from 'node:util';
 import {
   drainAllBackgroundWorkForCliExit,
@@ -62,8 +64,9 @@ import {
   pgliteCloseTimeoutMs,
   SINK_DRAIN_TIMEOUT_MS,
 } from './background-work.ts';
-import { POOL_END_TIMEOUT_SECONDS } from './db.ts';
+import { POOL_END_TIMEOUT_SECONDS } from './pool-end-timeout.ts';
 import { parseGlobalFlags } from './cli-options.ts';
+import { setInterruptedDocumentWriter, slowReadElapsedMs, withReadMeta } from './read-heartbeat.ts';
 
 const DAEMON_COMMANDS: ReadonlySet<string> = new Set(['serve']);
 
@@ -95,15 +98,19 @@ const TEARDOWN_SLACK_MS = 2_000;
 /** Max wait for the stdio flush fence before exiting anyway (blocked pipe). */
 const FLUSH_GUARD_MS = 2_000;
 /**
- * Aliveness grace between the fence and process.exit when stdio is NOT a TTY.
- * Empirically verified (#2084 probes): Bun's process.stdout queues pipe writes
- * in a native writer that only pushes to the fd on event-loop turns WHILE THE
- * PROCESS IS ALIVE — process.exit discards the queue, natural event-loop exit
- * discards it too, and no API reaches it (write callbacks fire on accept, not
- * delivery; writableLength/bytesWritten read 0 throughout;
- * Bun.stdout.writer().flush() is a different writer; fs.writeSync(1) is also
- * queued). Staying alive briefly is the ONLY flush. TTY writes are synchronous
- * — no grace needed there.
+ * Upper bound on the aliveness grace between the fence and process.exit when
+ * stdio is NOT a TTY. Empirically verified (#2084 probes): Bun's
+ * process.stdout/stderr queue pipe writes in a native writer that only pushes
+ * to the fd on event-loop turns WHILE THE PROCESS IS ALIVE — process.exit
+ * discards the queue, natural event-loop exit discards it too (write callbacks
+ * fire on accept, not delivery; writableLength/bytesWritten read 0 throughout).
+ * What Bun 1.4 does expose: write() returns false exactly when bytes stayed
+ * queued (a write the fd took whole returns true), and 'drain' fires once the
+ * queue is empty again. trackNativeBacklog reads that signal on process.stderr,
+ * and process.stdout's one-shot writes go through the fd-1 write chain, so the
+ * exit seam knows when nothing is queued and exits without waiting. The grace
+ * only runs while a tracked stream is still draining (ending at its 'drain')
+ * or for a stream nothing tracks. TTY writes are synchronous — no grace there.
  */
 const FLUSH_GRACE_PIPE_MS = 250;
 
@@ -246,10 +253,12 @@ export interface FlushThenExitOpts {
   stderr?: MinimalWritable;
   guardMs?: number;
   /**
-   * Aliveness window between the fence and exit. Default: 0 when BOTH stdio
-   * streams are TTYs (synchronous writes), FLUSH_GRACE_PIPE_MS otherwise.
-   * The grace timer is deliberately ref'd — keeping the loop alive is the
-   * only thing that delivers Bun's queued pipe writes (see module constant).
+   * Longest aliveness window between the fence and exit. Default: 0 when BOTH
+   * stdio streams are TTYs (synchronous writes), FLUSH_GRACE_PIPE_MS otherwise.
+   * It ends early once every non-TTY stream is known to hold no queued bytes
+   * (streamQueueState). The grace timer is deliberately ref'd — keeping the
+   * loop alive is the only thing that delivers Bun's queued pipe writes (see
+   * module constant).
    */
   graceMs?: number;
 }
@@ -262,9 +271,12 @@ export interface FlushThenExitOpts {
  *     queue; an unref'd guard bounds a stream whose callback never fires.
  *     (In Bun the callback fires on ACCEPT, not delivery — the fence alone is
  *     NOT sufficient; verified in the #2084 probes.)
- *  2. Aliveness grace: a REF'D timer keeps the process alive `graceMs` so
- *     Bun's native writer can push the queued bytes to the fd / a consuming
- *     reader (#1959 truncation class). TTY stdio skips this (sync writes).
+ *  2. Aliveness grace: a REF'D timer keeps the process alive up to `graceMs`
+ *     so Bun's native writer can push the queued bytes to the fd / a
+ *     consuming reader (#1959 truncation class). It is skipped when every
+ *     non-TTY stream is known to be empty, and ends at the 'drain' of the
+ *     tracked streams still holding bytes; a stream nothing tracks gets the
+ *     full grace. TTY stdio skips this (sync writes).
  *
  * A reader that consumes nothing for longer than guard+grace loses the tail —
  * unavoidable without waiting forever; strictly better than the pre-#2084
@@ -299,12 +311,31 @@ export function flushThenExit(code: number, opts: FlushThenExitOpts = {}): void 
       if (fenced) return;
       fenced = true;
       if (guard) clearTimeout(guard);
-      if (graceMs <= 0) {
+      const states = streams
+        .filter((s) => (s as { isTTY?: boolean }).isTTY !== true)
+        .map((s) => ({ s, state: streamQueueState(s) }))
+        .filter(({ state }) => state !== 'empty');
+      if (graceMs <= 0 || states.length === 0) {
         exit(code);
         return;
       }
+      let exited = false;
+      const exitOnce = () => {
+        if (exited) return;
+        exited = true;
+        clearTimeout(grace);
+        exit(code);
+      };
       // Ref'd on purpose: aliveness IS the flush (Bun pipe-write semantics).
-      setTimeout(() => exit(code), graceMs);
+      const grace = setTimeout(exitOnce, graceMs);
+      if (states.some(({ state }) => state === 'unknown')) return;
+      let draining = states.length;
+      for (const { s } of states) {
+        s.once?.('drain', () => {
+          draining -= 1;
+          if (draining === 0) exitOnce();
+        });
+      }
     };
     let pending = streams.length;
     const done = () => {
@@ -431,6 +462,46 @@ interface StdoutQueueEntry {
   offset: number;
   consumed: boolean;
   settle: () => void;
+}
+
+/** Native-writer queue state of the streams trackNativeBacklog wrapped. */
+const nativeBacklog = new WeakMap<object, { queued: boolean }>();
+
+/**
+ * Record when Bun's native writer is holding queued bytes for `stream`:
+ * write() returns false exactly when part of the chunk stayed queued, and
+ * 'drain' fires once the queue is empty (Bun 1.4 pipe semantics, pinned by
+ * test/cli-exit-drain.test.ts). Lets the exit seam skip the aliveness grace
+ * when nothing is queued instead of sleeping on every exit.
+ */
+function trackNativeBacklog(stream: NodeJS.WriteStream): void {
+  if (nativeBacklog.has(stream)) return;
+  const state = { queued: false };
+  nativeBacklog.set(stream, state);
+  const write = stream.write.bind(stream) as (...args: unknown[]) => boolean;
+  stream.write = function (...args: unknown[]): boolean {
+    const accepted = write(...args);
+    if (!accepted && !state.queued) {
+      state.queued = true;
+      stream.once('drain', () => {
+        state.queued = false;
+      });
+    }
+    return accepted;
+  } as typeof stream.write;
+}
+
+/**
+ * Whether `stream` may still hold bytes the process must stay alive to
+ * deliver: 'empty' (process.stdout behind the fd-1 write chain, or a tracked
+ * stream with nothing queued), 'queued' (a tracked stream waiting for its
+ * 'drain'), or 'unknown' (anything nothing tracks — the fixed grace applies).
+ */
+function streamQueueState(stream: MinimalWritable): 'empty' | 'queued' | 'unknown' {
+  if (stream === process.stdout && stdoutInterposed) return 'empty';
+  const state = nativeBacklog.get(stream);
+  if (!state) return 'unknown';
+  return state.queued ? 'queued' : 'empty';
 }
 
 /** FIFO of deferred payloads: every routed stdout write settles in order. */
@@ -653,7 +724,18 @@ export function drainStdoutQueueSync(deadlineMs: number = resolveStdoutDrainDead
  * (EAGAIN mid-payload) or a prior in-flight write defers to the async tail,
  * preserving order.
  */
+let stdoutCapture: ((text: string) => void) | null = null;
+
+/** GST-2476 G2: while set, every fd-1 write this module makes goes to the capture instead (enforced member mode withholds an allowed command's output). */
+export function setStdoutCapture(capture: ((text: string) => void) | null): void {
+  stdoutCapture = capture;
+}
+
 function chainStdoutWrite(data: string | Uint8Array, encoding?: BufferEncoding): Promise<void> {
+  if (stdoutCapture) {
+    stdoutCapture(typeof data === 'string' ? data : Buffer.from(data.buffer, data.byteOffset, data.byteLength).toString('utf8'));
+    return Promise.resolve();
+  }
   const buf =
     typeof data === 'string'
       ? Buffer.from(data, encoding ?? 'utf8')
@@ -683,11 +765,17 @@ function chainStdoutWrite(data: string | Uint8Array, encoding?: BufferEncoding):
  */
 export function installStdoutPipeDelivery(opts: { json?: 'document' | 'ndjson' } = {}): void {
   if (stdoutInterposed) return;
+  if (!process.stderr.isTTY) trackNativeBacklog(process.stderr);
   // Agent contract v1 (D2 guard mode): under `--json` the guard installs even
   // on a TTY, because the contract is "fd 1 carries exactly the document".
   if (process.stdout.isTTY && !opts.json) return;
   stdoutInterposed = true;
   jsonGuardMode = opts.json ?? null;
+  setInterruptedDocumentWriter(doc => {
+    if (jsonDocumentWritten) return;
+    jsonDocumentWritten = true;
+    void chainStdoutWrite(`${JSON.stringify(doc, null, jsonGuardMode === 'ndjson' ? undefined : 2)}\n`).catch(() => { /* fd 1 gone */ });
+  });
   const toStderr = (data: string | Uint8Array, encoding?: BufferEncoding): Promise<void> => {
     try { process.stderr.write(typeof data === 'string' ? Buffer.from(data, encoding ?? 'utf8') : data); } catch { /* best effort */ }
     return Promise.resolve();
@@ -764,12 +852,16 @@ function writeJsonFallbackIfMissing(exitCode: number): void {
     return;
   }
   jsonDocumentWritten = true;
+  // 129/130/143: a signal stopped the command before its result; say so, so a harness timeout never reads as empty.
+  const signalled = exitCode === 129 || exitCode === 130 || exitCode === 143;
   const doc = {
     ...(jsonGuardMode === 'ndjson' ? { status: 'error' } : {}),
-    error: 'command_failed',
-    code: lastRenderedErrorCode ?? 'command_failed',
-    message: `The command exited with status ${exitCode} without writing its JSON result.`,
-    suggestion: 'Re-run without --json to read the error on stderr, or run `gbrain doctor --json`.',
+    error: signalled ? 'interrupted' : 'command_failed',
+    code: signalled ? 'interrupted' : lastRenderedErrorCode ?? 'command_failed',
+    message: signalled ? `The command was interrupted by a signal (exit ${exitCode}) before it wrote its JSON result. Nothing was read, so this is not an empty result.`
+      : `The command exited with status ${exitCode} without writing its JSON result.`,
+    suggestion: signalled ? 'Re-run the same command with a longer timeout; large brains can take minutes.'
+      : 'Re-run without --json to read the error on stderr, or run `gbrain doctor --json`.',
     exit_code: exitCode,
     contract_version: 1,
   };
@@ -804,7 +896,15 @@ function recordJsonDocumentMissing(): void {
  */
 export async function writeStdoutFinal(output: string): Promise<void> {
   jsonDocumentWritten = true;
-  await chainStdoutWrite(output);
+  await chainStdoutWrite(jsonGuardMode === 'document' && slowReadElapsedMs() !== null ? withReadMetaText(output) : output);
+}
+
+/** A slow read's document text with `elapsed_ms` and `complete` (read-heartbeat.ts), in the text's own indentation. */
+function withReadMetaText(output: string): string {
+  let doc: unknown;
+  try { doc = JSON.parse(output); } catch { return output; }
+  const indent = /^\{\n( +)"/.exec(output)?.[1]?.length;
+  return `${JSON.stringify(withReadMeta(doc), null, indent)}${output.endsWith('\n') ? '\n' : ''}`;
 }
 
 /**

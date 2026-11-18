@@ -10,7 +10,7 @@ import { describe, expect, test } from 'bun:test';
 import type { GitHubClient } from '../../scripts/lib/gh-issue.ts';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { CAPS, collectHealth, firstAttempt, parseWindow, renderHealth, shardRatio, topFailingFiles, type Annotation, type Job, type Run } from '../../scripts/ci-health-report.ts';
+import { CAPS, classify, collectHealth, firstAttempt, parseWindow, renderHealth, shardRatio, topFailingFiles, type Annotation, type Job, type Run } from '../../scripts/ci-health-report.ts';
 
 const repo = { full_name: 'garrytan/gbrain' };
 const run = (id: number, conclusion: string, attempt = 1, fork = false): Run => ({
@@ -24,6 +24,19 @@ const shard = (id: number, name: string, secs: number, conclusion = 'success'): 
 describe('ci-health-report', () => {
   test('first-attempt pass counts only runs that passed without a re-run; cancelled runs are ignored', () => {
     expect(firstAttempt([run(1, 'success'), run(2, 'success', 2), run(3, 'failure'), run(4, 'cancelled')])).toEqual({ runs: 3, pass: 1, rate: 1 / 3 });
+  });
+
+  test('a job whose checkout retry also failed is infrastructure, and a test failure after a recovered checkout is a test', () => {
+    const stalledTwice: Job = { id: 1, name: 'test (1, 2)', conclusion: 'failure', steps: [
+      { name: 'Run actions/checkout@11d5960a326750d5838078e36cf38b85af677262', conclusion: 'success' },
+      { name: 'Check out again after a stalled first attempt', conclusion: 'failure' },
+    ] };
+    const recovered: Job = { ...stalledTwice, steps: [
+      { name: 'Check out again after a stalled first attempt', conclusion: 'success' },
+      { name: 'Run unit shard', conclusion: 'failure' },
+    ] };
+    expect(classify([stalledTwice])).toBe('infrastructure');
+    expect(classify([recovered])).toBe('test');
   });
 
   test('shard ratio is slowest over mean among matching jobs', () => {
@@ -48,7 +61,7 @@ describe('ci-health-report', () => {
   const W = { since: '2026-09-27T00:00:00.000Z', until: '2026-10-04T00:00:00.000Z' };
   const decoded = (path: string) => decodeURIComponent(path);
 
-  function fakeApi(opts: { pr?: (page: number, path: string) => { workflow_runs: Run[]; total_count: number }; push?: Run[]; issues?: unknown[]; comments?: Record<number, unknown[]>; timeline?: Record<number, unknown[]>; failJobs?: boolean }) {
+  function fakeApi(opts: { pr?: (page: number, path: string) => { workflow_runs: Run[]; total_count: number }; push?: Run[]; issues?: unknown[]; comments?: Record<number, unknown[]>; timeline?: Record<number, unknown[]>; failJobs?: boolean; unitJobs?: [string, string] }) {
     const calls: string[] = [];
     const client: GitHubClient = {
       async request<T>(_m: string, path: string): Promise<T> {
@@ -67,7 +80,8 @@ describe('ci-health-report', () => {
           const id = Number(/runs\/(\d+)\//.exec(path)![1]);
           if (id % 7 === 0) return { jobs: [{ id: 9, name: 'stress-changed-tests', conclusion: 'failure' }, { id: 10, name: 'test-status', conclusion: 'failure' }] } as T;
           if (id % 7 === 1) return { jobs: [{ id: 11, name: 'verify', conclusion: 'timed_out' }] } as T;
-          return { jobs: [shard(1, 'test (1)', 100), shard(2, 'test (2)', 300, 'failure'), shard(3, 'Selected E2E (diff-relevant) 1', 50)] } as T;
+          const [first, second] = opts.unitJobs ?? ['test (1)', 'test (2)'];
+          return { jobs: [shard(1, first, 100), shard(2, second, 300, 'failure'), shard(3, 'Selected E2E (diff-relevant) 1', 50)] } as T;
         }
         if (path.includes('/annotations')) return [{ annotation_level: 'failure', path: 'test/flaky.test.ts', title: 'error: timeout', message: '' }] as T;
         if (path.includes('issues?labels=master-red')) return (opts.issues ?? []) as T;
@@ -100,6 +114,12 @@ describe('ci-health-report', () => {
     expect(body).toContain('**Truncated:**');
     expect(body).toContain('### Next step for the agent');
     expect(body).toContain('Docs: docs/ci-red-runbook.md#ci-health-report');
+  });
+
+  test('unit shard spread reads the packed jobs test.yml runs two shards in (`test (1, 2)`)', async () => {
+    const { client } = fakeApi({ unitJobs: ['test (1, 2)', 'test (3, 4)'], pr: p => ({ workflow_runs: p === 1 ? [run(2, 'success')] : [], total_count: 1 }) });
+    const unit = (await collectHealth(client, W)).workflows.find(w => w.workflow === 'test.yml')!;
+    expect(unit.spread.mean_ratio).toBeCloseTo(1.5);
   });
 
   test('a window over the 1000-result search cap is split in halves until every slice fits; a slice that cannot fit is indeterminate, never satisfied', async () => {

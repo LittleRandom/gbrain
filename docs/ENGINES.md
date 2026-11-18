@@ -153,7 +153,7 @@ RRF fusion, multi-query expansion, and 4-layer dedup are engine-agnostic. They o
 - `tsvector` + `GIN` index for full-text search with `ts_rank` weighting
 - `pgvector` HNSW index for cosine similarity vector search
 - `pg_trgm` + `GIN` for fuzzy slug resolution
-- Recursive CTEs for graph traversal
+- Recursive CTEs for graph traversal (breadth-first, each page visited once)
 - Trigger-based search_vector (spans pages + timeline_entries)
 - JSONB for frontmatter with GIN index
 - Connection pooling via Supabase Supavisor (port 6543)
@@ -170,6 +170,126 @@ authorized database role; an RLS-hidden statistics view is not evidence that
 the object is absent. Highly selective queries may correctly choose an exact
 plan. The [retrieval guide](architecture/RETRIEVAL.md#named-thing-retrieval-per-page-pool--title--alias--evidence)
 describes bounded candidate recovery and incomplete-result metadata.
+
+On Postgres the same refresh also analyzes the page columns every search
+filter reads (`deleted_at`, `source_id`, `type`, `slug`) and
+`content_chunks(model, modality, page_id, body_generation)`, and an embed drain that embedded
+anything analyzes those chunk columns once at its end (each ANALYZE bounded by
+a 30 s statement and 2 s lock timeout). Without those statistics the vector
+candidate statement sorts every eligible chunk instead of walking the HNSW
+index, and at 1M chunks and above that sort runs past the 8 s vector budget,
+so hybrid search falls back to keyword-only results until autovacuum
+analyzes the tables. If a refresh is skipped (a lock, or a role that does not
+own the tables), run `ANALYZE content_chunks(model, modality, page_id, body_generation)` and
+`ANALYZE pages` as the table owner.
+
+### TLS for Postgres connections
+
+Every Postgres connection gbrain opens to a host that is **not on this
+machine** requires TLS unless the database URL says otherwise. On this
+machine means `localhost`, `127.0.0.0/8`, `::1` or a Unix socket path;
+everything else needs TLS, including private addresses (`10.x`,
+`192.168.x`) and Docker service names such as `postgres-1`, because gbrain
+cannot tell a trusted network from an untrusted one by its name.
+(`src/core/pg-tls.ts` is the one resolver every connection pool uses.)
+
+| URL says | What gbrain does |
+|---|---|
+| no `sslmode`, host on this machine | plaintext, as before |
+| no `sslmode`, any other host | `sslmode=require` |
+| `?sslmode=require` | encrypts the connection; does **not** verify the server certificate |
+| `?sslmode=verify-full` | encrypts and verifies the certificate and host name against the CA store |
+| `?sslmode=disable` | plaintext; the one opt-out, for a network you trust |
+
+An sslmode (or `ssl=`, or `sslrootcert=system`) in the URL is always
+honored and never weakened, and so is the driver's own `PGSSL` variable.
+
+`require` stops anyone on the network from reading the traffic, but it would
+not notice an attacker who sits in the middle and presents their own
+certificate. For that, use `verify-full`. It checks the server certificate
+against Node's CA store, so a provider with its own CA needs that CA added:
+Supabase publishes it under **Project Settings → Database → SSL
+Configuration → Download certificate**. Put the file on the brain host and set
+`NODE_EXTRA_CA_CERTS=/path/to/prod-ca-2021.crt` in the environment gbrain
+runs in (for the installed service, `~/.gbrain/env`), then use
+`?sslmode=verify-full`. A `sslrootcert=<file>` parameter is not read by the
+driver; use `NODE_EXTRA_CA_CERTS` instead.
+
+A server that does not accept TLS fails the connection with
+[`postgres_tls_required`](guides/error-codes.md#postgres_tls_required),
+which names both choices: turn TLS on at the server, or add
+`sslmode=disable` to the URL. Nothing falls back to plaintext on its own.
+`gbrain doctor --only postgres_tls` reports whether this machine's own
+connection to a non-local server uses TLS. It judges that from the client side:
+`sslmode=require`, `verify-ca` and `verify-full` make the driver refuse a
+server without TLS. It warns on `sslmode=disable`, and on `sslmode=prefer` when
+the server does not offer TLS or reports the session unencrypted (prefer falls
+back to plaintext without saying so, so doctor never certifies a prefer
+connection as encrypted). Behind a
+pooler, the server's `pg_stat_ssl` row describes the pooler's own hop to the
+database, which can't be checked from your machine, so doctor shows it as detail
+and never warns about it. PGLite opens no network connection, so none of this
+applies to it.
+
+### Vector index sizing
+
+The chunk HNSW index stores each vector beside its graph links, so at 1,024
+dimensions it takes about 7.6 GiB per million chunks as `vector` (about
+9.8 GiB for a 1.28M-chunk brain) and a third of that as `halfvec`. The
+deferred ANN build (`gbrain migrate embeddings`, `gbrain reindex --vectors`)
+runs `CREATE INDEX CONCURRENTLY` with the server's `maintenance_work_mem`.
+When the graph does not fit, pgvector logs `hnsw graph no longer fits into
+maintenance_work_mem` and the build slows several-fold: 4.3x at 250k chunks
+with 256 MB. Before a large build, raise it on the brain host to the index
+size plus about 10% (Supabase: `supabase postgres-config update --config
+maintenance_work_mem=12GB --project-ref <ref> --experimental`, which reloads
+without a restart; self-hosted: `ALTER SYSTEM SET maintenance_work_mem =
+'12GB'` and `SELECT pg_reload_conf()`), and give it
+`max_parallel_maintenance_workers` of about half the cores: a 1M-chunk build
+took 103 s on 16 vCPU with 12 GB and 8 workers. Measured, not shipped:
+`halfvec` gives the same recall with an index a third the size, and
+`ef_construction` 128 adds about 0.02 to 0.03 unfiltered recall@10 for about
+25% more build time. Both need a migration or a rebuild, so the defaults stay
+(m 16, ef_construction 64, `vector`). Measurements and method:
+[`docs/eval/hnsw-scale-bench.md`](eval/hnsw-scale-bench.md).
+
+### Vector index prewarm
+
+<a id="vector-index-prewarm"></a>
+
+After a Postgres restart or a cache eviction, the first searches walk HNSW
+pages nobody has read yet: on a brain whose index is bigger than the cache,
+an unseen query reads 2,000 to 4,500 index pages and spends 1.2 to 2.7 s in
+the vector stage. `gbrain embeddings prewarm` loads every HNSW index of the
+brain into `shared_buffers` once with `pg_prewarm(<index>, 'buffer')`, so
+those pages are already cached. It is opt-in and local to the brain host: a
+CLI-only command (no MCP tool, refused by thin clients), and
+`gbrain config set serve.vector_prewarm true` runs it once in the
+background each time `gbrain serve` starts (off by default; a refusal is
+logged and the serve carries on).
+
+`shared_buffers` decides whether it runs. The indexes must total at most
+half of it, read with `current_setting('shared_buffers')`; past that the
+prewarm would evict the heap and keyword-index pages every other read needs.
+`effective_cache_size` is printed but never decides: it is a planner hint
+the operator sets, not memory the server holds. The check reads only catalog
+rows and file sizes, so a refusal reads no index page.
+
+| Command | Does |
+|---|---|
+| `gbrain embeddings prewarm --dry-run --json` | Index sizes, `shared_buffers`, `effective_cache_size`, the budget and the fit; reads nothing |
+| `gbrain embeddings prewarm` | Prewarms when the indexes fit and `pg_prewarm` exists |
+| `gbrain config set serve.vector_prewarm true` | Prewarms at each serve start (restart the serve) |
+
+Refusals, each with a fix: `vector_prewarm_wont_fit` (raise
+`shared_buffers` to at least twice the index size and restart Postgres; a
+managed database sizes it with the instance), `vector_prewarm_extension_missing`
+(`CREATE EXTENSION IF NOT EXISTS pg_prewarm;` as a role that may create
+extensions) and `vector_prewarm_unsupported_engine` (PGLite has no server
+cache to fill). Prewarmed pages stay cached until Postgres restarts or other
+reads evict them; pg_prewarm's own `autoprewarm` worker
+(`shared_preload_libraries = 'pg_prewarm'`) can reload them after a restart
+without gbrain.
 
 ### Opt-in RLS source-scope binding (`GBRAIN_RLS_SCOPE_BINDING`)
 
@@ -214,6 +334,360 @@ per-request scope binding — unwrapped paths (writes, admin/maintenance reads)
 run under the role default and are not backstopped per caller. This is layer 2;
 the app-layer source filters remain layer 1 and stay mandatory. Behavioral pins
 live in `test/postgres-engine-rls-scope.test.ts`.
+
+**Segmented page tables.** A page over 1 MiB stored in segments (`pages.segmented_storage`)
+keeps its text in `page_segment_texts`, its layout and headings in
+`page_body_manifest`, uploads in progress in `page_body_stagings` /
+`page_body_staging_parts` (with the segment texts each one holds in
+`page_body_staging_texts`), view sizes in `page_view_digests`, and per-segment
+derivation results (link candidates, window anchors) in `page_segment_derivations`,
+with each page's derivation spend in `page_derivation_spend` and derivation purges
+in progress in `page_segment_derivation_purges` / `page_segment_derivation_purge_pages`.
+gbrain enables RLS on all ten on every schema replay, as it does on `pages` and
+`content_chunks`, so with no policy a role that does not bypass RLS reads no row
+of them. Title search, the source-scoped vector scan, the chunk windows search
+reads around its hits, `get_chunks` and get_page check a chunk of a page stored
+in segments against `page_body_manifest`. A restricted read role that can see
+such a chunk (a segmented page of one of its sources) needs `SELECT` on it;
+without it those reads fail with `permission_denied` (42501). A role that sees
+no such chunk, as every role does while no page is segmented
+(`pages.segmented_storage` is off by default), reads as before without the
+grant (`test/e2e/segmented-switch-off-rls.test.ts`). Grant it together with
+these policies, never with an open one, or the role reads every source's segment
+text. A scoped role then sees exactly the segment rows of its sources:
+
+<!-- gbrain:segmented-rls-recipe:begin (applied verbatim by test/e2e/segmented-rls-scope.test.ts) -->
+```sql
+-- The pages_scope_filter predicate, on each table's own source_id.
+CREATE POLICY page_segment_texts_scope_filter ON page_segment_texts
+  USING (current_setting('app.scopes', true) = '*'
+         OR source_id = ANY(string_to_array(current_setting('app.scopes', true), ',')));
+CREATE POLICY page_body_manifest_scope_filter ON page_body_manifest
+  USING (current_setting('app.scopes', true) = '*'
+         OR source_id = ANY(string_to_array(current_setting('app.scopes', true), ',')));
+CREATE POLICY page_body_stagings_scope_filter ON page_body_stagings
+  USING (current_setting('app.scopes', true) = '*'
+         OR source_id = ANY(string_to_array(current_setting('app.scopes', true), ',')));
+-- A write role records the texts each staging holds here; without a policy its
+-- segmented writes are refused.
+CREATE POLICY page_body_staging_texts_scope_filter ON page_body_staging_texts
+  USING (current_setting('app.scopes', true) = '*'
+         OR source_id = ANY(string_to_array(current_setting('app.scopes', true), ',')));
+-- Search joins sources; a scoped role sees its own.
+CREATE POLICY sources_scope_filter ON sources
+  USING (current_setting('app.scopes', true) = '*'
+         OR id = ANY(string_to_array(current_setting('app.scopes', true), ',')));
+-- No source_id of their own: visible exactly when their staging or page is
+-- (the pages policy filters the subquery). content_chunks holds every page's
+-- chunk text, segmented or not.
+CREATE POLICY page_body_staging_parts_scope_filter ON page_body_staging_parts
+  USING (current_setting('app.scopes', true) = '*'
+         OR EXISTS (SELECT 1 FROM page_body_stagings s WHERE s.id = staging_id));
+CREATE POLICY page_view_digests_scope_filter ON page_view_digests
+  USING (current_setting('app.scopes', true) = '*'
+         OR EXISTS (SELECT 1 FROM pages p WHERE p.id = page_id));
+CREATE POLICY page_segment_derivations_scope_filter ON page_segment_derivations
+  USING (current_setting('app.scopes', true) = '*'
+         OR EXISTS (SELECT 1 FROM pages p WHERE p.id = page_id));
+CREATE POLICY content_chunks_scope_filter ON content_chunks
+  USING (current_setting('app.scopes', true) = '*'
+         OR EXISTS (SELECT 1 FROM pages p WHERE p.id = page_id));
+-- A write role books segmented derivation spend and records derivation purges
+-- here; without a policy those writes are refused.
+CREATE POLICY page_derivation_spend_scope_filter ON page_derivation_spend
+  USING (current_setting('app.scopes', true) = '*'
+         OR EXISTS (SELECT 1 FROM pages p WHERE p.id = page_id));
+CREATE POLICY page_segment_derivation_purges_scope_filter ON page_segment_derivation_purges
+  USING (current_setting('app.scopes', true) = '*'
+         OR source_id = ANY(string_to_array(current_setting('app.scopes', true), ',')));
+CREATE POLICY page_segment_derivation_purge_pages_scope_filter ON page_segment_derivation_purge_pages
+  USING (current_setting('app.scopes', true) = '*'
+         OR EXISTS (SELECT 1 FROM page_segment_derivation_purges r WHERE r.request_id = page_segment_derivation_purge_pages.request_id));
+
+-- A read role that searches and reads pages. The other tables it reads
+-- (config, timeline_entries, facts, ...) need policies of their own.
+GRANT SELECT ON pages, content_chunks, page_body_manifest, page_segment_texts,
+  page_view_digests, sources TO <reader-role>;
+
+-- If the runtime role OWNS these tables, as for pages:
+ALTER TABLE page_segment_texts FORCE ROW LEVEL SECURITY;
+ALTER TABLE page_body_manifest FORCE ROW LEVEL SECURITY;
+ALTER TABLE page_body_stagings FORCE ROW LEVEL SECURITY;
+ALTER TABLE page_body_staging_parts FORCE ROW LEVEL SECURITY;
+ALTER TABLE page_body_staging_texts FORCE ROW LEVEL SECURITY;
+ALTER TABLE page_view_digests FORCE ROW LEVEL SECURITY;
+ALTER TABLE page_segment_derivations FORCE ROW LEVEL SECURITY;
+ALTER TABLE page_derivation_spend FORCE ROW LEVEL SECURITY;
+ALTER TABLE page_segment_derivation_purges FORCE ROW LEVEL SECURITY;
+ALTER TABLE page_segment_derivation_purge_pages FORCE ROW LEVEL SECURITY;
+ALTER TABLE content_chunks FORCE ROW LEVEL SECURITY;
+```
+<!-- gbrain:segmented-rls-recipe:end -->
+
+A role whose reads do not run through the scoped helper is scoped by its own
+default (`ALTER ROLE <reader-role> SET app.scopes = 'source-a,source-b'`). The
+policies read `app.scopes` only; the app-layer source filters stay layer 1.
+
+A write role that does not own the tables needs `SELECT, INSERT, UPDATE, DELETE`
+on all ten, as on any table a migration adds, even while no page is segmented:
+purging soft-deleted pages, fact withdrawal (`forget_fact`, `purge_fact`), the
+maintenance sweep's facts pass, doctor's credential check and the segment
+storage sweep name them. Its ordinary writes (`put_page`, `remember`, sync
+imports, their embedding and the unchanged-file check) do not, while it sees no
+segmented chunk (`test/e2e/segmented-switch-off-write-role.test.ts`). With the
+policies above it creates segmented pages and sees only its sources' rows
+(`test/e2e/segmented-rls-scope.test.ts`).
+
+<a id="owner-only-delete-triggers"></a>
+**Owner-only delete triggers.** Rows derived from an owner-only source (an `imessage` source, or
+one with `owner_only: true`) stay owner-only after their origin is gone. Since migration v322
+(GST-3032) a `BEFORE DELETE` trigger on `sources`, `pages`, `facts`, `takes` and
+`timeline_entries` records the deleted row and every row derived from it in `owner_only_marks`,
+and reads treat a marked row, or one derived from a marked row, as owner-only. Nothing derived
+is deleted. A take or timeline row counts as owner-only by its own lineage as well as its page's.
+The first owner-only source (or mark) sets a one-way flag, a comment on `owner_only_marks`;
+from then on the guard stays on even after the last owner-only source is removed. A brain that
+never held owner-only data never reads `owner_only_marks`, so its logins need no new grant.
+The triggers run as the deleting role. A role whose reads row-level security limits (a scoped
+writer, or `FORCE ROW LEVEL SECURITY` on a table it owns) could miss derived rows: its delete
+of a row it sees as owner-only is refused with `owner_only_lineage_unreadable` (delete it as
+the table owner without `FORCE`, or as a `BYPASSRLS` login, and the derived rows are marked),
+and its delete of a row it sees as open goes through but sets the `('*', 'row_security')`
+mark, which closes owner-only lineage the way a missing trigger does. `CREATE TRIGGER` needs the table's owner: a table another role owns gets
+no trigger, the migration run and `gbrain doctor` (`owner_only_marks_triggers`) name it with
+`ALTER TABLE ... OWNER TO`, and `gbrain apply-migrations --force-schema` run by its owner
+creates it. While a trigger is missing or disabled on a brain that holds an owner-only source or
+a mark, owner-only lineage reads closed: every row with a recorded derivation input and every
+synthesized concept or question counts as owner-only. It stays closed after the triggers are
+back (a delete in the gap left no marks) until the owner, having checked what was deleted in
+the gap, deletes the `('*', 'unguarded')` row by hand; the closed mode itself never adds a mark.
+
+A scoped writer that keeps making permanent deletes (the recipe above) keeps owner-only lineage
+closed: while a login whose reads row-level security limits makes permanent deletes on a brain
+that holds owner-only data, every derived row and synthesized concept stays owner-only for
+everyone but the owner. Deleting the `('*', 'row_security')` row does not end it, because that
+login's next permanent delete sets it again. The ways out are to run permanent deletes as the
+table owner (without `FORCE`) or a `BYPASSRLS` login, or to stop holding owner-only data:
+remove the owner-only source and, once the rows derived from it may be read by others again,
+its marks.
+
+<a id="owner-only-marks-privileges"></a>**Privileges on `owner_only_marks`.** The table follows
+the sibling pattern: row-level security on and no policy, so a role with only table privileges
+(Supabase's `anon` and `authenticated`) neither reads nor adds a mark. No migration grants
+anything. On a brain that has held owner-only data, every non-owner login that reads `sources`
+needs `SELECT` (to read owner-only lineage exactly) and, if it makes permanent deletes,
+`INSERT` on `owner_only_marks`, each with a permissive policy. Without them the login reads
+owner-only lineage closed, never open and never an error, and its permanent deletes are
+refused with `owner_only_marks_unwritable`, which names the grant. Nobody but the owner
+removes a mark, and only the owner of `owner_only_marks` sets the flag, so the first
+owner-only source is added by that role. `gbrain doctor` (`owner_only_marks_triggers`) names
+each login that still needs the statements and prints them; the owner runs:
+
+<!-- gbrain:owner-only-marks-recipe:begin (applied verbatim by test/e2e/owner-only-marks-scoped-login.test.ts) -->
+```sql
+-- A login that reads and makes permanent deletes (the writer role above):
+GRANT SELECT, INSERT ON owner_only_marks TO <writer-role>;
+CREATE POLICY owner_only_marks_read_<writer-role> ON owner_only_marks FOR SELECT TO <writer-role> USING (true);
+CREATE POLICY owner_only_marks_add_<writer-role> ON owner_only_marks FOR INSERT TO <writer-role> WITH CHECK (true);
+-- A read-only login (the reader role above) needs the read half only:
+GRANT SELECT ON owner_only_marks TO <reader-role>;
+CREATE POLICY owner_only_marks_read_<reader-role> ON owner_only_marks FOR SELECT TO <reader-role> USING (true);
+```
+<!-- gbrain:owner-only-marks-recipe:end -->
+
+A login that cannot read `derivation_inputs`, `facts`, `links`, `takes` and `timeline_entries`
+(the reader role above reads none of them) cannot walk owner-only lineage, so on a brain that has
+held owner-only data it reads every row closed: it sees no page or fact as open, with no error,
+also after the last owner-only source is removed. Do not grant it `SELECT` on those tables
+without a policy that shows it every row: under row-level security it would miss derivation rows
+and read rows open that are owner-only.
+
+<a id="purge-and-withdrawal-guards"></a>
+**Purge and withdrawal guards.** The guards that refuse purged content and keep withdrawn
+facts withdrawn run as the writing role (`SECURITY INVOKER`) and read their ledgers
+(`fact_purges`, `fact_withdrawals`, `take_purges`, `page_purges` and the derivation purge
+tables) under that role's RLS. Since migration v318 (#7632, #7659) they fail closed: when
+RLS applies to the writing role on a ledger and no permissive policy of the role covers it,
+the guard refuses the write with `writer_coordinator_required: writer state is unreadable to
+this database role` (P0001, relationship `unreadable_state`), whose `HINT` names the table
+and the policy to add, instead of reading the ledger as empty and letting a purged claim,
+take, page or derivation, or a withdrawn fact, through. The refused writes are fact inserts
+and claim updates, fact re-activations, take writes, page content writes, segment derivation
+writes, and page soft-deletes or segment retirements while the derivation purge tables are
+unreadable. The owner (without `FORCE ROW LEVEL SECURITY`), a role that bypasses RLS, a
+ledger without RLS and PGLite are not affected. A scoped write role needs these policies, on
+top of the maintainer recipe below for `pages` and `sources`; they let it read only the
+ledger rows of the sources it writes and change none:
+
+<!-- gbrain:ledger-rls-recipe:begin (applied verbatim by test/guard-ledgers-fail-closed-7632.test.ts) -->
+```sql
+-- The ledgers of the writer's own sources, with the pages_scope_filter predicate.
+CREATE POLICY fact_purges_writer_scope ON fact_purges FOR SELECT TO <writer-role>
+  USING (current_setting('app.scopes', true) = '*'
+         OR source_id = ANY(string_to_array(current_setting('app.scopes', true), ',')));
+CREATE POLICY fact_withdrawals_writer_scope ON fact_withdrawals FOR SELECT TO <writer-role>
+  USING (current_setting('app.scopes', true) = '*'
+         OR source_id = ANY(string_to_array(current_setting('app.scopes', true), ',')));
+CREATE POLICY take_purges_writer_scope ON take_purges FOR SELECT TO <writer-role>
+  USING (current_setting('app.scopes', true) = '*'
+         OR source_id = ANY(string_to_array(current_setting('app.scopes', true), ',')));
+CREATE POLICY page_purges_writer_scope ON page_purges FOR SELECT TO <writer-role>
+  USING (current_setting('app.scopes', true) = '*'
+         OR source_id = ANY(string_to_array(current_setting('app.scopes', true), ',')));
+CREATE POLICY page_segment_derivation_purges_writer_scope ON page_segment_derivation_purges FOR SELECT TO <writer-role>
+  USING (current_setting('app.scopes', true) = '*'
+         OR source_id = ANY(string_to_array(current_setting('app.scopes', true), ',')));
+-- The note a page leaving a running derivation sweep's scope leaves for that sweep.
+CREATE POLICY page_segment_derivation_purge_pages_writer_note ON page_segment_derivation_purge_pages FOR INSERT TO <writer-role>
+  WITH CHECK (EXISTS (SELECT 1 FROM page_segment_derivation_purges r
+                      WHERE r.request_id = page_segment_derivation_purge_pages.request_id));
+```
+<!-- gbrain:ledger-rls-recipe:end -->
+
+A bulk fact insert (the fence import in `src/core/engine-sql/facts.ts`) defers the withdrawal
+stamp to the end of its statement, so when one of its rows matches a withdrawal the guard
+updates that row in `facts`, and the write role then needs a permissive `UPDATE` policy on
+`facts` covering the row, beside its `SELECT` policy, or the guard refuses the insert with the
+same `writer_coordinator_required` error.
+
+**Check that the upgrade replaced every guard.** Migrations v318 and v321 can only replace a guard
+function the role running them owns. A guard owned by another role is left as it was, and each
+migration only names it in one stderr line. Left by v318, it still lets a scoped writer without
+ledger policies through (`guards: N purge or withdrawal guard(s) still read their ledgers as empty ...`).
+Left by v321, a facts guard still lacks the name-tag rule, so a claim forgotten or
+purged under another subject can come back on a name tag (`guards: N purge or withdrawal guard(s)
+keep their body from before name keys ...`). After upgrading, run this as any role that can read
+the catalog. Every one of the seven rows must show `fails_closed = t`:
+
+```sql
+SELECT p.proname, pg_get_userbyid(p.proowner) AS owner,
+       strpos(p.prosrc, 'row_security_active(') > 0 AS fails_closed
+FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+WHERE n.nspname = 'public' AND p.proname IN ('gbrain_guard_inserted_facts',
+  'gbrain_preserve_fact_withdrawal', 'gbrain_refuse_purged_fact', 'gbrain_refuse_purged_take',
+  'gbrain_refuse_purged_page', 'gbrain_refuse_purging_derivation', 'gbrain_mark_derivation_scope_entry')
+ORDER BY 1;
+```
+
+For a row with `fails_closed = f`, connect as the role in its `owner` column and run
+`ALTER FUNCTION public.<proname>() OWNER TO <the role gbrain migrates as>;`. Then run
+`gbrain apply-migrations --yes`, or start gbrain: every migration run re-creates a guard that
+is missing its check or its current body, provided the migrating role owns it. You can also run
+gbrain once as the owning role instead. Run the query again to confirm. The query sees only the
+ledger check, so a facts guard v321 left still shows `fails_closed = t`. On Postgres, `gbrain doctor`
+(`guard_ledger_checks`) runs the same check, also checks the current body of the three facts guards
+(`unbacked_page` in `gbrain_refuse_purged_fact`, `memory/scope` in `gbrain_preserve_fact_withdrawal`
+and `gbrain_guard_inserted_facts`), and names each guard left behind with its owner, and the fix:
+`gbrain apply-migrations --yes` when the doctor's role may re-create it, else the
+`ALTER FUNCTION ... OWNER TO` SQL to run as the owning role first.
+
+The segmented storage recipe above already covers the two derivation purge tables for a
+role it applies to. A policy that filters out ledger rows of a source the role writes hides
+them from the guard, as before. Every gbrain function that pins a search_path ends it with
+`pg_temp` (migration v277, #7632), so a session's temp table or view named like a ledger
+cannot hide it from a guard; before, any session, the owner included, could store purged
+content that way. Each definition outside
+`src/core/schema-migrations/` pins `pg_catalog, public, pg_temp` itself (`bun run check:search-path`
+fails one that does not, or a pinned function missing from `PINNED_FUNCTION_NAMES`), so a schema
+replay keeps it; historical migration bodies still pin the old path, so every migration run ends by
+putting `pg_temp` back (`hardenFunctionSearchPaths` in `src/core/function-search-path.ts`), and the
+schema blob's generated hardening region must stay its last statement. Where the migrating role
+does not own a function, the run that applies migrations names it on stderr and leaves it;
+`gbrain doctor` (`function_search_path`) prints the schema-qualified `ALTER FUNCTION` to run as its
+owner, or `gbrain apply-migrations --yes` below v277 ([function search path](guides/troubleshooting.md#function-search-path);
+`test/e2e/function-search-path-postgres.test.ts`).
+
+<a id="writer-protocol-fences"></a>
+**Writer-protocol fences.** The managed-writer guard, the persistence protocol floor, protocol
+activation and the Git-canonical source counter also run as the writing role and read their state
+under its RLS. Since migration v278 (#7636) they fail closed: a role that cannot see the
+`persistence_brain` row is refused on every guarded write, managed brain or not, instead of being
+treated as unmanaged. The message is `writer_coordinator_required: writer state is unreadable to
+this database role`: the managed-writer guard raises it as P0001, the request, effect and
+activation guards of the persistence protocol as SQLSTATE 42501. During a coordinated write's
+publication either one is stored on the receipt as `writer_coordinator_required` (relationship
+`unreadable_state`, the role remedy, and the owner-only `error_detail.state` naming the table; since
+#7777 for the protocol guards, #7780 for the state and remedy). A protocol guard's
+refusal outside publication (write admission, protocol activation) reaches the command as that
+database error, which gbrain's generic database output labels `permission_denied` with grant
+advice: the code at the start of the message names the refusal. On a managed brain the same refusal covers, for a writer without the git protocol, a
+hidden `git_canonical_brain` row and, while the brain has any Git-canonical source, a hidden
+target or old source row whether or not that source is Git-canonical; and a hidden page row behind a tag,
+timeline entry or take. Protocol activation (row-level security on `sources`, `persistence_requests`,
+`persistence_effects`, `persistence_worktrees` or `persistence_source_bindings`) and a change to
+which sources are Git-canonical (row-level security on `sources`) refuse any role it applies to,
+whatever its policies; only the table owner (without `FORCE ROW LEVEL SECURITY`) or a role that
+bypasses RLS passes them ([write refusals](guides/write-refusals.md#writer-coordinator-required);
+`test/writer-fence-fail-closed-7636.test.ts`).
+
+<a id="derived-state-maintainers"></a>**Derived-state maintainers.** Eight triggers keep derived state as the writing role:
+deleting a page removes its `page_retrievals` rows, soft-deleting or moving it clears its
+`extract_atoms_page_state` rows, a tag write moves its page's revision, a `page_versions` row copies the page's
+trust tier and writer, a page update re-indexes its `timeline_entries` text, a page write queues or drops its
+`page_projection_jobs` row (reading `sources`), and a trust-relevant change bumps `trust_policy_state`. Since
+migration v281 (#7637) each refuses with `writer_coordinator_required` (relationship `unreadable_state`, the error
+names the table) when row-level security applies to the role on a table it needs and no permissive policy for the role
+covers a command it runs there. Before, such a role kept stale derived state (a deleted page's retrieval rows stayed)
+or failed with a raw RLS error. The owner (without `FORCE ROW LEVEL SECURITY`) and a role that bypasses RLS are not
+affected. The guest-source guard in the trust trigger and guest admission read `guest_sources` the same way: since
+migration v314 a role that row-level security keeps from reading it is refused (`writer_coordinator_required`,
+`unreadable_state`, state `guest_sources`) on every page, fact, take and timeline write, because it cannot tell a guest
+source from an ordinary one. A scoped write role that does not own these tables needs these policies; the maintainer tables hold ids,
+timestamps and counters but no page text, so the writer sees every row, and a policy that filters them would leave the
+rows it hides stale:
+
+<!-- gbrain:maintainer-rls-recipe:begin (applied verbatim by test/derived-state-maintainers-7637.test.ts) -->
+```sql
+-- The writer's own pages and sources, with the pages_scope_filter predicate.
+-- Tag writes update the page revision; version rows and the projection queue
+-- read the page and its source.
+CREATE POLICY pages_writer_scope ON pages FOR ALL TO <writer-role>
+  USING (current_setting('app.scopes', true) = '*'
+         OR source_id = ANY(string_to_array(current_setting('app.scopes', true), ',')))
+  WITH CHECK (current_setting('app.scopes', true) = '*'
+         OR source_id = ANY(string_to_array(current_setting('app.scopes', true), ',')));
+CREATE POLICY sources_writer_scope ON sources FOR SELECT TO <writer-role>
+  USING (current_setting('app.scopes', true) = '*'
+         OR id = ANY(string_to_array(current_setting('app.scopes', true), ',')));
+-- The timeline text a page update indexes: the entries of pages the writer sees.
+CREATE POLICY timeline_entries_writer_scope ON timeline_entries FOR SELECT TO <writer-role>
+  USING (EXISTS (SELECT 1 FROM pages p WHERE p.id = page_id));
+-- Derived state with no page text: every row, so a deleted page's rows go too.
+CREATE POLICY page_retrievals_writer ON page_retrievals FOR ALL TO <writer-role>
+  USING (true) WITH CHECK (true);
+CREATE POLICY extract_atoms_page_state_writer ON extract_atoms_page_state FOR ALL TO <writer-role>
+  USING (true) WITH CHECK (true);
+CREATE POLICY page_projection_jobs_writer ON page_projection_jobs FOR ALL TO <writer-role>
+  USING (true) WITH CHECK (true);
+CREATE POLICY trust_policy_state_writer ON trust_policy_state FOR ALL TO <writer-role>
+  USING (true) WITH CHECK (true);
+-- Which sources are guest sources and who writes them: every row, read only.
+CREATE POLICY guest_sources_writer ON guest_sources FOR SELECT TO <writer-role>
+  USING (true);
+```
+<!-- gbrain:maintainer-rls-recipe:end -->
+
+<a id="folder-access-tables"></a>**Folder access tables.** A page write stamps the folder rules covering its slug
+from `access_policy_state` and `access_rules`, and remote reads hide the prefixes listed in
+`access_pending_coverage`, all as the database role doing the write or read. A role that row-level security keeps
+from reading those tables never reads them as "no rule": the stamp refuses the write with
+`writer_coordinator_required` (relationship `unreadable_state`, naming the table), and reads treat every page as
+under a pending prefix, so nothing is shown. The owner (without `FORCE ROW LEVEL SECURITY`) and a role that
+bypasses RLS are not affected, and `gbrain access` rule commands refuse such a role with `permission_denied`. A scoped
+role that writes or serves pages needs these policies; they let it read the rules and lock a source's policy row while
+stamping, but not change either. Row-level security does not cover TRUNCATE or triggers, so the recipe also revokes
+those. A policy that filters these rows hides rules from the role and so reveals the pages under them: keep `USING (true)`. The folder-rule lineage test also reads `slug_rename_history` (every slug a renamed page has had), which renames write; a role that cannot read it reads every page as covered, so a scoped role needs a `USING (true)` policy there like the other tables it writes. The recipe for the three access tables:
+
+<!-- gbrain:access-rls-recipe:begin (applied verbatim by test/access-folder-scoped-role.test.ts) -->
+```sql
+CREATE POLICY access_policy_state_reader ON access_policy_state FOR SELECT TO <writer-role> USING (true);
+CREATE POLICY access_policy_state_stamp_lock ON access_policy_state FOR UPDATE TO <writer-role>
+  USING (true) WITH CHECK (false);
+CREATE POLICY access_rules_reader ON access_rules FOR SELECT TO <writer-role> USING (true);
+CREATE POLICY access_pending_coverage_reader ON access_pending_coverage FOR SELECT TO <writer-role> USING (true);
+REVOKE TRUNCATE, TRIGGER, REFERENCES ON access_policy_state, access_rules, access_pending_coverage FROM <writer-role>;
+```
+<!-- gbrain:access-rls-recipe:end -->
 
 **In engine-sql.** A read in a migrated domain takes a `ScopedRead` when it
 runs through this helper and a `LegacyUnscopedRead` when it runs on the pool
@@ -282,6 +756,23 @@ Details in INSTALL_FOR_AGENTS.md ("Engine preference for harness installs").
 - tsvector + ts_rank for full-text search (same as Postgres)
 - pg_trgm for fuzzy slug resolution (same as Postgres)
 
+### PGLite vector index ceiling
+
+PGLite runs Postgres inside WebAssembly, and pglite.wasm caps its memory at
+2 GiB. pgvector holds the whole HNSW graph in `maintenance_work_mem` while it
+builds, about 4.7 KB per 1,024-dimension chunk (1.16 GB at 250k chunks).
+gbrain starts PGLite with `max_parallel_maintenance_workers=0` (PGLite has no
+worker processes, and a planned parallel build reserved all of
+`maintenance_work_mem` up front) and `max_wal_size=8GB` (a build WAL-logs its
+whole index in one statement, and WAL past the automatic checkpoint trigger
+wedges PGLite). The deferred ANN build (`gbrain migrate embeddings`) and
+`gbrain reindex --vectors` size `maintenance_work_mem` to the graph
+(`withHnswBuildMemory` in `src/core/vector-index.ts`): a 248,802-chunk build
+takes about 11 minutes and a 1.9 GB index. A graph past the 1.5 GiB budget,
+about 300k chunks at 1,024 dimensions, is refused before the build with
+`pglite_vector_index_too_large`; vector search keeps working with exact scans,
+and the fix is the read-only `gbrain migrate --to postgres --plan --json`.
+
 **When to use PGLite vs Postgres:**
 
 | Factor | PGLite | PostgresEngine + Supabase |
@@ -292,12 +783,15 @@ Details in INSTALL_FOR_AGENTS.md ("Engine preference for harness installs").
 | Cost | Free | Supabase Pro ($25/mo) |
 | Concurrency | Single process | Connection pooling |
 | Backups | Manual (file copy) | Managed by Supabase |
+| Largest page | 128 MiB, stored in segments (`pages.max_bytes`) | 256 MiB, stored in segments (`pages.max_bytes`) |
+
+**The belief ledger lives only in the database.** `belief_events` and its side tables record what the brain had recorded, and when (`gbrain beliefs status`). Markdown carries only current state, so a rebuild from Markdown, `gbrain reinit-pglite` or a dropped database starts an empty history; back up the database itself. After restoring a Postgres (or PGLite) backup, replay the purges made after the backup was taken: until then content purged later is readable again, and `gbrain doctor --only belief_ledger_coverage` reports a restore whose purge replay was partial, unavailable or unverified. Graduation copies the ledger verbatim (equal event keys and digests); the legacy copier refuses a brain that has one.
 
 **Migration:** on a PGLite brain, `gbrain migrate --to postgres` (alias `--to supabase`) graduates the brain to Postgres. Without `--yes` it prints the plan and exits 3; `--yes --expect <plan_hash>` runs it. Graduation drains pending writes, copies every table verbatim with its primary keys (pages, facts, takes, versions, links, timeline, embeddings, transcripts and paid caches, request history and withdrawals, token and OAuth rows) into a fenced target, verifies row counts and digests, runs `gbrain doctor` on the target, and only then flips routing. It works for brains with write history and for managed brains. The PGLite data dir is retained as `<path>.graduated-<run_id>` and a tombstone file takes its place. Walkthrough, recovery by error code, rollback and what stays on this computer: [Move a PGLite brain to Postgres](guides/move-to-postgres.md).
 
 **Say to your agent:** *"Upgrade my brain to Postgres. Show me the plan first."*
 
-The legacy copier handles every other direction: `gbrain migrate --to pglite`, PGLite to Postgres when `gbrain config set migrate.graduation false` opts out of graduation, and history-free brains on Windows. It re-creates pages through `putPage` (chunks, embeddings, links, tags, timeline, facts) and copies config rows minus the engine-local denylist (`MIGRATE_CONFIG_ENGINE_LOCAL_KEYS`: the target-owned `engine`/`version` connection + schema ledger and the physical embedding-column registry keys); skipped keys are printed, never silent, and the run ends with a per-table copied-count summary. It does not carry request IDs, withdrawals, attribution or ownership, so it refuses a managed brain and any brain with durable write history, fact withdrawals or canonical worktree ownership (rows in `persistence_requests`, `fact_withdrawals` or `persistence_worktrees`).
+The legacy copier handles every other direction: `gbrain migrate --to pglite`, PGLite to Postgres when `gbrain config set migrate.graduation false` opts out of graduation, and history-free brains on Windows. It re-creates pages through `putPage` (chunks, embeddings, links, tags, timeline, facts) and copies config rows minus the engine-local denylist (`MIGRATE_CONFIG_ENGINE_LOCAL_KEYS`: the target-owned `engine`/`version` connection + schema ledger and the physical embedding-column registry keys); skipped keys are printed, never silent, and the run ends with a per-table copied-count summary. It forwards the full page row (origin path, kind, provenance, `ingested_at`, aliases, chunk code metadata). Pages the source had sealed are rebuilt on the target before the config flip, without an embedding key, keeping chunk ids and vectors whose input matches. A failed rebuild blocks the flip: the run exits 1 with no error code, prints `The active engine was NOT switched` and the failing pages, and leaves the source engine active; fix them (`gbrain projections drain` on the target) and re-run `gbrain migrate` to resume. Pages the source had not sealed arrive queued, with their verbatim chunks. It does not carry request IDs, withdrawals, attribution or ownership, so it refuses a managed brain and any brain with durable write history, fact withdrawals or canonical worktree ownership (rows in `persistence_requests`, `fact_withdrawals` or `persistence_worktrees`), and a brain with a belief ledger (rows in `belief_events`), which it names.
 
 <a id="engine-migration-refused"></a>**Engine migration refused (`writer_coordinator_required`).** The legacy copier's refusal is an agent-contract envelope whose `fix` names the refusing side; every branch verifies with the read-only `gbrain doctor --no-migrate --json`, and nothing has changed in either datastore:
 
@@ -306,6 +800,8 @@ The legacy copier handles every other direction: `gbrain migrate --to pglite`, P
 | A PGLite brain with history (or a managed one) moving to Postgres with graduation turned off | `ask_user` (consent `egress`) | Relay `user_message`: turn graduation back on (`fix.argv`: `gbrain config unset migrate.graduation`) and preview the move with the read-only plan (`fix.then`: `gbrain migrate --to postgres --url-env GBRAIN_TARGET_URL --plan --json`, then the [two-command flow](guides/move-to-postgres.md#move-the-brain)), or keep it on PGLite and share it through `gbrain mcp expose`. |
 | A Postgres brain moving to PGLite | `report` | The brain stays on Postgres; moving down would drop its history. |
 | A target that already holds persistence history | `tell_user_to_run` | Rerun with an empty database the user provides (`--path` for a PGLite target). |
+
+A brain with page versions but no write history gets the same refusal with `reason: page_history` and the number of versions in the message: the legacy copier re-creates pages without their versions, so the copy would discard them. Graduation (PGLite to Postgres) carries them.
 
 On Windows, a PGLite brain with history gets `graduation_unsupported_platform` instead: it stays on PGLite and is shared with `gbrain mcp expose`.
 
@@ -387,6 +883,154 @@ to connect: it diagnoses the dir from disk, names the repair command, reports
 retained repair backups, and escalates when repairs keep recurring (that
 means the unclean-shutdown genesis is still active — see the ladder's rung 4).
 
+<a id="pglite-live-serve"></a>
+### PGLite while `gbrain serve` runs (`pglite_busy` reason `live_serve`)
+
+One gbrain process opens a PGLite brain at a time. While `gbrain serve` (stdio
+or `--http`) holds it, page and fact writes from the CLI (`gbrain put`,
+`gbrain remember`) go through the running server and work. Commands that need
+the database to themselves, which includes the admin commands
+(`gbrain access …`, `gbrain sources …`, `gbrain auth …`) and most reads,
+refuse with `pglite_busy` reason `live_serve`. The refusal names the server's
+PID, and its fix is two steps: stop that server, then run the command again.
+Never remove the lock of a server that is still running.
+
+On a brain that serves one person this is a short pause: quit the agent
+session (a stdio serve) or stop `gbrain serve --http`, run the command, and
+start it again. On a brain that serves several people over
+`gbrain serve --http`, every member's connection drops while the server is
+stopped, for every admin step. Move such a brain to Postgres, where the server
+and the admin commands run side by side: preview with the read-only
+`gbrain migrate --to postgres --url-env GBRAIN_TARGET_URL --plan --json`,
+then follow [Move a PGLite brain to Postgres](guides/move-to-postgres.md). The
+move carries members, tokens, `readable_by` and facts across.
+`gbrain setup <harness> --serves several` on PGLite says this in its
+`engine` line.
+
+<a id="legacy-pglite-lock"></a>
+### Legacy PGLite lock (`pglite_busy` reason `legacy_owner_unverified`)
+
+A PGLite brain is owned through the stable sibling kernel lock
+`<data-dir>.gbrain-owner.lock`. Brains last opened by an older gbrain may
+still hold that release's lock folder, `<data-dir>/.gbrain-lock/`. The first
+open by a current gbrain removes it automatically only when it can prove the
+old owner is dead: readable metadata with a PID that `kill -0` reports gone
+and, on Linux, the same PID namespace and boot id as this process. A live
+owner keeps the ordinary `pglite_busy` refusal.
+
+When the folder's metadata is torn or missing, records no PID, or (Linux) does
+not prove the PID ran in this namespace since the last boot, waiting never
+helps, so the open refuses `pglite_busy` with reason
+`legacy_owner_unverified` (class consent, exit 3, not retryable). Its fix
+asks the user and starts with the read-only preview; `gbrain doctor` shows
+the same reason and fix on its `connection` check.
+
+1. **Preview.** `gbrain pglite-repair --legacy-lock --dry-run --json [--path <dir>]`
+   never opens the engine and never creates anything. It names the recorded
+   PID, whether `kill -0` says it is running and its command, the processes
+   an open-file scan of `/proc` (Linux) saw holding files under the data dir,
+   and the filesystem type (Linux `statfs`, macOS `df -P` and `mount`), and prints the `plan_hash` and
+   the apply command. This evidence is advisory: it covers only this host and
+   PID namespace and cannot see other containers or other hosts that share the
+   folder.
+2. **Apply, after the user agrees.**
+   `gbrain pglite-repair --legacy-lock --path <dir> --yes --expect <plan_hash>`
+   takes the kernel lock (so no current gbrain can be running), inspects
+   again under it and refuses `legacy_lock_removal_refused` while a process
+   on this host holds the data dir or the recorded PID runs a command that
+   could be gbrain (`live_holder`), or when the data dir is on a network or
+   shared filesystem such as NFS, SMB, 9p, virtiofs or FUSE
+   (`network_filesystem`), or when it cannot confirm the filesystem is local
+   (`filesystem_unverified`: Linux reads `statfs`; macOS reads the mount
+   point from `df -P` and its `mount` line, and counts it local only with
+   the `local` flag and a local type such as apfs or hfs. Other systems, a
+   failed probe, an unrecognised type, a macOS network mount such as smbfs or
+   nfs, and a macOS mount without the `local` flag all refuse). A lock that changed since the preview refuses `preview_changed`.
+   It inspects again after consent, so a holder or change that appears while
+   the prompt waits refuses the same way. Otherwise it moves the folder into
+   `<data-dir>.legacy-lock-removed-<timestamp>/` (nothing is deleted) with a
+   `receipt.json` and the exact restore command (it also puts back the prior
+   `<data-dir>.gbrain-owner.json` bytes, kept as `prior-owner-marker.json`,
+   or removes the new marker when there was none), writes the kernel-v1 marker
+   `<data-dir>.gbrain-owner.json`, and starts the 10-minute WAL-repair
+   quarantine (`<data-dir>.lock-reap.json`). The next ordinary open succeeds.
+
+## Opening an engine from settings (experimental)
+
+`openEngine(settings)` (`src/core/engine-open.ts`, exported as `gbrain/engine-open`) creates and connects an engine
+from one value, for a host that embeds several brains in one process or keeps its settings somewhere other than
+`~/.gbrain`. It is off by default and refuses unless `settings.embedded_core === true` (`embedded_core_required`).
+The CLI, `gbrain serve` and mounts never call it and behave exactly as before.
+
+```ts
+import { openEngine } from 'gbrain/engine-open';
+
+const engine = await openEngine({
+  embedded_core: true,
+  engine: 'postgres',
+  database: { url, directUrl },        // PGLite: { path }, or none for an in-memory brain
+  pool: { max: 4 },                    // this engine's own pool (default 4), never the db.ts singleton
+  host: { id: hostId },                // required UUID: the persistence host identity
+  writer: { id, credential, lane: 'stdio' },
+  embedding: { model: 'voyage:voyage-4', dimensions: 1024 },
+  ai: { providers: { voyage: { apiKey } }, models: { chat } },
+});
+await engine.initSchema();             // the host migrates; a connect never does
+await engine.disconnect();
+```
+
+What the settings decide, with nothing read from a config file, an environment variable, the home directory or the
+working directory:
+
+- **Connection.** The direct (DDL/session) pool uses only
+  `database.directUrl`, or the route a known pooler URL derives; `GBRAIN_DIRECT_DATABASE_URL` is never consulted.
+  Each URL must be one single-host URL naming its host, user and database (`engine_settings_invalid` otherwise).
+  Both pools pass every connection field to the driver (port 5432 when unnamed; no password when the URL has none),
+  so no `PG*` variable picks the server or credentials. The statement-description cache stays in the process
+  instead of `<home>/cache/pg-types` unless a CLI-path pool to the same database shares the process. PGLite skips the
+  `GBRAIN_PGLITE_SNAPSHOT` fast path.
+- **Host identity.** `hostIdFor(engine)` (`src/core/persistence/identity.ts`) answers `host.id` for the engine and
+  everything sharing its `engineKey`; every host-id read in `src/core` goes through it (two CLI-only sites
+  excepted), and for any other engine it is `localHostId()`. No `host.json` is read or minted; no id refuses
+  `engine_host_missing`. The consumer heartbeat records `embedded:<host-id>`, read as identity given at open.
+- **Writer.** An unauthenticated write uses `settings.writer` for its lane (a remote call needs a `stdio` writer, a
+  local one `cli`), registered in `persistence_local_writers` on first use with the default read/write ceiling. An
+  existing registration keeps its own ceiling, another credential or lane under the id refuses `permission_denied`,
+  and a revoked one is never replaced. Engines that make their first write at the same moment register the writer once;
+  a credential already registered under another id refuses `permission_denied`. No `<brain>.<lane>.json` file is read or minted; with no writer for the lane
+  the write refuses `writer_registration_required`.
+- **Embedding identity.** `initSchema()` seeds a fresh brain from `settings.embedding` (else the built-in default),
+  never from the process gateway, and refuses `engine_embedding_mismatch` on a database that records another model
+  or width.
+- **AI gateway.** Embed, chat, expansion and rerank calls use only `settings.ai` (`providers`: id to
+  `{ apiKey, baseUrl }`; `models`: chat, expansion, reranker) and `settings.embedding`, never a `process.env`
+  key, the config file or the process gateway. An unnamed provider refuses `engine_scope_missing` and nothing is
+  sent. Operations, persistence consumers, minion jobs, `POST /mcp`, `hybridSearch` and the import paths enter
+  their engine's scope; wrap any other direct call in `withEngineScope(engine, fn)`. With an embedded engine open,
+  a call in no scope refuses `engine_scope_required`; `withLocalScope(fn)` (the CLI, serve and jobs enter it) uses
+  the process gateway. Batch shrink, no-key and structured-output memory, usage rows and the alias policy are per
+  engine. Query embeddings are cached per engine until close, unless `cache_namespace` (a host's name for
+  one tenant database) keeps them warm; a new key starts cold.
+- **Read back.** `embeddedSettings(engine)` returns a frozen copy with no secrets.
+- **Close.** `disconnect()` closes the engine for good and drops its settings, even while a reconnect is in flight
+  (any pool that reconnect builds is ended). A later `connect()` or `reconnect()` refuses `engine_closed`; call
+  `openEngine` again instead.
+- **Files.** File ops use `settings.storage` (local, or s3 with an endpoint) and its key `prefix`.
+
+Still process-wide: CLI file storage, transcription, the AI call log and timeouts, `GBRAIN_*` tuning variables (pool lifetime,
+connect and session timeouts, `GBRAIN_PREPARE`, `GBRAIN_DIRECT_POOL_SIZE`, `GBRAIN_DISABLE_DIRECT_POOL`,
+`GBRAIN_RLS_SCOPE_BINDING`, the PGLite close watchdog), `PG*` TLS and tuning
+variables, the connection-events audit log, and operation-level
+config reads (content-sanity screening, schema-pack resolution, the embedding switch on publication). None of them
+picks an engine's database, host identity, writer, embedding identity or AI keys. A source with a git checkout keeps its native coordination lock under the
+process's persistence home.
+
+### Upgrading an embedded host
+
+- Unscoped AI calls refuse `engine_scope_required` even after `configureGateway`; wrap them as above.
+- `openEngine` refuses an unknown settings key, top-level or nested (`engine_settings_invalid` names it).
+- `examples/embedded-two-brains.ts` is a two-brain host on package exports only: `bun examples/embedded-two-brains.ts`.
+
 ## Canonical schema sources
 
 Schema DDL text has one hand-edited copy. `bun run build:schema`
@@ -439,8 +1083,13 @@ Worked examples:
    migrations run. If the blob gains an index, FK, trigger or view that references a column an
    older brain may lack, add that column's probe and `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`
    to the forward-reference bootstrap both engines run (`src/core/engine-sql/bootstrap.ts`:
-   probe, gap, DDL). A column only defined in a
+   probe, gap, DDL). A partial index's `WHERE` predicate and `INCLUDE` list count as references (an
+   index filtering on a column a later migration adds wedges the replay). A column only defined in a
    `CREATE TABLE` needs no bootstrap entry. `test/schema-bootstrap-coverage.test.ts` names any gap.
+   The schema-history upgrade tests (`test/schema-history-upgrade.slow.test.ts` on PGLite,
+   `test/e2e/schema-history-upgrade.test.ts` on Postgres) upgrade a stored fresh brain of each release
+   from schema v260 on (`test/fixtures/schema-history/`, written by
+   `scripts/capture-schema-history-fixture.ts`) and compare the result with a fresh install.
 
 ## Engine detection and access repair
 
@@ -534,12 +1183,12 @@ names — reasons may be added, never renamed or removed). All 16:
 | `no_url` | nothing configured at all — `gbrain init --prefer-postgres` (or `gbrain init` for PGLite) |
 | `env_shadowed` | a cwd-.env `DATABASE_URL` exists but the cwd-.env guard excludes it — export `GBRAIN_DATABASE_URL` |
 | `auth_failed` | password/role rejected (28P01) — reset credentials, then `gbrain init --url <conn>` |
-| `permission_denied` | 28000/42501 — the role lacks a GRANT or hits RLS |
+| `permission_denied` | 28000/42501 — the role lacks a GRANT or hits RLS; a 42501 whose message starts with a writer code (`writer_coordinator_required:`, `writer_upgrade_required:`, `writer_not_quiesced:`, `unsupported_mutation_protocol:`) is a persistence protocol guard's refusal ([write refusals](guides/write-refusals.md#protocol-guard)) |
 | `tenant_not_found` | Supavisor rejected the tenant — pooler usernames are `postgres.<project-ref>`; also raised by paused projects |
 | `ssl_required` | the server demands SSL — `?sslmode=require` rewrite (rewrite tier) |
 | `pool_exhausted` | 53300 / session-slot exhaustion — [pool sizing](#pool-sizing) guidance: `export GBRAIN_POOL_SIZE=6` per long-running process, fewer processes |
 | `conn_refused` | ECONNREFUSED — docker-start arm for gbrain's own container; pooler rewrite for Supabase direct URLs |
-| `dns_failed` | ENOTFOUND/EAI_AGAIN — one bounded retry; persistent + Supabase suggests a paused project |
+| `dns_failed` | ENOTFOUND/EAI_AGAIN — one bounded retry; persistent on a Supabase direct host suggests a paused project, while on a Supabase pooler URL it points at this machine's DNS and network (the shared pooler host resolves whatever a project's state) |
 | `network_unreachable` | ENETUNREACH/ETIMEDOUT — often an IPv6-only direct host; session-pooler rewrite |
 | `conn_dropped` | 08xxx / reset mid-connection — transient, bounded reconnect |
 | `server_starting` | "the database system is starting up" — retry shortly |
@@ -547,6 +1196,7 @@ names — reasons may be added, never renamed or removed). All 16:
 | `schema_missing` | 42P01/42703 — pending migrations (`gbrain apply-migrations --yes`; excluded from the db-repair marker on the MCP mid-operation path, where it usually means code skew) |
 | `pgvector_missing` | the vector extension is absent — auto tier creates it |
 | `storage_corrupt` | XX001/XX002, or an XX000 such as `unexpected chunk number … for toast value` or `tuple concurrently deleted` — stored data is damaged; db-repair stops at manual and names the first step, `gbrain repair orphan-children` (preview, includes the torn-TOAST probe; [orphan children](guides/repair.md#orphan-children)) |
+| `tls_required_default` | `postgres_tls_required`: gbrain's TLS default met a non-local server without TLS — db-repair stops at manual; turn TLS on at the server or add `sslmode=disable` ([TLS](#tls-for-postgres-connections)) |
 | `unknown` | unclassified — redacted error + `gbrain doctor` |
 
 The classifier lives in `src/core/pg-access-classify.ts`; remediation copy has
@@ -594,14 +1244,59 @@ Size the pooler for every process at once:
 
 ```
 long-running processes x GBRAIN_POOL_SIZE
-  + processes with GBRAIN_DIRECT_DATABASE_URL x GBRAIN_DIRECT_POOL_SIZE (default 3)
-  + one-shot commands running at the same time x their pool
+  + processes whose direct route lands on this pooler x their direct pool (see below)
+  + one-shot commands running at the same time x their pool (a full `gbrain sync` is one too)
+  + parallel import workers x 2 (an unmanaged sync of more than 100 files, `--workers N`, or the sync a serve runs)
   <= the pooler's client limit (Supabase Supavisor: the project's pool_size)
 ```
+
+The direct route lands on the pooler when `GBRAIN_DIRECT_DATABASE_URL` names it,
+and also when gbrain derives it from a Supabase pooler URL whose user does not
+name the project (`postgres.<ref>`): the derived route keeps the pooler host on
+port 5432, its session port, even when the main URL uses transaction mode
+(6543). Two long-running processes at the
+defaults (10 + 3 each) already pass a client limit of 25, so a scheduled
+`gbrain sync` next to a `gbrain serve` on the same session port can exhaust it.
+`GBRAIN_MAX_CONNECTIONS` caps a sync's worker fan-out to fit a budget.
+
+<a id="direct-pool-by-command"></a>The direct pool's size follows the command.
+`gbrain serve`, `gbrain jobs`, `gbrain autopilot` and `gbrain sync --watch`
+open up to 3 direct connections. A command that exits but owns writes or takes
+a lease (`sync`, `put`, `import`, `dream`, `cycle`, `sources`, `mcp`,
+`migrate-graduation`) and the diagnostics that report the route (`doctor`,
+`engine`) open 1. Every other command routes nothing through the direct pool:
+its statements use the ordinary pool, as with `GBRAIN_DISABLE_DIRECT_POOL=1`.
+Two exceptions keep the direct route for it: applying pending schema
+migrations (one connection, for the session advisory lock and the 30-minute
+statement timeout), and taking a lease such as an embed or extract lock
+(the command then opens 1, so the lease heartbeat keeps its own connection).
+`GBRAIN_DIRECT_POOL_SIZE` still sets the size wherever a direct pool opens.
+`GBRAIN_DIRECT_POOL_BY_COMMAND=0` restores the earlier behavior: every command
+may open the full 3-connection direct pool.
 
 When the sum does not fit, run fewer long-running processes (for example one
 shared `gbrain serve --http` instead of one stdio `serve` per agent session),
 or raise the pooler's limit. Do not lower a long-running process below 6.
+
+`gbrain doctor` check `session_lane_budget` (read-only) counts this role's
+connections in `pg_stat_activity` across every process, by process kind
+(`serve`, `sync`, `jobs`, … from the `gbrain <kind>:<pid>:<nonce>`
+connection name) and host, and warns at 80% of the limit with the kinds
+holding the most. Postgres cannot read a pooler's per-role limit, so behind a
+Supabase pooler set `GBRAIN_SESSION_LANE_LIMIT` to the project's `pool_size`;
+without it the check reports the counts only. Without a pooler the limit is
+`max_connections` less the reserved slots. Behind a pooler the count is an
+upper bound: connections that bypass it (a direct `db.<ref>` host) count too,
+and a transaction pooler's server connections carry its own name, so they are
+counted apart, not attributed to a process.
+
+With a direct route configured, the persistence consumer's own tick
+statements (idle probe, switch read, recovery and expired-claim scans,
+capacity marking) take the direct pool beside the claims, renewals and the
+heartbeat, so a transaction-mode pooler never sits between the owner and its
+bookkeeping (#6317; `gbrain sources writer status --json` shows
+`connection.lane: direct`). `GBRAIN_CONSUMER_DIRECT_LANE=0` keeps those scans
+on the ordinary pool when the direct pool is too small for them.
 `pool_exhausted` errors (SQLSTATE `53300`) and the
 [serve boot timeout](#serve-boot-timeout) print this guidance.
 
@@ -638,6 +1333,213 @@ the operations that preceded them. A pool created with `max: 1` keeps the
 driver's documented single-connection idiom (`BEGIN` as an ordinary query)
 for unreserved statements.
 
+<a id="schema-lock-blocked"></a>**`schema_lock_blocked`** (error, retryable).
+A schema step waited its `lock_timeout` for a table lock another session holds
+and stopped instead of hanging (#5227). `gbrain init` and `upgrade` replay
+`schema.sql` on the reserved DDL backend; every `ALTER TABLE` there takes an
+ACCESS EXCLUSIVE lock even as a no-op, so one open transaction in another
+client (idle in transaction, a stuck job) used to park the whole command in
+`wait_event_type=Lock` with no output. The replay runs under a session-level
+`lock_timeout` on that backend (`GBRAIN_SCHEMA_LOCK_TIMEOUT_SECONDS`, default
+60; the value found before is restored on release, so a pooled backend never
+leaks it), a transaction-wrapped migration binds the same wait with
+`SET LOCAL lock_timeout`, and a `transaction: false` migration sets and
+restores it on its own reserved backend. Handler migrations and the
+post-migration `verifySchema` run outside the bound: they issue their own
+statements (`CREATE INDEX CONCURRENTLY` cannot run in a transaction) and stay
+as they were. While the wait is active a separate one-backend connection
+samples `pg_blocking_pids()` of the waiting backend once, so the refusal names
+the blocking sessions by pid, `application_name`, state and transaction age;
+after the cancel the blocker may already be gone, and the message says when the
+sample came late. Query text is never read or shown. `detail` names the step
+(`replay`, `migration v<N>`). The RLS block skips tables whose
+`relrowsecurity` is already set, so a re-run on a live brain no longer takes
+ACCESS EXCLUSIVE on them. `init` retries a blocked step a few times with a
+short backoff (`init-schema-retry.ts`); a lock that never clears is a bounded
+failure, not a hang. Fix: let the named session finish or, with the user's
+agreement, end it on the database host with `SELECT pg_terminate_backend(<pid>)`,
+then rerun the same command. Test: `test/e2e/init-schema-lock-blocked.test.ts`.
+
+<a id="pg-connection-stuck"></a>**`pg_connection_stuck`** (warn). A pooled
+statement ran past its in-flight budget, either with nothing coming back from
+the server (`reason=idle`) or while bytes kept arriving (`reason=age`, #6543),
+so the vendored driver retired that connection:
+the statement and every statement queued behind it failed with the driver error
+`CONNECTION_STUCK`, the connection left the pool before its socket closed, and
+the pool reconnected on its own (#6383). Usually only a wedged connection
+reaches the budget: a pipeline the client and server no longer agree on, a
+transaction-mode pooler that swallowed a `CancelRequest` and left the backend
+in `ClientRead`, or a dead peer. It is not proof: behind a transaction-mode
+pooler (port 6543) the startup `statement_timeout` never reaches the backend
+(`SHOW statement_timeout` reads `0`; `/health?deep=1` reports it as
+`transport.session_timeouts_not_applied`), so a legitimately slow statement can
+reach the budget too (#6543). The budget is the pool's own startup `statement_timeout` (5 min on
+the read pool, 30 min on the direct pool, `GBRAIN_STATEMENT_TIMEOUT` for the
+read pool) plus `GBRAIN_PG_STUCK_GRACE_MS` (default `30000`); it follows the
+configured timeout even through a pooler that drops the startup parameter, and
+`GBRAIN_PG_STUCK_GRACE_MS=0` or `off` disables the watchdog. Two clocks run
+against it: the idle clock restarts on every byte the server sends, the age
+clock never does, so a statement that keeps streaming rows or notices past the
+budget is retired too. The budget is derived per statement and travels with the
+operation: a statement after a `SET [LOCAL] statement_timeout` or
+`set_config('statement_timeout', …)` on its connection (inside a transaction,
+on a reserved connection, or in the same simple query) gets
+`max(budget, that timeout + grace)`, and a declared `0` (an index build, a bulk
+copy) has no cap. The driver reads the declaration from the statements it
+sends, so it holds behind a transaction-mode pooler that never applies a
+session `SET`; a transaction's `SET LOCAL` ends with it, `RESET` restores the
+pool's budget. An operation that must run longer declares its own timeout that
+way; `GBRAIN_STATEMENT_TIMEOUT` raises it for every read-pool statement. The
+line names the pool, `reason`, `age_ms`, `budget_ms` (that statement's own
+cap), `queued` (statements that failed with it) and the statement by first
+keyword and table (`sql=SELECT_pages`), never its text or parameters. `getPoolDiagnostics().stuckDiscards` counts retirements per
+engine; `/health?deep=1` reports them as `stuck_discards`. Retry the failed
+call; if the line repeats, run `gbrain doctor --json` and report the warn lines
+with the operations that preceded them.
+
+<a id="pg-connection-desync"></a>**`pg_connection_desync`** (warn). A statement's
+answer (columns, rows, a completion, a parse or bind acknowledgement, or a
+statement error) arrived on a pooled connection with no statement waiting for
+it, so the client and the server no longer agreed on which answer belonged to
+which statement. The vendored driver retired that connection, statements
+queued on it failed with a connection error, and the pool reconnected on its
+own. The line names the pool, the message type, the driver's connection id and
+the last statement written on it by first keyword and table, never its text or
+parameters. Notices, notifications and parameter changes never trigger it.
+`getPoolDiagnostics().desyncDiscards` counts retirements per engine;
+`/health?deep=1` reports them as `desync_discards`.
+
+<a id="pg-connection-recovery-failed"></a>**`pg_connection_recovery_failed`**
+(warn). A connection the driver retired after an incident (stuck, desynced, or
+closed under running statements, for example by `pg_terminate_backend` or a
+pooler reap) could not reconnect; statements waiting for it failed with the
+connect error, and the next statement retries. The line names the pool, the
+driver's connection id, the incident (`cause=stuck|desync|closed`) and the
+error code. `getPoolDiagnostics()` counts reconnects of retired connections as
+`recovered` and failures as `recoveryFailed`; `/health?deep=1` reports them as
+`recovered` and `recovery_failed` (#6543). A resident `gbrain serve` writes its
+stuck, desync and recovery events to the pool-recovery audit
+(`~/.gbrain/audit/pool-recovery-YYYY-Www.jsonl`), so
+`gbrain doctor --only pool_reap_health` fails on a recovery failure and warns
+on a stuck or desynced connection in the last hour.
+Retry the failed call; if the line repeats, run `gbrain doctor --json` and
+report the warn lines.
+
+<a id="pg-statement-build-failed"></a>**`pg_statement_build_failed`** (warn). A
+statement could not be built from its parameters (`error=UNDEFINED_VALUE`: a
+parameter was `undefined`; `error=MAX_PARAMETERS_EXCEEDED`: more than 65534
+parameters). It was answered in its place in the pipeline by a query the server
+refuses, so only it failed and a transaction it was part of was aborted rather
+than committed without it. Before #6383 the same failure, when the statement was
+pipelined behind another on its connection, rejected that other statement with
+its error, left the culprit queued with nothing on the wire, and delivered every
+later reply one statement late until the process restarted (the
+`null is not an object (evaluating 'query.statement.types')` line and a backend
+stuck `active / ClientRead` were that desync). The line names the pool and the
+statement by first keyword and table, and an `UNDEFINED_VALUE` line names the
+parameter (`param=$2`, or `param=?` for an array element). Behind a
+transaction-mode pooler (port 6543, `?prepare=false`) a build failure usually
+means a misrouted answer: the statement bound a value read from a row that
+belonged to another statement, so earlier reads on that pool are suspect too.
+Check `/health?deep=1` `transport.max_pipeline` (gbrain sends `0` there since
+v0.60.187.0; `PGMAX_PIPELINE=0` forces it) and audit the window with
+[the pooler misroute audit](guides/pooler-misroute-audit.md). Elsewhere the
+call site that bound `undefined` is a gbrain bug, so report the line.
+`getPoolDiagnostics().buildFailures` counts them.
+
+<a id="pg-pool-stalled"></a>**`pg_pool_stalled`** (warn, resident processes).
+`gbrain serve` reads its pool every 30 s; when connections are checked out or
+statements are waiting for one across two ticks in a row and the pool completed
+no statement in between, it logs this line once per tick with `checked_out`,
+`max`, `waiters`, `inflight_oldest_ms` and `stalled_ms`, and one
+`[gbrain] info code=pg_pool_recovered` line when statements complete again.
+One slow statement is one quiet tick and is never reported. With the in-flight
+watchdog on, a stall ends within `statement_timeout` plus grace and
+`pg_connection_stuck` names the connection; with the watchdog off this line is
+the only trace a wedged pool leaves. A line that keeps repeating with no
+recovery means the database or pooler is unreachable from the process:
+`gbrain doctor --json` from a fresh process, then restart the stalled one.
+
+<a id="serve-deep-health"></a>**`/health?deep=1`** (`gbrain serve --http`). Plain `/health` stays the fast
+liveness probe, and it runs its `SELECT 1` on a reserved connection, which the
+driver only ever claims from idle connections; a wedged connection sits in the
+busy queue where handler statements are routed, so `/health` answered 200
+through the whole #6383 incident. `/health?deep=1` runs `SELECT 1` through the
+ordinary pooled dispatch (no reservation, 3 s budget) and answers 503 when the
+probe does not return in time, when a pooled statement is past its own
+in-flight budget (the same per-statement budget the watchdog retires at, so a
+transaction that declared a longer `statement_timeout` is measured against it;
+the block's `inflight_over_budget_ms`), or when an earlier deep probe is still pending (one
+deep probe per engine at a time). Its body carries the pool block:
+`{ checked_out, max, waiters, inflight_oldest_ms, completed, poisoned_discards,
+stuck_discards, build_failures, desync_discards, recovered, recovery_failed }`. It is cheap enough for a two-minute cron. The
+same pool numbers ride the persistence consumer's heartbeat row, so
+`gbrain sources writer status --json` shows `pool.inflight_oldest_ms` for the
+owner process.
+
+Every 503 body carries a stable `code` with `fix` and `docs` from the error
+registry (#6543):
+
+- `persistence_restart_required`: this serve's persistence consumer reports
+  `restart_required` (an abandoned preparation or a publication past its
+  deadline), so it claims no write until the process restarts. Restart serve.
+- `pool_inflight_over_budget`: a pooled statement has run past its own
+  in-flight budget without being retired (the watchdog is off, or the serve
+  runs a driver without per-statement budgets). Restart serve; behind a transaction-mode pooler read
+  `transport` first and set `PGMAX_PIPELINE=0` if `max_pipeline` is not `0`.
+  No request id or statement text reaches either body: the endpoint is
+  unauthenticated.
+- `deep_health_probe_failed` with `reason` `pending`, `timeout` or `error`: the
+  pooled `SELECT 1` did not answer. Retry; if it persists, `gbrain doctor --json`.
+
+Both 200 and 503 bodies carry `transport`, read once at startup through the
+read pool and logged as a `[gbrain serve] transport` line:
+`{ pooler_mode, prepare, max_pipeline, max_pipeline_reason, statement_timeout,
+session_timeouts_not_applied, fix?, application_name? }`. `prepare` and
+`max_pipeline` are the live pool's options; `max_pipeline_reason` says why
+(`transaction_pooler_port`, `url_prepare_false`, `gbrain_prepare_off`,
+`url_max_pipeline`, `env_pgmax_pipeline` or `default`): gbrain builds the read
+pools with `max_pipeline: 0` for a transaction-mode URL (port 6543 or
+`?prepare=false`) or `GBRAIN_PREPARE=0` since v0.60.187.0, and a URL
+`?max_pipeline=` or a non-empty `PGMAX_PIPELINE` always wins.
+PgBouncer in transaction mode carries pipelined statements correctly, so a
+PgBouncer deployment on port 6543 or with `?prepare=false` can opt back in with
+`?max_pipeline=100`: on a 3-connection pool with 8 concurrent workers at about
+40 ms round trip, pipelining off measured about 37% fewer statements per second
+(1185 vs 1890 in 30 s); at localhost latency there was no measurable cost. Do
+not opt back in behind Supavisor.
+`application_name: "Supavisor"` appears when the backend names Supavisor.
+`session_timeouts_not_applied: true` means gbrain configured a
+`statement_timeout` but it reads `0` through the pool (a transaction-mode
+pooler drops startup parameters), so no server-side timeout bounds an
+autocommit statement; `fix` is the same `ALTER ROLE` the
+doctor's `persistence_session_timeouts` check prints
+([troubleshooting](guides/troubleshooting.md#session-timeouts-not-applied)).
+The endpoint is unauthenticated, so it only reports: it never retires a
+connection or restarts anything.
+
+<a id="serve-unhealthy-exit"></a>To let a supervisor recover a wedged serve
+without a human, set `GBRAIN_SERVE_RESTART_REQUIRED_EXIT_SECONDS=<n>` (off by default;
+`n` must be a whole number of at least `120`, and a smaller value refuses to
+start with `invalid_params`). When `persistence_restart_required` has held
+continuously for `n` seconds (read in-process; the hold restarts whenever the
+stuck work settles and the flag clears), serve logs
+`[gbrain serve] error code=serve_unhealthy_exit cause=persistence_restart_required`,
+disconnects under a 5 s deadline (the consumer's stop waits on the stuck work,
+so the exit never depends on it draining) and exits `69`.
+`pool_inflight_over_budget` never triggers the exit (the variable is named for
+its one trigger): restart serve yourself or from your health check. A loop
+guard records each self-exit in `serve-self-exit.json` under the gbrain home;
+after 3 self-exits within an hour serve stops exiting, logs
+`serve_self_exit_suppressed`, and the deep-health 503 carries
+`self_exit_suppressed: true` with a fix that asks for a manual restart and a
+look at `gbrain sources writer status --json`.
+The service `gbrain mcp expose` installs restarts it (systemd `Restart=always`,
+launchd `KeepAlive`), so a fresh serve comes up; the floor keeps a restart loop
+under the systemd unit's start limit (10 starts per 300 s). For the installed service put the variable
+in `~/.gbrain/env`; for a foreground serve set it in the shell or your own
+supervisor's environment. A foreground serve with no supervisor just exits.
+
 <a id="backfill-rollback-failed"></a>**`backfill_rollback_failed`** (error).
 A `gbrain backfill` batch failed, and its `ROLLBACK` failed too. The run stops
 rather than retrying on a connection whose transaction state is unknown; the
@@ -646,23 +1548,88 @@ checkpoint did not advance. The message names both errors (redacted, at most
 200 characters each). Fix the cause they name, then run
 `gbrain backfill <kind> --resume`.
 
+<a id="backfill-commit-indeterminate"></a>**`backfill_commit_indeterminate`** (error).
+A `gbrain backfill` batch sent its `COMMIT` and got no verdict from the
+server (for example the connection dropped), so the batch may or may not have
+committed. The run stops without bisecting or skipping anything, and the
+checkpoint stays before the batch. Run `gbrain backfill <kind> --resume`:
+rows that did commit no longer match the backfill and are not redone.
+
+<a id="backfill-skipped-rows"></a>**Skipped backfill rows.** A row whose compute
+or UPDATE fails on its own (a CHECK or type violation, a compute error) is
+isolated by splitting its batch, each part in its own transaction, and recorded
+in the config key `backfill.<kind>.skipped`; the checkpoint moves past it and
+the other rows land. `gbrain backfill <kind>` prints each recorded row with
+its code and the retry command, and every later run retries it first. A row
+that fails with the same content error on 3 consecutive runs (same row, same
+gbrain version) is held: it is reported but not retried until the row or the
+gbrain version changes; `gbrain backfill <kind> --fresh` retries it now. When
+most rows of a run fail, the run stops with `item_failures_systemic` and keeps
+the skip record and checkpoint it began with.
+
 <a id="persistence-consumer-log"></a>**`[persistence] phase=<phase> reason=<code>`**
 (stderr). The resident write consumer could not finish a phase. `reason` is
 the SQLSTATE (for example `53300` when a pooler's client limit is reached),
 a write-error code, `storage_error`, or `deadline_exceeded` when the phase
 overran its five-second budget. `message` is the redacted error text, one line,
-at most 200 characters. Connection-wait evidence follows on Postgres:
+at most 200 characters. When an unexpected exception in the owner failed a
+write (`storage_error` with a generic public message; the class and frame stay owner-only),
+the line also carries `class=`, `errno=` and `frame=` (the top gbrain source
+frame, repo-relative, for example `src/core/persistence/page-prepare.ts:120`):
+the owner diagnostics the receipt points at. For a database server error it
+adds `error_text=`, `statement=` and `position=` (#7112): the server's primary
+message with every quoted value replaced by `…` (an object name such as a
+column, a relation or the token a syntax error stopped at is kept), the first
+line of the failing statement with its literals replaced, never its
+parameters, and the error's character position. A PL/pgSQL `RAISE` keeps no
+text, because it can carry page values. The stored receipt keeps the same
+identifiers (never an application error's message) owner-side in `error_detail`, with the
+build that ran the attempt; on the brain host `gbrain write-request <id> --json`
+prints that `error_detail`, and names an owner on another build than the CLI
+(`owner_build`) and the restart to run. Connection-wait evidence follows on Postgres:
 `first_conn_ms` is the time from phase start until the phase obtained a
 connection; `checkout=not_observed conn_wait_ms=<n>` means it had not obtained
 one after `n` milliseconds (a saturated pool or pooler, not a slow query); and
 `loop_lag_ms` is the longest event-loop delay during the phase (a busy or
 starved process). The same fields appear in the consumer's status snapshot
-under `phase`. Unfinished work stays tracked and is retried; nothing is lost. Run `gbrain sources writer status --json` to see what is waiting. The
+under `phase`. Unfinished work stays tracked and is retried; nothing is lost. Run `gbrain sources writer status --json` to see what is waiting.
+A `deadline_exceeded` phase is also how a round-trip a transaction-mode pooler
+(Supavisor port 6543, PgBouncer) never completed ends: the backend sits in
+`ClientRead`, the cancel request the deadline sends may never reach it, so
+`GBRAIN_CANCEL_SETTLE_MS` (default 2000) after the cancel the owner discards
+that reserved connection, the statement settles client-side, and the next tick
+runs. The connection end is not reported as `storage_error`; doctor's
+`persistence_session_timeouts` names a transaction-mode URL, and the
+session-mode URL of the same pooler (Supabase: port 5432) avoids the class.
+`phase=preparation` lines name a write whose preparation ran past its budget:
+`reason=deadline_exceeded` (the claim is released with `blocked_reason`
+`preparation_deadline` and one attempt is counted; the budget is
+`persistence.sync_preparation_ms` for a managed sync member,
+`persistence.maintenance_preparation_ms` for every other managed kind and 30 s
+for `remember`, `put_page` and `edit_page`), `reason=preparation_stalled` (the
+request reached `persistence.max_preparation_attempts` and was finished
+`failed` instead of being claimed again) and `reason=ceiling_exceeded` (the
+preparation ignored cancellation past `persistence.preparation_ceiling_ms`; the
+message names the step and what it waited on, and ends `restart_required` when
+this process holds as many such preparations as it tolerates and has stopped
+claiming). The runbook is
+[catch-up stuck](guides/troubleshooting.md#catch-up-stuck). The
 line is rate-limited (one per second, one per phase and code every 30 seconds).
 An idle consumer keeps one ordinary-pool connection for its work probe and
 never holds a direct or session-pooler connection, so a
 `GBRAIN_DIRECT_DATABASE_URL` that points at a session pooler is not pinned by
 idle `gbrain serve` processes.
+
+<a id="persistence-claim-phase"></a>**Claim phases.** Each claim renewal also records the claimed write's phase
+(`preparing` or `publishing`); `gbrain sources writer status --json` shows it as
+`claim` on running blockers, and doctor `persistence_write_stall` warns past
+`persistence.max_claim_ms` (default 600000, 60000 to 86400000). A running
+claim also carries the preparation `step`, how long it has been in it, what it
+waits on (`git`, `fs`, `db`, `pool` or `unknown`) and the owner process (kind,
+pid, gbrain version); past its budget, `claim.stall` reads
+`preparation_overdue`. Each request counts the cut-offs of its preparation in
+`persistence_requests.preparation_attempts`. See
+[troubleshooting](guides/troubleshooting.md#persistence-write-stall).
 
 ## JSONB writes: never double-encode
 
@@ -698,27 +1665,122 @@ The real backstop is `test/e2e/op-checkpoint-jsonb-parity.test.ts` +
 `test/e2e/jsonb-roundtrip.test.ts`, which round-trip writes through real Postgres
 and assert `jsonb_typeof` — the assertion PGLite cannot make.
 
+## The Rust engine shell
+
+The opt-in Rust engine (`docs/designs/RUST_ENGINE.md`) is under construction. PGLite and Postgres behave exactly
+as before, and an install needs no Rust toolchain and no addon. `openRustEngine({ addon, databasePath })`
+(`src/core/rust-engine.ts`) is the one seam: the addon loader calls it after it has loaded and verified the native
+addon, and gets back the engine: every `BrainEngine` member, with `kind` `'rust'`. `BrainEngine.kind` admits `'rust'`
+when the `rust` config value lands; no config value selects the Rust engine yet. Finding, checking and loading the
+addon, and refusing a missing or mismatched one, belong to the loader (below), not the shell.
+
+- **Capabilities.** The engine reports a capability only when it serves every `BrainEngine` member of that
+  capability (`src/core/rust-engine/store-capabilities.ts`). Today that is `config`, `sources`, `tags` and `schema`.
+  Each member it does not serve refuses `engine_capability_missing` with the capability as `reason` (`raw_sql`,
+  `pages`, `search`, ...), the member in `detail`, and `written=nothing`, before any work.
+  `src/core/rust-engine/members.ts` maps every member to its capability; the type fails when a new `BrainEngine`
+  member is not classified. What each capability still lacks is under "What a Rust brain serves now".
+- **SQL-only paths.** Code that only works through SQL (migrations, cycle locks, engine migration and graduation,
+  embed backfill, page-body staging) takes the kind as `EngineKind`, narrows it with `sqlEngineKind` or
+  `isRustEngineKind` (`src/core/sql-engine-kind.ts`), and refuses a Rust brain with `engine_capability_missing` reason `raw_sql` instead of treating it as Postgres.
+- **The addon loader.** `loadRustEngineAddon()` (`src/core/rust-engine/addon-loader.ts`) returns the loaded addon,
+  or the refusal `rust_engine_addon_missing` or `rust_engine_addon_mismatch` with its `reason` (`gbrain errors
+  <code>`), before the brain is touched. It uses `GBRAIN_RUST_ENGINE_ADDON` (an absolute path to a build from `bun run
+  rust:build`; it skips only the release checksum pin) first, then an addon cached at
+  `<gbrain home>/engines/rust/<engine_build>/<target>.node` whose SHA-256 equals the cached manifest of this gbrain
+  version. It never reaches the network and writes nothing: with no cached addon it refuses with reason
+  `not_installed`, and a cached file that fails a check stays as it was. Fetching the release's addon into that cache
+  arrives with the capability gate. Only the Rust engine's open path may import the loader, lazily, so a PGLite or
+  Postgres brain never loads the addon or creates `<gbrain home>/engines/`.
+- **Shared memory.** The addon refuses a typed array whose buffer the runtime (`napi_is_arraybuffer`) does not call a
+  plain `ArrayBuffer`, so a `SharedArrayBuffer` view is refused with `InvalidArg` however JavaScript globals or
+  prototypes have been changed (`rust/README.md`).
+
+### What a Rust brain serves now
+
+`connect()` opens the brain directory through the addon's store (`rust/README.md`, "The brain store") and
+`disconnect()` closes it. A second engine on a directory that is open refuses `rust_store_locked`; a directory the
+store cannot read refuses `rust_store_unreadable` with its reason (`gbrain errors <code>`). A served member on an engine
+that is not connected refuses `engine_closed`. These members run on the store (`src/core/rust-engine/store-members/`):
+
+- Config, sources and tags: `getConfig`, `setConfig`, `unsetConfig`, `listConfigKeys`, `getAllConfig`,
+  `getConfigValues`, `listAllSources`, `updateSourceConfig`, `getSource`, `listSourceLocalPaths`,
+  `getSourceStrictness`, `addTag`, `removeTag`, `getTags`, `pruneFrontmatterTags`, `addPageTagsById`. These are the
+  members that make the `config`, `sources`, `tags` and `schema` capabilities complete. The store keeps each tag's
+  claim (`added` or `frontmatter`) as PGLite's `tags.tag_source` does, so an import prune removes only the tags the
+  import claimed. `getSource` reads `last_commit`, `contextual_retrieval_mode` and `trust_frontmatter_overrides` as
+  null, null and false: only the sync anchor and source admin SQL write those columns, and neither runs on a Rust brain.
+- Pages: `getPage`, `readPageSnapshot`, `putPage`, `deletePage`, `softDeletePage`, `restorePage`, `listPages`,
+  `resolveSlugs`. A stale `expectedRevision` refuses with `PageRevisionConflictError`, as on PGLite.
+- Versions, chunks, keyword search, links, graph and timeline: `createVersion`, `getVersions`, `upsertChunks`,
+  `sealChunks`, `getChunks`, `deleteChunks`, `searchKeyword`, `addLink`, `addLinksBatch`, `removeLink`, `getLinks`,
+  `getBacklinks`, `traverseGraph`, `traversePaths`, `traversePathsDetailed`, `addTimelineEntry`,
+  `addTimelineEntriesBatch`, `getTimeline`. These capabilities stay unreported, because other members of the same
+  capability (`revertToVersion`, `getChunkPage`, `searchTitles`, `getBacklinkCounts`, `getTimelineForDate`, ...) still refuse.
+- Segmented pages (a page over 1 MiB, stored in segments): `allocateBodyOccurrenceIds`, `stageSegmentTexts`,
+  `readSegmentTexts`, `stageManifestRows`, `readManifest`, `stageSegmentChunks`, `createSegmentedPageShell`,
+  `flipBodyGeneration`, `openBodyStaging`, `setBodyStagingState`, `readSegmentDerivations`, `upsertSegmentDerivations`,
+  `retireSegmentDerivations`, `sealSegmentedPage` and `refreshPageBody`. `sweepSegments` still refuses, and so does
+  a segmented page written inside `transaction` (the store has none), so the `page_body` capability stays unreported.
+  A whole-body `putPage` over a segmented page refuses, as on PGLite (`rust/docs/store/page_body.md`).
+
+A served member never drops what it cannot keep. An option or input the store has no home for, or cannot answer the
+way PGLite does, refuses `engine_capability_missing` and writes nothing. These are refused today:
+
+- a chunk that carries a vector or an image vector, and a Rust brain whose config sets `search_embedding_column` or
+  `embedding_columns` (the store keeps no vectors yet, so a Rust brain has no vector search and no embeddings until it
+  does; this arrives later);
+- a `putPage` with a `source_path` into a source in source-root slug mode whose directory is below its repository root
+  (only the files on disk can say whether another page already holds that file, and the store cannot read them);
+- `listPages` with `listColumnsOnly`;
+- `resolveSlugs` when no live page has exactly that slug, because PGLite goes on to a fuzzy title match the store does
+  not have, so an empty answer would be wrong to give;
+- a `getChunks` over more than one distinct `sourceIds` entry, a read of unsealed chunks or embeddings;
+- a keyword search with an offset, `where` or a date window, and a link batch that sets a link kind or resolution.
+
+A `putPage` that carries a `source_path` keeps it, and refuses `page_identity_changed` (detail
+`origin_already_claimed`) when another live page of the same source already records that path, as PGLite does.
+
+What the Rust members do the way PGLite does: `putPage` writes the page alone. It does not chunk and does not seal,
+and `upsertChunks` does not seal either; only `sealChunks` replaces the chunks outright and seals them to the page's
+revision, so a page is searchable only after `sealChunks`. `getChunks` returns `[]` for a page that is not sealed at its
+current revision. `deletePage` hard-deletes from the default source. `softDeletePage` and `restorePage` with no
+`sourceId` act on every source. Slugs are matched as written. A cancelled `AbortSignal` stops `upsertChunks`,
+`addLinksBatch` and `addTimelineEntriesBatch` before anything is written, but a write already running in the native
+store cannot be cancelled, which is a difference from PGLite. Overlapping `connect()` calls share one open, and a
+`disconnect()` during a connect wins: the connect rejects `engine_closed` and the store it opened is closed.
+
+A scope that names no source (an empty string `sourceId` or `sourceIds` entry) is never widened: `getChunks` and `getTags` answer it as PGLite does, with nothing, instead of reading every source. A keyword hit always carries `effective_date` and `effective_date_source`, null when the page has no date.
+
+Keyword search hides what PGLite hides: soft-deleted pages, archived sources, pages that carry a `quarantine` or
+`pinned_question` frontmatter key, whatever its value, and the slug prefixes `test/`, `attachments/` and `.raw/` plus any
+that `GBRAIN_SEARCH_EXCLUDE` names (`include_slug_prefixes` opts back in). Ranking-only options of `searchKeyword` are accepted and
+ignored, because Rust ranks with BM25 and this is not parity with PGLite (design D5). Its scores and tie order differ
+from PGLite's. The expected difference is listed in `test/rust-expected-divergence/` (one file per family).
+
+The parity suite checks this: with `GBRAIN_TEST_RUST_ARM=1` each `test/engine-parity/` file adds a Rust arm. A case that
+reaches a member or an option Rust refuses must end on that typed refusal (a refusal the case caught on the way to
+another outcome does not count); any other case must return what PGLite returns, or differ only as its row in
+`test/rust-expected-divergence/` (one file per family) names with a normaliser, and Rust must still return a value (a thrown error never
+passes, and a row that stops being true fails the run). The suite
+runs on PGLite alone without the flag.
+
+**Transactions and the belief ledger.** Both stay refused on the Rust engine, on purpose.
+
+- `transaction`, `transactionDirect` and `lockPageKeys` refuse `transactions`. The store makes each write atomic on
+  its own, but it has no handle that spans several calls, and `lockPageKeys` throws outside a transaction on PGLite, so
+  there is nothing for it to hold. Code that passes settings into a transaction (the write attribution, trust and
+  maintenance settings in `src/core/persistence/context.ts`) does it with `set_config` and `current_setting` through
+  `tx.executeRaw`, which needs SQL. A Rust transaction would carry those values on a typed context instead.
+- `belief_ledger` is a subsystem, not a `BrainEngine` member: `src/core/belief/` appends and reads belief events through
+  `executeRaw`. The Rust engine never reports `raw_sql` (design D18), so the ledger refuses until its reads and appends
+  have typed members. Nothing in the Rust engine writes belief events today.
+
 ## Adding a new engine
 
 1. Create `src/core/<name>-engine.ts` implementing `BrainEngine`
-2. Add to engine factory in `src/core/engine-factory.ts`:
-   ```typescript
-   export async function createEngine(config: EngineConfig): Promise<BrainEngine> {
-     switch (config.engine || 'postgres') {
-       case 'pglite': {
-         const { PGLiteEngine } = await import('./pglite-engine.ts');
-         return new PGLiteEngine();
-       }
-       case 'myengine': {
-         const { MyEngine } = await import('./my-engine.ts');
-         return new MyEngine();
-       }
-       // ...
-     }
-   }
-   ```
-   The factory uses dynamic imports so an engine's dependencies (e.g. the
-   PGLite WASM blob) are only loaded when that engine is selected.
+2. Add a case to `constructEngine` in `src/core/engine-construct.ts`, which `createEngine` and `openEngine`
+   both build through. Its dynamic imports load an engine's dependencies (the PGLite WASM blob) only when selected.
 3. If the engine speaks the Postgres dialect, add a dialect adapter that
    implements `SqlExecutor` (`src/core/engine-sql/executor.ts`) beside
    `dialect-pglite.ts` and `dialect-postgres.ts`, expose it through a private
@@ -727,7 +1789,9 @@ and assert `jsonb_typeof` — the assertion PGLite cannot make.
    engines do. Declare its capabilities honestly. The binding matrix
    (`test/helpers/executor-binding-matrix.ts`) and the engine-sql contract
    tests tell you whether the adapter binds, counts, fails and cancels like the
-   others. A non-SQL engine implements every method itself.
+   others. A non-SQL engine implements typed methods instead of a `SqlExecutor`:
+   it declares no `raw_sql` capability, and each member it cannot serve yet
+   refuses `engine_capability_missing` (see "The Rust engine shell" above).
 4. Store engine type in `~/.gbrain/config.json`: `{ "engine": "myengine", ... }`
 5. Add tests. The test suite should be engine-agnostic where possible... same test cases, different engine constructor.
 6. Document in this file + add a design doc in `docs/`
@@ -754,7 +1818,7 @@ Every method in `BrainEngine`. The full interface. No optional methods, no featu
 | Keyword search | tsvector + ts_rank | tsvector + ts_rank | Identical (real Postgres) |
 | Vector search | pgvector HNSW | pgvector HNSW | Same operators; bounded fallback/cancellation differs |
 | Fuzzy slug | pg_trgm | pg_trgm | Identical (real Postgres) |
-| Graph traversal | Recursive CTE | Recursive CTE | Same SQL |
+| Graph traversal | Breadth-first recursive CTE (one row per layer) | Breadth-first recursive CTE (one row per layer) | Same SQL |
 | Transactions | Full ACID | Full ACID | Both support this |
 | JSONB queries | GIN index | GIN index | Identical |
 | Concurrent access | Connection pooling | Single process | PGLite limitation |
@@ -763,10 +1827,6 @@ Every method in `BrainEngine`. The full interface. No optional methods, no featu
 
 ## Future engine ideas
 
-**TursoEngine.** libSQL (SQLite fork) with embedded replicas and HTTP edge access. Would give SQLite's simplicity with cloud sync. Interesting for mobile/edge use cases.
-
-**DuckDBEngine.** Analytical workloads. Bulk exports, embedding analysis, brain-wide statistics. Not for OLTP. Could be a secondary engine for analytics alongside Postgres for operations.
-
-**Custom/Remote.** The interface is clean enough that someone could build an engine backed by any storage: Firestore, DynamoDB, a REST API, even a flat file system. The interface doesn't assume SQL.
-
-Note: there is no SQLite engine. PGLite uses the same SQL as Postgres, so no separate SQLite dialect with FTS5/sqlite-vss translation is needed.
+TursoEngine (libSQL with embedded replicas and edge sync), DuckDBEngine (analytics and bulk exports beside
+Postgres, not OLTP) and custom engines over any store: the interface assumes no SQL. There is no SQLite engine;
+PGLite speaks Postgres SQL, so no FTS5/sqlite-vss dialect is needed.

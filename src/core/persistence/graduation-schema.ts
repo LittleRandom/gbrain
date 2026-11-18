@@ -39,7 +39,7 @@ CREATE TABLE IF NOT EXISTS persistence_graduation (
   created_at timestamptz NOT NULL DEFAULT now(),
   updated_at timestamptz NOT NULL DEFAULT now()
 );
-CREATE OR REPLACE FUNCTION gbrain_graduation_fence() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public AS $fence$
+CREATE OR REPLACE FUNCTION gbrain_graduation_fence() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public, pg_temp AS $fence$
 DECLARE fence_run text;
 BEGIN
   SELECT run_id::text INTO fence_run FROM persistence_graduation WHERE singleton = 1;
@@ -74,8 +74,21 @@ function parseJson<T>(value: unknown): T | null {
   return value as T;
 }
 
-export async function graduationTablePresent(engine: BrainEngine): Promise<boolean> {
+/**
+ * Engines (their root, never a transaction clone) whose database is known to have the table; an absence is never
+ * kept. Only writer admission reads it (`cached`): a database that admits writes has the persistence schema, while
+ * a graduation target engine can be pointed at a database that does not have the table yet.
+ */
+const tablePresent = new WeakSet<object>();
+function rootEngine(engine: object): object {
+  let root = engine;
+  while (Object.hasOwn(root, '_pageTransaction')) root = Object.getPrototypeOf(root);
+  return root;
+}
+export async function graduationTablePresent(engine: BrainEngine, opts: { cached?: boolean } = {}): Promise<boolean> {
+  if (opts.cached && tablePresent.has(rootEngine(engine))) return true;
   const [row] = await engine.executeRaw<{ present: boolean }>(`SELECT to_regclass('persistence_graduation') IS NOT NULL AS present`);
+  if (row?.present === true) tablePresent.add(rootEngine(engine));
   return row?.present === true;
 }
 
@@ -102,6 +115,30 @@ export async function readGraduationRow(engine: BrainEngine, opts: { forUpdate?:
     doctor: parseJson(row.doctor),
     rollback: parseJson(row.rollback),
     graduated_at: (row.graduated_at as string | null) ?? null,
+  };
+}
+
+/**
+ * The connect gate's read of the custody row in one statement (#7147): every CLI call pays this read before its
+ * work, so it reads the row directly and treats only an undefined table (42P01, a brain before the migration) as "no
+ * row" instead of probing for the table first. Outside a transaction only: a failed statement would abort one.
+ */
+export async function readGraduationConnectRow(engine: BrainEngine): Promise<Pick<GraduationRow, 'role' | 'run_id' | 'state' | 'source_data_dir'> | null> {
+  let row: Record<string, unknown> | undefined;
+  try {
+    [row] = await engine.executeRaw<Record<string, unknown>>(
+      `SELECT role, run_id::text AS run_id, state, source_data_dir FROM persistence_graduation WHERE singleton = 1`);
+  } catch (error) {
+    if ((error as { code?: unknown } | null)?.code === '42P01') return null;
+    throw error;
+  }
+  tablePresent.add(rootEngine(engine));
+  if (!row) return null;
+  return {
+    role: row.role as GraduationRow['role'],
+    run_id: String(row.run_id),
+    state: row.state as GraduationRow['state'],
+    source_data_dir: (row.source_data_dir as string | null) ?? null,
   };
 }
 

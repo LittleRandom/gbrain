@@ -4,7 +4,7 @@
       "argv": "takes list",
       "exitCode": 1,
       "stderr": [
-        "Error [unavailable]: OAuth discovery failed: OAuth discovery network error: Unable to connect. Is the computer able to access the url?",
+        "Error [unavailable]: OAuth discovery failed: OAuth discovery network error: ECONNREFUSED: Unable to connect. Is the computer able to access the url?",
         "Fix: gbrain remote doctor",
         "Docs: https://github.com/garrytan/gbrain/blob/master/docs/guides/error-codes.md#unavailable"
       ],
@@ -34,7 +34,7 @@
       "argv": "cache stats",
       "exitCode": 1,
       "stderr": [
-        "Error [unavailable]: OAuth discovery failed: OAuth discovery network error: Unable to connect. Is the computer able to access the url?",
+        "Error [unavailable]: OAuth discovery failed: OAuth discovery network error: ECONNREFUSED: Unable to connect. Is the computer able to access the url?",
         "Fix: gbrain remote doctor",
         "Docs: https://github.com/garrytan/gbrain/blob/master/docs/guides/error-codes.md#unavailable"
       ],
@@ -55,7 +55,7 @@
       "argv": "quarantine list",
       "exitCode": 1,
       "stderr": [
-        "Error [unavailable]: OAuth discovery failed: OAuth discovery network error: Unable to connect. Is the computer able to access the url?",
+        "Error [unavailable]: OAuth discovery failed: OAuth discovery network error: ECONNREFUSED: Unable to connect. Is the computer able to access the url?",
         "Fix: gbrain remote doctor",
         "Docs: https://github.com/garrytan/gbrain/blob/master/docs/guides/error-codes.md#unavailable"
       ],
@@ -76,7 +76,7 @@
       "argv": "jobs list",
       "exitCode": 1,
       "stderr": [
-        "Error [unavailable]: OAuth discovery failed: OAuth discovery network error: Unable to connect. Is the computer able to access the url?",
+        "Error [unavailable]: OAuth discovery failed: OAuth discovery network error: ECONNREFUSED: Unable to connect. Is the computer able to access the url?",
         "Fix: gbrain remote doctor",
         "Docs: https://github.com/garrytan/gbrain/blob/master/docs/guides/error-codes.md#unavailable"
       ],
@@ -86,7 +86,7 @@
       "argv": "jobs get 1",
       "exitCode": 1,
       "stderr": [
-        "Error [unavailable]: OAuth discovery failed: OAuth discovery network error: Unable to connect. Is the computer able to access the url?",
+        "Error [unavailable]: OAuth discovery failed: OAuth discovery network error: ECONNREFUSED: Unable to connect. Is the computer able to access the url?",
         "Fix: gbrain remote doctor",
         "Docs: https://github.com/garrytan/gbrain/blob/master/docs/guides/error-codes.md#unavailable"
       ],
@@ -96,7 +96,7 @@
       "argv": "jobs stats",
       "exitCode": 1,
       "stderr": [
-        "Error [unavailable]: OAuth discovery failed: OAuth discovery network error: Unable to connect. Is the computer able to access the url?",
+        "Error [unavailable]: OAuth discovery failed: OAuth discovery network error: ECONNREFUSED: Unable to connect. Is the computer able to access the url?",
         "Fix: gbrain remote doctor",
         "Docs: https://github.com/garrytan/gbrain/blob/master/docs/guides/error-codes.md#unavailable"
       ],
@@ -117,7 +117,7 @@
       "argv": "search modes",
       "exitCode": 1,
       "stderr": [
-        "Error [unavailable]: OAuth discovery failed: OAuth discovery network error: Unable to connect. Is the computer able to access the url?",
+        "Error [unavailable]: OAuth discovery failed: OAuth discovery network error: ECONNREFUSED: Unable to connect. Is the computer able to access the url?",
         "Fix: gbrain remote doctor",
         "Docs: https://github.com/garrytan/gbrain/blob/master/docs/guides/error-codes.md#unavailable"
       ],
@@ -160,7 +160,7 @@
       "argv": "capture hello",
       "exitCode": 1,
       "stderr": [
-        "Error [unavailable]: OAuth discovery failed: OAuth discovery network error: Unable to connect. Is the computer able to access the url?",
+        "Error [unavailable]: OAuth discovery failed: OAuth discovery network error: ECONNREFUSED: Unable to connect. Is the computer able to access the url?",
         "Fix: Retry the same operation and arguments with request_id <uuid>; do not generate a replacement ID.",
         "Request: <uuid>"
       ],
@@ -207,7 +207,9 @@
     {
       "argv": "doctor",
       "exitCode": 1,
-      "stderr": [],
+      "stderr": [
+        "[gbrain] reading doctor checks; large brains can take minutes. Progress prints here every 10 s; the result prints on stdout when it is ready."
+      ],
       "stdout": [
         "",
         "GBrain Health Check (thin-client)",
@@ -219,7 +221,7 @@
         "",
         "  [✓] config_integrity: mcp_url=http://127.0.0.1:1/mcp, issuer_url=http://127.0.0.1:1",
         "  [✓] oauth_credentials: client_id=cid, secret_source=config",
-        "  [✗] oauth_discovery: OAuth discovery network error: Unable to connect. Is the computer able to access the url?",
+        "  [✗] oauth_discovery: OAuth discovery network error: ECONNREFUSED: Unable to connect. Is the computer able to access the url?",
         "",
         "Connectivity check FAILED — see error above.",
         "Common fixes:",
@@ -232,7 +234,7 @@
       "argv": "think q",
       "exitCode": 1,
       "stderr": [
-        "Error [unavailable]: OAuth discovery failed: OAuth discovery network error: Unable to connect. Is the computer able to access the url?",
+        "Error [unavailable]: OAuth discovery failed: OAuth discovery network error: ECONNREFUSED: Unable to connect. Is the computer able to access the url?",
         "Fix: gbrain remote doctor",
         "Docs: https://github.com/garrytan/gbrain/blob/master/docs/guides/error-codes.md#unavailable"
       ],
@@ -242,7 +244,7 @@
       "argv": "recall q",
       "exitCode": 1,
       "stderr": [
-        "Error [unavailable]: OAuth discovery failed: OAuth discovery network error: Unable to connect. Is the computer able to access the url?",
+        "Error [unavailable]: OAuth discovery failed: OAuth discovery network error: ECONNREFUSED: Unable to connect. Is the computer able to access the url?",
         "Fix: gbrain remote doctor",
         "Docs: https://github.com/garrytan/gbrain/blob/master/docs/guides/error-codes.md#unavailable"
       ],
@@ -261,6 +263,80 @@
       "exitCode": 1,
       "stderr": [
         "Cannot reach http://127.0.0.1:1/mcp. Run `gbrain remote doctor` for details."
+      ],
+      "stdout": []
+    },
+    {
+      "argv": "wakeshift watch job 1",
+      "exitCode": 1,
+      "stderr": [
+        "Error [unavailable]: OAuth discovery failed: OAuth discovery network error: ECONNREFUSED: Unable to connect. Is the computer able to access the url?",
+        "Fix: gbrain remote doctor",
+        "Docs: https://github.com/garrytan/gbrain/blob/master/docs/guides/error-codes.md#unavailable"
+      ],
+      "stdout": []
+    },
+    {
+      "argv": "wakeshift status",
+      "exitCode": 1,
+      "stderr": [
+        "Error [requires_local_engine]: `gbrain wakeshift` is not routable (thin-client of http://127.0.0.1:1/mcp); run it on the brain host.",
+        "Fix: gbrain wakeshift status",
+        "Why: `wakeshift watch job|write|cron` and `wakeshift accept-terms` route to the brain host automatically (watch_job / watch_write_request / watch_cron / accept_wakeshift_terms MCP tools). enable, disable, status and test read or change the brain host's Wakeshift key and settings: run those on the brain host.",
+        "Docs: https://github.com/garrytan/gbrain/blob/master/docs/guides/error-codes.md#requires_local_engine"
+      ],
+      "stdout": []
+    },
+    {
+      "argv": "serve --http",
+      "exitCode": 1,
+      "stderr": [
+        "Error [requires_local_engine]: `gbrain serve --http` is not routable (thin-client of http://127.0.0.1:1/mcp): it serves a brain over HTTP, so it runs on the brain host.",
+        "Fix: gbrain serve --http",
+        "Why: HTTP serving hosts the brain database, which lives on the brain host; a thin client has none to serve.",
+        "Docs: https://github.com/garrytan/gbrain/blob/master/docs/guides/error-codes.md#requires_local_engine"
+      ],
+      "stdout": []
+    },
+    {
+      "argv": "serve --http --port 3131",
+      "exitCode": 1,
+      "stderr": [
+        "Error [requires_local_engine]: `gbrain serve --http --port 3131` is not routable (thin-client of http://127.0.0.1:1/mcp): it serves a brain over HTTP, so it runs on the brain host.",
+        "Fix: gbrain serve --http --port 3131",
+        "Why: HTTP serving hosts the brain database, which lives on the brain host; a thin client has none to serve.",
+        "Docs: https://github.com/garrytan/gbrain/blob/master/docs/guides/error-codes.md#requires_local_engine"
+      ],
+      "stdout": []
+    },
+    {
+      "argv": "serve --access read-only",
+      "exitCode": 1,
+      "stderr": [
+        "Error [requires_local_engine]: `gbrain serve --access read-only` is not routable (thin-client of http://127.0.0.1:1/mcp): it asks this bridge to enforce a restriction, and a thin client cannot enforce one locally.",
+        "Fix: gbrain auth register-client '<name>' --grant-types client_credentials --scopes read",
+        "Why: The brain host enforces what each client may do; a filter in this process would be advice, not a boundary.",
+        "Docs: https://github.com/garrytan/gbrain/blob/master/docs/guides/error-codes.md#requires_local_engine"
+      ],
+      "stdout": []
+    },
+    {
+      "argv": "serve --surface Starter",
+      "exitCode": 2,
+      "stderr": [
+        "Error [invalid_params]: --surface must be one of verbs|starter|full; got 'Starter'.",
+        "Fix: Pass one of verbs|starter|full, e.g. --surface verbs.",
+        "Docs: https://github.com/garrytan/gbrain/blob/master/docs/guides/error-codes.md#invalid_params"
+      ],
+      "stdout": []
+    },
+    {
+      "argv": "serve --advertise=bogus",
+      "exitCode": 2,
+      "stderr": [
+        "Error [invalid_params]: --advertise must be one of verbs|starter|full; got 'bogus'.",
+        "Fix: Pass one of verbs|starter|full, e.g. --advertise verbs.",
+        "Docs: https://github.com/garrytan/gbrain/blob/master/docs/guides/error-codes.md#invalid_params"
       ],
       "stdout": []
     }

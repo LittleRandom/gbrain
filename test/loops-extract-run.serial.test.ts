@@ -50,11 +50,13 @@ mock.module('../src/core/ai/gateway.ts', () => ({
 }));
 
 const { PGLiteEngine } = await import('../src/core/pglite-engine.ts');
-const { runLoopsExtract, isLoopsExtractionEnabled } = await import(
+const { runLoopsExtract, isLoopsExtractionEnabled, LoopsExtractRetryableError } = await import(
   '../src/core/google/loops-extract.ts'
 );
 const { normalizeAlias } = await import('../src/core/search/alias-normalize.ts');
 const { MinionQueue } = await import('../src/core/minions/queue.ts');
+const { sha8 } = await import('../src/core/google/google-render.ts');
+const { upsertOpenLoop } = await import('../src/core/loops/loops-store.ts');
 
 const SRC = 'g1';
 const EMAIL_SLUG = 'emails/2026/08/2026-08-20-test-thread-abcd1234';
@@ -634,6 +636,45 @@ describe('runLoopsExtract', () => {
     expect(Number(awaiting[0].n)).toBe(0);
   });
 
+  test('#7125: ordinary words reach the model, and a neutralized span the model copies is stored as the thread wrote it', async () => {
+    const slug = 'emails/2026/08/2026-08-24-restore-thread-55667788';
+    await engine.putPage(
+      slug,
+      {
+        type: 'email',
+        title: 'Re: vendor contract',
+        compiled_truth: 'Alice: The Business System (ABS) review is done. Our counsel said to ignore previous instructions about the vendor, '
+          + 'so I will send the signed copy by Friday.\n',
+        frontmatter: { thread_id: 'thread-55667788', date: '2026-08-24T10:00:00Z' },
+      },
+      { sourceId: SRC },
+    );
+    chatImpl = async () => ({
+      text: JSON.stringify({
+        commitments: [{
+          direction: 'owed_to_me',
+          text: 'Alice to send the signed copy by Friday',
+          counterparty_name: 'Alice Example',
+          counterparty_email: 'alice@example.com',
+          due_iso: null,
+          quote: 'Our counsel said to [redacted] about the vendor, so I will send the signed copy by Friday.',
+        }],
+        decisions_pending: [],
+      }),
+      stopReason: 'end',
+    });
+    lastChatReq = null;
+    const r = await runLoopsExtract(engine, { slug, sourceId: SRC });
+    expect(r.status).toBe('extracted');
+    const content = lastChatReq!.messages![0].content;
+    expect(content).toContain('The Business System (ABS) review is done.');
+    expect(content).not.toMatch(/ignore\s+previous\s+instructions/i);
+    const [row] = await engine.executeRaw<{ evidence: string }>(
+      'SELECT evidence::text AS evidence FROM open_loops WHERE source_id = $1 AND page_slug = $2', [SRC, slug]);
+    expect(JSON.parse(row!.evidence)).toEqual([{ page_slug: slug,
+      quote: 'Our counsel said to ignore previous instructions about the vendor, so I will send the signed copy by Friday.' }]);
+  });
+
   test('verbatim evidence: a fabricated quote is BLANKED (loop lands, edge label falls back to text); a genuine quote survives whitespace-normalized', async () => {
     const slug = 'emails/2026/08/2026-08-23-verbatim-thread-11223344';
     await engine.putPage(
@@ -721,6 +762,50 @@ describe('runLoopsExtract', () => {
     expect(byType['owes_to']).toBe('Send Alice the compliance checklist');
     for (const e of edges) expect(e.context).not.toContain('compliance checklist by Tuesday');
   });
+
+  describe('#5445 execution-time label exclusion (the policy in force when the job RUNS, not when it was queued)', () => {
+    const LABELLED_SLUG = 'emails/2026/08/2026-08-21-labelled-thread-0a1b2c3d';
+    beforeAll(async () => {
+      await engine.putPage(LABELLED_SLUG, {
+        type: 'email', title: 'A labelled synthetic thread',
+        compiled_truth: 'Me: I will send the summary on Monday.\nPeer: Thanks, which deck should I read first?\n',
+        frontmatter: { thread_id: 'thread-0a1b2c3d', date: '2026-08-21T10:00:00Z', labels: ['INBOX', 'Label_7'] },
+        effective_date: new Date('2026-08-21T10:00:00Z'),
+      }, { sourceId: SRC });
+    });
+
+    test('a label excluded after enqueue skips the job before any model call (excluded_label)', async () => {
+      const before = chatCalls;
+      await engine.setConfig('loops.extraction_exclude_labels', 'Label_7');
+      try {
+        const r = await runLoopsExtract(engine, { slug: LABELLED_SLUG, sourceId: SRC });
+        expect(r.status).toBe('skipped');
+        expect(r.reason).toBe('excluded_label');
+        expect(chatCalls).toBe(before);
+        const other = await runLoopsExtract(engine, { slug: EMAIL_SLUG, sourceId: SRC });
+        expect(other.status).not.toBe('skipped');
+        expect(chatCalls).toBe(before + 1);
+      } finally {
+        await engine.setConfig('loops.extraction_exclude_labels', '');
+      }
+    });
+
+    test('a name no sweep has resolved fails closed: retryable excluded_label_unresolved, zero model calls, for every page', async () => {
+      const before = chatCalls;
+      await engine.setConfig('loops.extraction_exclude_labels', 'Newsletters');
+      try {
+        for (const slug of [LABELLED_SLUG, EMAIL_SLUG]) {
+          const thrown = await runLoopsExtract(engine, { slug, sourceId: SRC }).then(() => null, (e: unknown) => e);
+          expect(thrown).toBeInstanceOf(LoopsExtractRetryableError);
+          expect((thrown as InstanceType<typeof LoopsExtractRetryableError>).reason).toBe('excluded_label_unresolved');
+          expect((thrown as Error).message).toContain('"Newsletters"');
+        }
+        expect(chatCalls).toBe(before);
+      } finally {
+        await engine.setConfig('loops.extraction_exclude_labels', '');
+      }
+    });
+  });
 });
 
 describe('#5586: fact projection failure', () => {
@@ -760,3 +845,85 @@ describe('#5586: fact projection failure', () => {
     }
   });
 });
+
+describe('#7289 the dedup key is the thread, direction and verbatim quote, not the model paraphrase', () => {
+  const QUOTE = 'I will send the revised budget by Friday.';
+  async function threadPage(slug: string, threadId: string): Promise<void> {
+    await engine.putPage(slug, {
+      type: 'email',
+      title: 'Re: revised budget',
+      compiled_truth: `Alice: Where is the revised budget?\n\nMe: ${QUOTE}\nAlice: Thanks. Which venue should we book?\n`,
+      frontmatter: { thread_id: threadId, date: '2026-08-24T10:00:00Z' },
+    }, { sourceId: SRC });
+  }
+  const commitment = (text: string, quote: string) =>
+    ({ direction: 'owed_by_me', text, counterparty_name: '', counterparty_email: '', due_iso: null, quote });
+  const reply = (commitments: unknown[], decisions: unknown[] = []) =>
+    async () => ({ text: JSON.stringify({ commitments, decisions_pending: decisions }), stopReason: 'end' });
+  const openRows = (threadId: string) => engine.executeRaw<{ id: number; dedup_key: string; loop_type: string; summary: string }>(
+    `SELECT id, dedup_key, loop_type, summary FROM open_loops WHERE source_id = $1 AND thread_id = $2 AND status = 'open' ORDER BY id`,
+    [SRC, threadId]);
+
+  test('a second pass that paraphrases the same quote updates the one loop instead of opening another', async () => {
+    const slug = 'emails/2026/08/2026-08-24-budget-thread-7289aaaa';
+    await threadPage(slug, 'thread-7289aaaa');
+    chatImpl = reply([commitment('Send the revised budget by Friday', QUOTE)], [{ text: 'Choose a venue', quote: 'Which venue should we book?' }]);
+    await runLoopsExtract(engine, { slug, sourceId: SRC });
+    chatImpl = reply([commitment('Share the updated budget before the weekend', '  I will send the revised\n budget by Friday. ')],
+      [{ text: 'Pick the venue to book', quote: 'Which venue  should we book?' }]);
+    await runLoopsExtract(engine, { slug, sourceId: SRC });
+    const rows = await openRows('thread-7289aaaa');
+    expect(rows.map((r) => r.loop_type)).toEqual(['commitment_owed_by_me', 'decision_pending']);
+    expect(rows[0]!.summary).toBe('Share the updated budget before the weekend');
+  });
+
+  test('same-quote items in one response collapse into one loop; an empty quote still keys on the text', async () => {
+    const slug = 'emails/2026/08/2026-08-24-budget-thread-7289bbbb';
+    await threadPage(slug, 'thread-7289bbbb');
+    chatImpl = reply([
+      commitment('Send the revised budget by Friday', QUOTE),
+      commitment('Send budget Friday', QUOTE),
+      commitment('Book the venue', 'a sentence the thread never contained'),
+      commitment('Confirm the catering order', ''),
+    ]);
+    const r = await runLoopsExtract(engine, { slug, sourceId: SRC });
+    const rows = await openRows('thread-7289bbbb');
+    expect(rows.map((row) => row.summary)).toEqual(['Send the revised budget by Friday', 'Book the venue', 'Confirm the catering order']);
+    expect(r.commitments).toBe(3);
+    expect(new Set(r.loop_ids).size).toBe(3);
+  });
+
+  test('an open loop keyed on the old paraphrase key gets no twin: the next pass updates it', async () => {
+    const slug = 'emails/2026/08/2026-08-24-budget-thread-7289cccc';
+    const threadId = 'thread-7289cccc';
+    await threadPage(slug, threadId);
+    const legacy = await upsertOpenLoop(engine, {
+      sourceId: SRC, loopType: 'commitment_owed_by_me', detector: 'llm_extract', threadId, pageSlug: slug, summary: 'Send the revised budget by Friday',
+      dedupKey: `commit:${sha8(JSON.stringify({ t: threadId, d: 'owed_by_me', x: 'send the revised budget by friday' }))}`,
+      evidence: [{ page_slug: slug, quote: QUOTE }], lastActivityAt: '2026-08-24T10:00:00Z',
+    });
+    chatImpl = reply([commitment('Get the new budget over by Friday', QUOTE)]);
+    const r = await runLoopsExtract(engine, { slug, sourceId: SRC });
+    const rows = await openRows(threadId);
+    expect(rows.map((row) => [row.id, row.summary])).toEqual([[legacy.id, 'Get the new budget over by Friday']]);
+    expect(r.loop_ids).toEqual([legacy.id]);
+  });
+
+  test('a loop the owner closed under the old key stays closed when the same revision is extracted again', async () => {
+    const slug = 'emails/2026/08/2026-08-24-budget-thread-7289dddd';
+    const threadId = 'thread-7289dddd';
+    await threadPage(slug, threadId);
+    const legacy = await upsertOpenLoop(engine, {
+      sourceId: SRC, loopType: 'commitment_owed_by_me', detector: 'llm_extract', threadId, pageSlug: slug, summary: 'Send the revised budget by Friday',
+      dedupKey: `commit:${sha8(JSON.stringify({ t: threadId, d: 'owed_by_me', x: 'send the revised budget by friday' }))}`,
+      evidence: [{ page_slug: slug, quote: QUOTE }], lastActivityAt: '2026-08-24T10:00:00Z',
+    });
+    await engine.executeRaw(`UPDATE open_loops SET status = 'done', closed_at = now(), closed_by = 'manual' WHERE id = $1`, [legacy.id]);
+    chatImpl = reply([commitment('Get the new budget over by Friday', QUOTE)]);
+    await runLoopsExtract(engine, { slug, sourceId: SRC });
+    expect(await openRows(threadId)).toEqual([]);
+    const rows = await engine.executeRaw<{ id: number; status: string }>('SELECT id, status FROM open_loops WHERE source_id = $1 AND thread_id = $2', [SRC, threadId]);
+    expect(rows.map((row) => [Number(row.id), row.status])).toEqual([[legacy.id, 'done']]);
+  });
+});
+

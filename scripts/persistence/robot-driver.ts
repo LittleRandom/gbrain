@@ -1,7 +1,7 @@
 /**
  * Driver for the crash robot phase of the persistence gate. For each
- * schedule (the five cross-boundary sequences first, then seeded random
- * sequences until the time budget runs out) it runs a counting pass that
+ * schedule (the cross-boundary sequences first, then the fixed list of seeded
+ * random sequences, ROBOT_RANDOM_SEEDS plus any exploration seeds) it runs a counting pass that
  * finds every seam the schedule reaches, then one process-separated run per
  * chosen crash point: a worker freezes at the seam, the driver SIGKILLs it,
  * and a fresh worker recovers, resubmits the interrupted requests and
@@ -10,7 +10,7 @@
  */
 import { createHash, randomUUID } from 'node:crypto';
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { join, resolve } from 'node:path';
+import { basename, join, resolve } from 'node:path';
 import type postgres from '#postgres';
 import { random } from './harness.ts';
 import { crossBoundarySequences, randomSchedule, type GeneratorTopology, type Schedule } from './generator.ts';
@@ -29,11 +29,30 @@ export const PROCESS_FAULTS: ProcessFault[] = ['stale_index_lock', 'hung_git', '
  * owner's claim lease (requests 30 s, effects 2 minutes): a publication seam
  * does when the dead owner also held an effect claim, and the pooler
  * disconnect fault holds its run for about two minutes. A Postgres run with a
- * budget under FULL_ROBOT_SECONDS skips them and lists them in the manifest
+ * run of the `pr` scope skips them and lists them in the manifest
  * (`lease_bound_seams_skipped`, `lease_bound_faults_skipped`); full runs
  * (master, nightly, manual) crash every seam and run every fault.
  */
-export const FULL_ROBOT_SECONDS = 300;
+export type RobotScope = 'pr' | 'full';
+/**
+ * The random sequences every run executes, whatever its event, so two runs of
+ * one tree cover the same schedules and a passed run can be reused for an
+ * identical tree. 5108, 5109, 5113, 5115 and 5116 are the shrunk
+ * fence_absent fixtures of #7435.
+ */
+export const ROBOT_RANDOM_SEEDS: readonly number[] = [5105, 5106, 5107, 5108, 5109, 5113, 5115, 5116];
+/**
+ * Runs in flight at once. Every run owns its database, scratch root and home, and the plan is fixed before any
+ * crash runs, so the width changes only the wall clock (#8036). Two is measured on ubicloud-standard-4
+ * (docs/ci-event-parity.md#crash-robot-ceilings).
+ */
+export const ROBOT_CONCURRENCY = 2;
+/** Seeds from 5109 to 5116 not in ROBOT_RANDOM_SEEDS: the nightly runs one of them each night. */
+export const ROBOT_ROTATION_SEEDS: readonly number[] = [5110, 5111, 5112, 5114];
+/** The nightly's exploration seeds for a UTC day number: one rotation seed (each within four nights) and one never run before. */
+export function explorationSeeds(day: number): number[] {
+  return [ROBOT_ROTATION_SEEDS[day % ROBOT_ROTATION_SEEDS.length]!, 5117 + day];
+}
 const LEASE_BOUND_PUBLICATION_SEAMS: readonly FaultPoint[] = ['publication:prepared', 'publication:before_publication', 'publication:after_publication'];
 export function leaseBoundSeam(point: FaultPoint): boolean {
   return point.startsWith('effect:') || point === 'consumer:prepared' || LEASE_BOUND_PUBLICATION_SEAMS.includes(point);
@@ -44,9 +63,50 @@ export interface RobotRun {
   schedule: string; seed: number; length: number; fault?: { point: FaultPoint; nth: number }; process?: ProcessFault;
   ops?: string[]; crashed: boolean; violations: RobotOutcome['violations']; duration_ms: number; trace?: string[];
   deferred?: RobotOutcome['deferred'];
+  /** The worker finished without reaching its requested fault (#6584): nothing was crashed or recovered. */
+  fault_not_reached?: boolean;
+  /** Slots of the fault's seam the schedule's count run made, when the fault was planned from one. */
+  counted?: number;
+  /** Slots of the fault's seam made by a run that missed its fault. */
+  reached?: number;
+  /** The fault this run was planned with, and how many slots the run that missed it made (see `retargetable`). */
+  retargeted?: { nth: number; reached: number };
+  /** The worker's fault hook threw at the requested seam (`fault_hook_error`); the run proves nothing. */
+  hook_error?: string;
+}
+
+/**
+ * Requested faults a scenario (a schedule label, or a process fault) may
+ * legitimately finish without reaching, each with its reason. Any other
+ * unreached fault fails the run and the full gate.
+ */
+export const UNREACHED_FAULT_ALLOWLIST: readonly { scenario: string; point: FaultPoint; reason: string }[] = [];
+export function unreachedAllowed(run: Pick<RobotRun, 'schedule' | 'process' | 'fault'>): boolean {
+  return UNREACHED_FAULT_ALLOWLIST.some(entry => entry.scenario === (run.process ?? run.schedule) && entry.point === run.fault?.point);
+}
+/**
+ * #8078: a schedule whose concurrent group settles one of two legal ways makes one slot more or fewer at some seams
+ * (sync_and_connector_race_direct_write: the connector republish racing a direct write publishes 5 or 6 times, and
+ * its git effects, preparations and commits follow), so a fault the count run planned at its last slot can be missed
+ * by a run that took the other outcome. Such a run, short by exactly one slot of the count run, runs once more at the
+ * last slot it did make. A run that found violations, made no slot, fell more than one short, or missed again fails as before.
+ */
+export function retargetable(run: RobotRun): boolean {
+  const reached = run.reached ?? 0;
+  return run.fault_not_reached === true && !run.retargeted && run.counted !== undefined && run.fault !== undefined && run.violations.length === 0
+    && reached > 0 && reached >= run.counted - 1 && reached < run.fault.nth;
+}
+/** A run fails the gate when it found violations, its hook threw, or it never reached a fault it was not allowed to miss. */
+export function runFailed(run: RobotRun): boolean {
+  return run.violations.length > 0 || run.hook_error !== undefined || (run.fault_not_reached === true && !unreachedAllowed(run));
 }
 export interface RobotOptions {
+  /** `seconds` is the ceiling: a run past it is reported `over_budget`. */
   engine: 'pglite' | 'postgres'; seed: number; seconds: number; scratch: string; home: string;
+  /** `full` (default) crashes every seam; `pr` skips the Postgres lease-bound ones. */
+  scope?: RobotScope;
+  /** Random seeds run after ROBOT_RANDOM_SEEDS (the nightly's explorationSeeds). */
+  extraSeeds?: readonly number[];
   admin?: ReturnType<typeof postgres>; databaseUrl?: string; databases: string[];
   /** A transaction-mode PgBouncer URL: Postgres workers then connect through it (prepared statements off). */
   pooledUrl?: string;
@@ -56,6 +116,8 @@ export interface RobotOptions {
   /** Keep only these op ids of a schedule (shrinking). */
   keep?: Map<string, Set<string>>;
   worktrees?: number;
+  /** Runs in flight at once (default ROBOT_CONCURRENCY); a replay runs one at a time. */
+  concurrency?: number;
   log?: (line: string) => void;
 }
 
@@ -82,97 +144,158 @@ export async function runRobotPhase(o: RobotOptions) {
   const started = performance.now();
   const runs: RobotRun[] = [];
   const log = o.log ?? (line => process.stderr.write(`[crash-robot] ${o.engine}: ${line}\n`));
-  async function fresh(name: string): Promise<{ root: string; dataDir: string; databaseUrl?: string; directUrl?: string }> {
+  async function fresh(name: string): Promise<{ root: string; dataDir: string; databaseUrl?: string; directUrl?: string; database?: string }> {
     const root = join(o.scratch, `robot-${name}-${randomUUID().slice(0, 8)}`); mkdirSync(root, { recursive: true });
     if (!o.admin) return { root, dataDir: join(root, 'data') };
     const database = `gbrain_persistence_test_${randomUUID().replaceAll('-', '')}`;
     await o.admin.unsafe(`CREATE DATABASE ${database}`); o.databases.push(database);
     const direct = new URL(o.databaseUrl!); direct.pathname = `/${database}`;
     const pooled = o.pooledUrl ? new URL(o.pooledUrl) : null; if (pooled) pooled.pathname = `/${database}`;
-    return { root, dataDir: join(root, 'data'), databaseUrl: (pooled ?? direct).toString(), directUrl: direct.toString() };
+    return { root, dataDir: join(root, 'data'), databaseUrl: (pooled ?? direct).toString(), directUrl: direct.toString(), database };
+  }
+  // A transaction-mode pooler keeps every server connection a run opened in
+  // that run's per-database pool until its own idle timeout (PgBouncer: 600 s,
+  // the length of a full robot budget), so a run's database is released the
+  // moment the run passes: DROP ... WITH (FORCE) ends those backends. A
+  // failing run keeps its database for the retained-fixture metadata.
+  async function release(database: string | undefined) {
+    if (!database || !o.admin) return;
+    await o.admin.unsafe(`DROP DATABASE IF EXISTS ${database} WITH (FORCE)`);
+    const index = o.databases.indexOf(database); if (index >= 0) o.databases.splice(index, 1);
   }
   const environment: Record<string, string> = o.pooledUrl ? { GBRAIN_PREPARE: 'false' } : {};
-  async function execute(schedule: Schedule, role: 'count' | 'run', extra: Partial<RobotConfig> = {}): Promise<RobotRun & { counts?: Record<string, number> }> {
+  async function execute(schedule: Schedule, role: 'count' | 'run', extra: Partial<RobotConfig> = {}, planned: Pick<RobotRun, 'counted' | 'retargeted'> = {}): Promise<RobotRun & { counts?: Record<string, number> }> {
     const at = performance.now();
-    const place = await fresh(`${schedule.label}-${role}`);
+    const { database, ...place } = await fresh(`${schedule.label}-${role}`);
     const config: RobotConfig = { kind: o.engine, ...place, schedule, worktrees: o.worktrees ?? 2, statePath: join(place.root, 'state.json'), ...extra };
     const path = join(place.root, 'robot.json'); writeFileSync(path, JSON.stringify(config), { mode: 0o600 });
+    const home = join(o.home, basename(place.root)); mkdirSync(home, { recursive: true });
     const base = { schedule: schedule.label, seed: schedule.seed, length: schedule.ops.length, ...(extra.fault ? { fault: extra.fault } : {}),
-      ...(extra.process ? { process: extra.process } : {}), ...(o.keep?.has(schedule.label) ? { ops: schedule.ops.map(d => d.id) } : {}) };
-    const child = o.spawn(path, o.home, 'robot', [role], environment); o.track(child);
-    if (role === 'run' && extra.fault) {
-      const reached = await Promise.race([child.event('fault', 600_000).then(e => ({ fault: e })), child.event('done', 600_000).then(e => ({ done: e }))]);
-      if ('done' in reached) {
-        const result = reached.done.result as RobotOutcome;
-        return { ...base, crashed: false, violations: result.violations, deferred: result.deferred, trace: result.trace, duration_ms: performance.now() - at };
+      ...(extra.process ? { process: extra.process } : {}), ...(o.keep?.has(schedule.label) ? { ops: schedule.ops.map(d => d.id) } : {}), ...planned };
+    const child = o.spawn(path, home, 'robot', [role], environment); o.track(child);
+    const outcome = async (): Promise<RobotRun & { counts?: Record<string, number> }> => {
+      if (role === 'run' && extra.fault) {
+        const reached = await Promise.race([child.event('fault', 600_000).then(e => ({ fault: e })),
+          child.event('fault_hook_error', 600_000).then(e => ({ hookError: e })), child.event('done', 600_000).then(e => ({ done: e }))]);
+        if ('hookError' in reached) {
+          await child.kill();
+          return { ...base, crashed: false, hook_error: String(reached.hookError.message), violations: [], duration_ms: performance.now() - at };
+        }
+        if ('done' in reached) {
+          const result = reached.done.result as RobotOutcome;
+          return { ...base, crashed: false, fault_not_reached: true, ...(result.reached !== undefined ? { reached: result.reached } : {}),
+            violations: result.violations, deferred: result.deferred, trace: result.trace, duration_ms: performance.now() - at };
+        }
+        await child.kill();
+        const recovered = o.spawn(path, home, 'robot', ['recover'], environment); o.track(recovered);
+        const result = (await recovered.done()).result as RobotOutcome;
+        return { ...base, crashed: true, violations: result.violations, deferred: result.deferred, trace: result.trace, duration_ms: performance.now() - at };
       }
-      await child.kill();
-      const recovered = o.spawn(path, o.home, 'robot', ['recover'], environment); o.track(recovered);
-      const result = (await recovered.done()).result as RobotOutcome;
-      return { ...base, crashed: true, violations: result.violations, deferred: result.deferred, trace: result.trace, duration_ms: performance.now() - at };
+      const result = (await child.done()).result as RobotOutcome;
+      return { ...base, crashed: false, violations: result.violations, deferred: result.deferred, trace: result.trace, counts: result.counts, duration_ms: performance.now() - at };
+    };
+    const run = await outcome();
+    if (retargetable(run)) {
+      await release(database);
+      log(`${run.schedule} ${run.fault!.point}#${run.fault!.nth}: the run made ${run.reached} of the count run's ${run.counted} slots; crashing again at #${run.reached}`);
+      return execute(schedule, role, { ...extra, fault: { ...extra.fault!, nth: run.reached! } }, { counted: run.counted, retargeted: { nth: run.fault!.nth, reached: run.reached! } });
     }
-    const result = (await child.done()).result as RobotOutcome;
-    return { ...base, crashed: false, violations: result.violations, deferred: result.deferred, trace: result.trace, counts: result.counts, duration_ms: performance.now() - at };
+    if (!runFailed(run)) await release(database);
+    return run;
   }
-  const record = (run: RobotRun) => {
-    runs.push(run);
+  const say = (run: RobotRun) => {
     const what = run.fault ? `${run.fault.point}#${run.fault.nth}` : run.process ?? 'no crash';
-    log(`${run.schedule} ${what}: ${run.violations.length ? `${run.violations.length} VIOLATION(S) ${run.violations.map(v => v.class).join(',')}` : 'ok'} (${Math.round(run.duration_ms)} ms)`);
+    const verdict = run.violations.length ? `${run.violations.length} VIOLATION(S) ${run.violations.map(v => v.class).join(',')}`
+      : run.hook_error !== undefined ? `FAULT HOOK ERROR ${run.hook_error}`
+        : run.fault_not_reached ? (unreachedAllowed(run) ? 'fault not reached (allowed)' : 'FAULT NOT REACHED') : 'ok';
+    log(`${run.schedule} ${what}: ${verdict} (${Math.round(run.duration_ms)} ms)`);
   };
+  const record = (run: RobotRun) => { runs.push(run); say(run); };
+  const go = (schedule: Schedule, role: 'count' | 'run', extra: Partial<RobotConfig> = {}, planned: Pick<RobotRun, 'counted'> = {}) =>
+    execute(schedule, role, extra, planned).then(run => { say(run); return run; });
+  const width = o.concurrency ?? ROBOT_CONCURRENCY;
+  /** `each` over `items`, `width` at a time, each result at its item's index. The first failure stops every lane from taking another item. */
+  async function pooled<T, R>(items: readonly T[], each: (item: T) => Promise<R>): Promise<R[]> {
+    const results: R[] = [];
+    let next = 0;
+    let stopped = false;
+    const lane = async () => {
+      while (!stopped && next < items.length) {
+        const index = next++;
+        try { results[index] = await each(items[index]!); } catch (error) { stopped = true; throw error; }
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(width, items.length) }, lane));
+    return results;
+  }
 
   if (o.replay) {
     for (const entry of o.replay) {
       const schedule = restrict(scheduleFor(entry.schedule, entry.seed, entry.length), entry.ops ? new Set(entry.ops) : o.keep?.get(entry.schedule));
-      record(await execute(schedule, entry.fault || entry.process ? 'run' : 'count', { ...(entry.fault ? { fault: entry.fault } : {}), ...(entry.process ? { process: entry.process } : {}) }));
+      record(await execute(schedule, entry.fault || entry.process ? 'run' : 'count', { ...(entry.fault ? { fault: entry.fault } : {}), ...(entry.process ? { process: entry.process } : {}) },
+        entry.counted !== undefined ? { counted: entry.counted } : {}));
     }
     return summarize(runs, started, o);
   }
 
   const rand = random(o.seed);
-  const budgetMs = o.seconds * 1000;
-  const over = () => performance.now() - started > budgetMs;
+  const scope = o.scope ?? 'full';
+  const fixed = crossBoundarySequences(ROBOT_TOPOLOGY, o.seed);
+  const seeded = [...ROBOT_RANDOM_SEEDS, ...(o.extraSeeds ?? [])].map(seed => randomSchedule(ROBOT_TOPOLOGY, seed >>> 0, 24));
+  // Every schedule is counted first and every fault is then drawn in one fixed order, so how many runs are in
+  // flight never changes which runs execute, and the manifest lists them in that order.
+  const counted = await pooled([...fixed, ...seeded], schedule => go(schedule, 'count'));
+  const fixedCounts = counted.slice(0, fixed.length);
+  const seededCounts = counted.slice(fixed.length);
   // Every cross-boundary sequence runs uncrashed, then each seam it reaches is crashed once,
   // seams first covered across sequences (a seam no run has crashed yet goes first).
-  const fixed = crossBoundarySequences(ROBOT_TOPOLOGY, o.seed);
   const plan: { schedule: Schedule; point: FaultPoint; count: number }[] = [];
-  const skipLease = o.engine === 'postgres' && o.seconds < FULL_ROBOT_SECONDS;
+  const skipLease = o.engine === 'postgres' && scope === 'pr';
+  // A full PGLite run crashes every seam of every sequence; Postgres and pull requests crash each seam once.
+  const everySeam = scope === 'full' && o.engine === 'pglite';
   const skipped = new Set<string>();
-  for (const schedule of fixed) {
-    const counted = await execute(schedule, 'count'); record(counted);
-    for (const [point, count] of Object.entries(counted.counts ?? {}) as [FaultPoint, number][]) {
+  fixed.forEach((schedule, index) => {
+    for (const [point, count] of Object.entries(fixedCounts[index]!.counts ?? {}) as [FaultPoint, number][]) {
       if (skipLease && leaseBoundSeam(point)) { skipped.add(point); continue; }
       plan.push({ schedule, point, count });
     }
-  }
+  });
   // The seed rotates which sequence covers each seam first.
   const turn = (x: (typeof plan)[number]) => (fixed.indexOf(x.schedule) + o.seed) % fixed.length;
   plan.sort((x, y) => x.point.localeCompare(y.point) || turn(x) - turn(y));
   const firsts = plan.filter((x, i) => plan.findIndex(y => y.point === x.point) === i);
   const ordered = [...firsts, ...plan.filter(x => !firsts.includes(x))];
-  for (const [i, item] of ordered.entries()) {
-    const mandatory = i < firsts.length;
-    if (!mandatory && over()) break;
-    record(await execute(item.schedule, 'run', { fault: { point: item.point, nth: 1 + Math.floor(rand() * item.count) } }));
-  }
+  type Job = { schedule: Schedule; extra: Partial<RobotConfig>; counted?: number };
+  const crashes: Job[] = (everySeam ? ordered : firsts)
+    .map(item => ({ schedule: item.schedule, extra: { fault: { point: item.point, nth: 1 + Math.floor(rand() * item.count) } }, counted: item.count }));
   const skippedFaults = new Set<ProcessFault>();
+  const processes: Job[] = [];
   for (const fault of PROCESS_FAULTS) {
     if (fault === 'pooler_disconnect' && !o.admin) continue;
     if (skipLease && LEASE_BOUND_FAULTS.includes(fault)) { skippedFaults.add(fault); continue; }
-    record(await execute(fixed[1], 'run', { process: fault }));
+    processes.push({ schedule: fixed[1]!, extra: { process: fault } });
   }
   // serve killed right after the facts-absorb job's extraction commits; the job then runs again.
-  record(await execute({ ...fixed[1], ops: [], groups: [] }, 'run', { process: 'facts_absorb_kill',
-    fault: { point: 'publication:after_commit', nth: 1, operation: 'extract_facts' } }));
-  // Random sequences fill the rest of the budget.
-  for (let i = 0; !over(); i++) {
-    const schedule = randomSchedule(ROBOT_TOPOLOGY, (o.seed + 1 + i) >>> 0, 24);
-    const counted = await execute(schedule, 'count'); record(counted);
-    const points = (Object.entries(counted.counts ?? {}) as [FaultPoint, number][]).filter(([point]) => !(skipLease && leaseBoundSeam(point)));
-    if (!points.length || over()) continue;
-    const [point, count] = points[Math.floor(rand() * points.length)];
-    record(await execute(schedule, 'run', { fault: { point, nth: 1 + Math.floor(rand() * count) } }));
-  }
-  return { ...summarize(runs, started, o), lease_bound_seams_skipped: [...skipped].sort(), lease_bound_faults_skipped: [...skippedFaults].sort() };
+  processes.push({ schedule: { ...fixed[1]!, ops: [], groups: [] }, extra: { process: 'facts_absorb_kill',
+    fault: { point: 'publication:after_commit', nth: 1, operation: 'extract_facts' } } });
+  // The fixed random sequences, each counted and crashed once. On Postgres the crash avoids the lease-bound
+  // seams: the cross-boundary sequences already crash each of them once.
+  const seededCrashes = seeded.map((schedule, index): Job | undefined => {
+    const points = (Object.entries(seededCounts[index]!.counts ?? {}) as [FaultPoint, number][]).filter(([point]) => !(o.engine === 'postgres' && leaseBoundSeam(point)));
+    if (!points.length) return undefined;
+    const [point, count] = points[Math.floor(rand() * points.length)]!;
+    return { schedule, extra: { fault: { point, nth: 1 + Math.floor(rand() * count) } }, counted: count };
+  });
+  // The process faults start first: a hung git child and a dead owner's claim lease mostly wait, so they
+  // overlap the crash runs instead of adding their wait to the wall clock.
+  const jobs = [...processes, ...crashes, ...seededCrashes.filter((job): job is Job => job !== undefined)];
+  const finished = await pooled(jobs, job => go(job.schedule, 'run', job.extra, job.counted !== undefined ? { counted: job.counted } : {}));
+  const result = (job: Job) => finished[jobs.indexOf(job)]!;
+  runs.push(...fixedCounts, ...crashes.map(result), ...processes.map(result));
+  seeded.forEach((_, index) => { runs.push(seededCounts[index]!); const job = seededCrashes[index]; if (job) runs.push(result(job)); });
+  const summary = summarize(runs, started, o);
+  return { ...summary, scope, over_budget: o.seconds > 0 && summary.duration_ms > o.seconds * 1000,
+    lease_bound_seams_skipped: [...skipped].sort(), lease_bound_faults_skipped: [...skippedFaults].sort() };
 }
 
 function summarize(runs: RobotRun[], started: number, o: RobotOptions) {
@@ -183,10 +306,14 @@ function summarize(runs: RobotRun[], started: number, o: RobotOptions) {
     seed: o.seed, budget_seconds: o.seconds, duration_ms: performance.now() - started,
     schedules: new Set(runs.map(r => `${r.schedule}:${r.seed}`)).size,
     crash_runs: crashRuns.length, crashed_runs: crashRuns.filter(r => r.crashed).length,
+    fault_hook_errors: runs.filter(r => r.hook_error !== undefined),
+    faults_not_reached: runs.filter(r => r.fault_not_reached && !unreachedAllowed(r)),
+    faults_not_reached_allowed: runs.filter(r => r.fault_not_reached && unreachedAllowed(r)),
+    faults_retargeted: runs.filter(r => r.retargeted),
     sequences_x_crash_points: crashRuns.length, distinct_crash_points: [...points].sort(),
     process_faults: runs.filter(r => r.process).map(r => ({ fault: r.process, violations: r.violations.length })),
     violations, deferred: runs.flatMap(r => (r.deferred ?? []).map(v => ({ ...v, schedule: r.schedule, seed: r.seed, fault: r.fault }))),
-    failing_runs: runs.filter(r => r.violations.length), runs,
+    failing_runs: runs.filter(runFailed), runs,
   };
 }
 

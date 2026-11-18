@@ -21,6 +21,9 @@ import {
   type ThreadLoopVerdict,
 } from '../src/core/google/loop-detect.ts';
 import type { SuppressionSet } from '../src/core/loops/loops-store.ts';
+import { BULK_CATEGORY_LABELS } from '../src/core/google/gmail-categories.ts';
+import { BULK_CATEGORY_LABELS as EXTRACT_LANE_BULK_CATEGORY_LABELS } from '../src/core/google/loops-extract.ts';
+import { trimQuotedReply } from '../src/core/google/google-render.ts';
 import type { GmailMessageMeta, GmailThreadData } from '../src/core/google/types.ts';
 
 // Frozen clock — every age below is relative to this instant, so the corpus
@@ -48,6 +51,10 @@ interface MsgSpec {
   autoSubmitted?: boolean;
   /** Explicit internalDateMs override (0 = the all-zero-date case). */
   dateMs?: number;
+  /** Extra Gmail label ids (categories) beside SENT/INBOX. */
+  labels?: string[];
+  /** #5012 automated-mail headers (fields a master mapper did not capture). */
+  headers?: { precedence?: string; listId?: boolean; replyTo?: string[] };
 }
 
 function msg(spec: MsgSpec): GmailMessageMeta {
@@ -66,9 +73,10 @@ function msg(spec: MsgSpec): GmailMessageMeta {
     internalDateMs,
     calendarMethod: spec.calendarMethod ?? null,
     ...(spec.autoSubmitted !== undefined ? { autoSubmitted: spec.autoSubmitted } : {}),
-    labelIds: spec.sent ? ['SENT'] : ['INBOX'],
+    labelIds: [spec.sent ? 'SENT' : 'INBOX', ...(spec.labels ?? [])],
     listUnsubscribe: spec.listUnsub ?? false,
     bodyText: spec.body ?? 'Can you review the plan?',
+    ...(spec.headers ?? {}),
   };
 }
 
@@ -862,5 +870,214 @@ describe('google calendar system mail', () => {
       }),
     ]);
     expect(v.open.map((o) => o.loopType)).toEqual(['unanswered_inbound']);
+  });
+});
+
+describe('#5103: Google system senders and bulk categories in the deterministic lane', () => {
+  const detect = (messages: GmailMessageMeta[]): ThreadLoopVerdict => detectThreadLoop(thread(messages), MY, NOW);
+
+  test('both lanes read one bulk-category constant', () => {
+    expect(EXTRACT_LANE_BULK_CATEGORY_LABELS).toBe(BULK_CATEGORY_LABELS);
+    expect([...BULK_CATEGORY_LABELS]).toEqual(['CATEGORY_PROMOTIONS', 'CATEGORY_SOCIAL', 'CATEGORY_FORUMS']);
+  });
+
+  test('a Meet notes digest from gemini-notes@google.com opens no inbound loop', () => {
+    const v = detect([msg({ from: 'gemini-notes@google.com', to: ['me@example.com'], ageHours: 48, subject: 'Notes: weekly sync', body: 'Here are the notes. Any corrections?' })]);
+    expect(v.open).toEqual([]);
+  });
+
+  test('a lookalike address is matched by equality only, so it still opens a loop', () => {
+    const v = detect([msg({ from: 'gemini-notes@google.com.evil.example', to: ['me@example.com'], ageHours: 48 })]);
+    expect(v.open.map((o) => o.loopType)).toEqual(['unanswered_inbound']);
+  });
+
+  for (const label of BULK_CATEGORY_LABELS) {
+    test(`${label} inbound the owner never joined → no loop`, () => {
+      const v = detect([msg({ from: 'deals@shop-example.test', to: ['me@example.com'], ageHours: 48, labels: [label] })]);
+      expect(v.open).toEqual([]);
+    });
+  }
+
+  test('a PROMOTIONS thread the owner wrote a substantive message in still opens the reply-owed loop', () => {
+    const v = detect([
+      msg({ from: 'deals@shop-example.test', to: ['me@example.com'], ageHours: 200, labels: ['CATEGORY_PROMOTIONS'], body: 'Spring sale is on.' }),
+      msg({ from: 'me@example.com', to: ['deals@shop-example.test'], ageHours: 150, sent: true, labels: ['CATEGORY_PROMOTIONS'], body: 'Is the blue model still available in size 10?' }),
+      msg({ from: 'deals@shop-example.test', to: ['me@example.com'], ageHours: 48, labels: ['CATEGORY_PROMOTIONS'], body: 'Yes, could you confirm your shipping address?' }),
+    ]);
+    expect(v.open.map((o) => [o.loopType, o.counterpartyEmail])).toEqual([['unanswered_inbound', 'deals@shop-example.test']]);
+  });
+
+  test('CATEGORY_UPDATES without an owner reply still opens (invoices and document requests live there)', () => {
+    const v = detect([msg({ from: 'billing@vendor-example.test', to: ['me@example.com'], ageHours: 48, labels: ['CATEGORY_UPDATES'], body: 'Could you approve the attached invoice?' })]);
+    expect(v.open.map((o) => o.loopType)).toEqual(['unanswered_inbound']);
+  });
+
+  test('a bulk category never fabricates a close: my reply still closes, and their reply still closes my outbound loop', () => {
+    const v = detect([
+      msg({ from: 'deals@shop-example.test', to: ['me@example.com'], ageHours: 100, labels: ['CATEGORY_PROMOTIONS'] }),
+      msg({ from: 'me@example.com', to: ['deals@shop-example.test'], ageHours: 2, sent: true, labels: ['CATEGORY_PROMOTIONS'], body: 'Done, thanks for the details.' }),
+    ]);
+    expect(v.close).toEqual(['unanswered_inbound']);
+    expect(v.open).toEqual([]);
+  });
+
+  test('a mixed thread: the system digest is ignored and the human message to me opens the loop', () => {
+    const v = detect([
+      msg({ from: 'gemini-notes@google.com', to: ['me@example.com'], ageHours: 60, subject: 'Notes: planning' }),
+      msg({ from: 'bob@example.com', to: ['me@example.com'], ageHours: 48, subject: 'Re: planning', body: 'Can you send the budget sheet?' }),
+    ]);
+    expect(v.open.map((o) => [o.loopType, o.counterpartyEmail])).toEqual([['unanswered_inbound', 'bob@example.com']]);
+  });
+});
+
+describe('#5012 positively automated mail and the opt-in Updates reciprocity rule', () => {
+  const alert = (headers: MsgSpec['headers'], labels: string[] = []) =>
+    msg({ from: 'alerts@notify.bank-example.test', to: ['me@example.com'], ageHours: 48, labels, headers,
+      subject: 'Your balance alert', body: 'Your available balance is below the threshold you set. Review it?' });
+
+  const automatedHeaders: Array<[string, NonNullable<MsgSpec['headers']>]> = [
+    ['Precedence: bulk', { precedence: 'bulk' }],
+    ['Precedence: list', { precedence: 'list' }],
+    ['Precedence: junk', { precedence: 'junk' }],
+    ['a List-Id header', { listId: true }],
+    ['a no-reply Reply-To', { replyTo: ['no-reply@bank-example.test'] }],
+  ];
+  for (const [name, headers] of automatedHeaders) {
+    test(`a bank alert with ${name} opens no reply-owed loop and records why`, () => {
+      const v = detectThreadLoop(thread([alert(headers)]), MY, NOW, sup());
+      expect(v.open).toEqual([]);
+      expect(v.held).toBeUndefined();
+      expect(v.withheld).toEqual({ reason: 'automated_mail', counterpartyEmail: 'alerts@notify.bank-example.test' });
+    });
+  }
+
+  test('withholding never fabricates a close: my earlier outbound ask is still closed by their reply', () => {
+    const v = detectThreadLoop(thread([
+      msg({ from: 'me@example.com', to: ['alerts@notify.bank-example.test'], ageHours: 100, sent: true, body: 'Can you raise my limit?' }),
+      alert({ precedence: 'bulk' }),
+    ]), MY, NOW, sup());
+    expect(v.close).toEqual(['unanswered_outbound']);
+    expect(v.open).toEqual([]);
+  });
+
+  test('a cold founder intro in Primary still opens a loop', () => {
+    const v = detectThreadLoop(thread([msg({ from: 'founder@startup-example.test', to: ['me@example.com'], ageHours: 48,
+      labels: ['CATEGORY_PERSONAL'], subject: 'Intro: seed round', body: 'Would you have 20 minutes next week to hear about what we are building?' })]), MY, NOW, sup());
+    expect(v.open.map((o) => [o.loopType, o.counterpartyEmail])).toEqual([['unanswered_inbound', 'founder@startup-example.test']]);
+    expect(v.withheld).toBeUndefined();
+  });
+
+  const updatesIntro = () => thread([msg({ from: 'founder@startup-example.test', to: ['me@example.com'], ageHours: 48,
+    labels: ['CATEGORY_UPDATES'], subject: 'Intro: seed round', body: 'Would you have 20 minutes next week?' })]);
+
+  test('a cold founder intro in Updates opens a loop by default (the category alone never withholds)', () => {
+    const v = detectThreadLoop(updatesIntro(), MY, NOW, sup());
+    expect(v.open.map((o) => o.counterpartyEmail)).toEqual(['founder@startup-example.test']);
+  });
+
+  test('with the reciprocity rule on, Updates mail opens only for a sender the owner wrote to', () => {
+    const off = detectThreadLoop(updatesIntro(), MY, NOW, sup(), { ownerWroteTo: new Set() });
+    expect(off.open).toEqual([]);
+    expect(off.withheld).toEqual({ reason: 'updates_without_reciprocity', counterpartyEmail: 'founder@startup-example.test' });
+    const known = detectThreadLoop(updatesIntro(), MY, NOW, sup(), { ownerWroteTo: new Set(['founder@startup-example.test']) });
+    expect(known.open.map((o) => o.counterpartyEmail)).toEqual(['founder@startup-example.test']);
+  });
+
+  test('with the reciprocity rule on, an Updates thread the owner already wrote in still opens', () => {
+    const v = detectThreadLoop(thread([
+      msg({ from: 'me@example.com', to: ['billing@vendor-example.test'], ageHours: 100, sent: true, labels: ['CATEGORY_UPDATES'], body: 'Please resend the invoice.' }),
+      msg({ from: 'billing@vendor-example.test', to: ['me@example.com'], ageHours: 48, labels: ['CATEGORY_UPDATES'], body: 'Attached. Can you approve it?' }),
+    ]), MY, NOW, sup(), { ownerWroteTo: new Set() });
+    expect(v.open.map((o) => o.counterpartyEmail)).toEqual(['billing@vendor-example.test']);
+  });
+});
+
+describe('forwarded mail is judged by the note above the forward (#8941 keeps the forwarded body)', () => {
+  // Bodies go through the same trim the Gmail client applies, so these rows
+  // pin both halves: the forward keeps its whole body, and only the sender's
+  // own note decides whether it asks anything.
+  const GMAIL_FORWARD = [
+    '---------- Forwarded message ---------',
+    'From: Carol Example <carol@example.com>',
+    'Date: Mon, Aug 17, 2026 at 9:00 AM',
+    'Subject: Venue for the offsite',
+    'To: Me Example <me@example.com>',
+    '',
+    'Which venue did we settle on for the offsite? I need a headcount by Friday.',
+  ].join('\n');
+  const APPLE_FORWARD = [
+    'Begin forwarded message:',
+    '',
+    'From: Carol Example <carol@example.com>',
+    'Subject: Venue for the offsite',
+    '',
+    'Which venue did we settle on for the offsite?',
+  ].join('\n');
+  const forwardBody = (note: string, forwarded = GMAIL_FORWARD) => trimQuotedReply(note ? `${note}\n\n${forwarded}` : forwarded);
+  const myForward = (note: string, ageHours = 96, forwarded = GMAIL_FORWARD) =>
+    msg({ from: 'me@example.com', to: ['bob@example.com'], ageHours, sent: true, subject: 'Fwd: Venue for the offsite', body: forwardBody(note, forwarded) });
+
+  test('the forward keeps the forwarded message in its body', () => {
+    expect(forwardBody('FYI, see below.')).toContain('Which venue did we settle on');
+    expect(forwardBody('See below.', APPLE_FORWARD)).toContain('Which venue did we settle on');
+  });
+
+  for (const [name, m] of [
+    ['a Gmail forward with an FYI note over someone else\'s question', myForward('FYI, see below.')],
+    ['an Apple Mail forward with a "See below." note', myForward('See below.', 96, APPLE_FORWARD)],
+    ['a forward with no note at all', myForward('')],
+    ['an FYI note that only shares a link', myForward('FYI, context here: https://docs.example.com/view?id=42')],
+  ] as const) {
+    test(`${name} opens no waiting-on-them loop`, () => {
+      const v = detectThreadLoop(thread([m]), MY, NOW);
+      expect(v.open).toEqual([]);
+      expect(v.held).toBeUndefined();
+    });
+  }
+
+  test('a forward whose own note asks a question still opens the loop', () => {
+    const v = detectThreadLoop(thread([myForward('Can you take this one?')]), MY, NOW);
+    expect(v.open).toHaveLength(1);
+    expect(v.open[0].loopType).toBe('unanswered_outbound');
+    expect(v.open[0].counterpartyEmail).toBe('bob@example.com');
+  });
+
+  test('my question after an FYI forward opens at the question, not at the forward', () => {
+    const ask = msg({ from: 'me@example.com', to: ['bob@example.com'], ageHours: 80, sent: true, body: 'Did you get a chance to look?' });
+    const v = detectThreadLoop(thread([myForward('FYI, see below.', 400), ask]), MY, NOW);
+    expect(v.open).toHaveLength(1);
+    expect(v.open[0].openedMs).toBe(ask.internalDateMs);
+  });
+
+  test('their FYI forward to me is answered by my "Thanks!"', () => {
+    const v = detectThreadLoop(
+      thread([
+        msg({ from: 'bob@example.com', to: ['me@example.com'], ageHours: 40, subject: 'Fwd: Venue for the offsite', body: forwardBody('FYI, see below.') }),
+        msg({ from: 'me@example.com', to: ['bob@example.com'], ageHours: 30, sent: true, body: 'Thanks!' }),
+      ]),
+      MY,
+      NOW,
+    );
+    expect(v.open).toEqual([]);
+    expect(v.close).toEqual(['unanswered_inbound']);
+  });
+
+  test('their forward that asks me in its note still owes a real answer', () => {
+    const v = detectThreadLoop(
+      thread([
+        msg({ from: 'bob@example.com', to: ['me@example.com'], ageHours: 40, subject: 'Fwd: Venue for the offsite', body: forwardBody('Can you answer Carol?') }),
+        msg({ from: 'me@example.com', to: ['bob@example.com'], ageHours: 30, sent: true, body: 'Thanks!' }),
+      ]),
+      MY,
+      NOW,
+    );
+    expect(v.open).toHaveLength(1);
+    expect(v.open[0].loopType).toBe('unanswered_inbound');
+  });
+
+  test('asksQuestion reads only the text above a forward separator', () => {
+    expect(asksQuestion(forwardBody('FYI, see below.'))).toBe(false);
+    expect(asksQuestion(forwardBody('Thoughts?'))).toBe(true);
+    expect(asksQuestion('Is "---------- Forwarded message ---------" the separator Gmail writes?')).toBe(true);
   });
 });

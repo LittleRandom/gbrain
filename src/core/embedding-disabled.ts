@@ -7,7 +7,18 @@
 import { loadConfig, type GBrainConfig } from './config.ts';
 import type { BrainEngine } from './engine.ts';
 
-export async function embeddingsDisabled(engine?: { getConfig(key: string): Promise<string | null> } | null): Promise<boolean> {
+let readConsumerConfig: ((engine: BrainEngine) => GBrainConfig | undefined) | null = null;
+
+/**
+ * persistence/service.ts registers its consumer-config reader as it loads. A
+ * process that never loaded it runs no persistence consumer, so a read-only
+ * command (search, query) never pays for that module graph here.
+ */
+export function registerPersistenceConsumerConfig(read: (engine: BrainEngine) => GBrainConfig | undefined): void {
+  readConsumerConfig = read;
+}
+
+export async function embeddingsDisabled(engine?: { getConfig(key: string): Promise<string | null> } | null, onReadFailure = false): Promise<boolean> {
   try {
     if (loadConfig()?.embedding_disabled === true) return true;
   } catch { /* unreadable config: fall through to the DB plane */ }
@@ -15,8 +26,17 @@ export async function embeddingsDisabled(engine?: { getConfig(key: string): Prom
   try {
     return (await engine.getConfig('embedding_disabled')) === 'true';
   } catch {
-    return false;
+    return onReadFailure;
   }
+}
+
+/**
+ * The guard for a route that would send brain text to the embedding provider:
+ * embeddingsDisabled, except that a DB-plane read that fails answers true, so
+ * an unknown policy never sends text out.
+ */
+export function embeddingSendBlocked(engine?: { getConfig(key: string): Promise<string | null> } | null): Promise<boolean> {
+  return embeddingsDisabled(engine, true);
 }
 
 /**
@@ -28,10 +48,7 @@ export async function embeddingsDisabled(engine?: { getConfig(key: string): Prom
  */
 export async function factEmbeddingDisabled(engine: BrainEngine | null | undefined, config?: GBrainConfig | null): Promise<boolean> {
   let effective = config ?? null;
-  if (!effective && engine) {
-    const { persistenceConsumerConfig } = await import('./persistence/service.ts');
-    effective = persistenceConsumerConfig(engine) ?? null;
-  }
+  if (!effective && engine && readConsumerConfig) effective = readConsumerConfig(engine) ?? null;
   if (effective?.embedding_disabled === true) return true;
-  return embeddingsDisabled(engine);
+  return embeddingSendBlocked(engine);
 }

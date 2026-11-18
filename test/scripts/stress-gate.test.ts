@@ -10,7 +10,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { GitHubClient } from '../../scripts/lib/gh-issue.ts';
 import {
-  RACE_MAX_SHARDS, RACE_MIN_ITERATIONS, RACE_SHARD_BUDGET_MS, buildReport, loadExemptions, matchExemption, missingWork,
+  RACE_FLOOR_MAX_SHARDS, RACE_MAX_SHARDS, RACE_MIN_ITERATIONS, RACE_SHARD_BUDGET_MS, buildReport, loadExemptions, matchExemption, missingWork,
   parseExemptionBlocks, planGate, planRaceHunt, shardTimings, type GhIssue, type Plan, type StressFailure,
 } from '../../scripts/stress/gate.ts';
 import type { Weights } from '../../scripts/stress/plan.ts';
@@ -55,6 +55,42 @@ describe('gate plan', () => {
     expect(plan.files.map(f => [f.file, f.profile, f.iterations])).toEqual([['test/a.test.ts', 'unit', 10], ['test/c.serial.test.ts', 'serial', 10]]);
     expect(plan.notStressed).toEqual([{ file: 'test/e2e/x.live.test.ts', reason: expect.stringContaining('paid-provider') }]);
     expect(plan.shards.flatMap(s => s.items).reduce((n, i) => n + i.count, 0)).toBe(20);
+  });
+
+  test('a changed file with no measured weight is planned at its lane p95 and split under the 12-minute budget', () => {
+    const { root, base } = repo({ 'test/a.test.ts': "test('a', () => {});\n" });
+    const head = commit(root, { 'test/new.test.ts': "test('new', () => {});\n" });
+    const unit = new Map(Array.from({ length: 20 }, (_, i) => [`test/w${i}.test.ts`, (i + 1) * 10_000] as [string, number]));
+    const plan = isPlan(planGate(root, { event: 'pull_request', baseSha: base, headSha: head }, { ...weights(), unit }));
+    expect(plan.files).toEqual([{ file: 'test/new.test.ts', profile: 'unit', iterations: 10, estimateMs: 10 * (190_000 + 3000) }]);
+    expect(plan.shards.map(s => s.items.reduce((n, i) => n + i.count, 0)).sort()).toEqual([1, 3, 3, 3]);
+    expect(plan.shards.every(s => s.estimateMs <= 12 * 60_000)).toBe(true);
+    expect(plan.shards.flatMap(s => s.items).reduce((n, i) => n + i.count, 0)).toBe(10);
+  });
+
+  test('a plan past 256 shards at 12 minutes is re-planned at 25 minutes so GitHub accepts the matrix', () => {
+    const { root, base } = repo({ 'test/a.test.ts': "test('a', () => {});\n" });
+    const files = Array.from({ length: 130 }, (_, i) => `test/n${i}.test.ts`);
+    const head = commit(root, Object.fromEntries(files.map(f => [f, "test('n', () => {});\n"])));
+    const unit = new Map(files.map(f => [f, 100_000] as [string, number]));
+    const plan = isPlan(planGate(root, { event: 'pull_request', baseSha: base, headSha: head }, { ...weights(), unit }));
+    expect(plan.shards.length).toBeLessThanOrEqual(256);
+    expect(plan.shards.some(s => s.estimateMs > 12 * 60_000)).toBe(true);
+    expect(plan.shards.every(s => s.estimateMs <= 25 * 60_000)).toBe(true);
+    expect(plan.shards.flatMap(s => s.items).reduce((n, i) => n + i.count, 0)).toBe(1300);
+  });
+
+  test('a plan still past 256 shards at 25 minutes fails with a named error instead of a matrix GitHub refuses', () => {
+    const { root, base } = repo({ 'test/a.test.ts': "test('a', () => {});\n" });
+    const files = Array.from({ length: 257 }, (_, i) => `test/n${i}.test.ts`);
+    const head = commit(root, Object.fromEntries(files.map(f => [f, "test('n', () => {});\n"])));
+    const unit = new Map(files.map(f => [f, 100_000] as [string, number]));
+    const result = planGate(root, { event: 'pull_request', baseSha: base, headSha: head }, { ...weights(), unit });
+    const { error, why } = result as { error: string; why?: string };
+    expect(error).toContain("GitHub's 256-job matrix limit");
+    expect(error).toContain('Next: split the PR so each part plans 256 shards or fewer');
+    expect(error).not.toContain('stress_files');
+    expect(why).toContain('would let the rest land untested');
   });
 
   test('a missing merge base fails the plan with the fetch next step', () => {
@@ -118,6 +154,17 @@ describe('race hunt plan', () => {
     const deep = (p: Plan) => p.files.filter(f => f.iterations > Math.min(...p.files.map(x => x.iterations))).map(f => f.file);
     expect(deep(monday)).not.toEqual(deep(tuesday));
     expect(monday.shards.every(s => s.estimateMs <= RACE_SHARD_BUDGET_MS)).toBe(true);
+  });
+
+  test('a 3-iteration floor past 12 shards runs every file in a second group of up to 24 shards', () => {
+    const root = armsRepo(20);
+    const plan = planRaceHunt(root, { day: 0 }, weights(Object.fromEntries(list(20).map(f => [f, 15 * 60_000]))));
+    expect(plan.unrun).toEqual([]);
+    expect(plan.files.map(f => f.file)).toEqual(list(20));
+    expect(plan.files.every(f => f.iterations === RACE_MIN_ITERATIONS)).toBe(true);
+    expect(plan.shards.length).toBeGreaterThan(RACE_MAX_SHARDS);
+    expect(plan.shards.length).toBeLessThanOrEqual(RACE_FLOOR_MAX_SHARDS);
+    expect(plan.shards.every(s => s.estimateMs <= RACE_SHARD_BUDGET_MS)).toBe(true);
   });
 
   test('a set that does not fit at 3 iterations fails "race hunt over budget" naming the unrun files', () => {

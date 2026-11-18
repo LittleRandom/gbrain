@@ -3,6 +3,7 @@ import { resolveGitHubAccount } from './persistence/connector-account.ts';
 import { isValidRepoName } from './github-source-config.ts';
 import { connectorRender } from './connectors/connector-text.ts';
 import { ConnectorHoldSession, connectorHoldsResult } from './connectors/connector-hold-session.ts';
+import { connectorDryRunResult } from './connectors/api-source.ts';
 export { isValidRepoName, parseGitHubSourceConfig } from './github-source-config.ts';
 export { AppTokenProvider, mintAppInstallationToken } from './github-app-token.ts';
 import { AppTokenProvider } from './github-app-token.ts';
@@ -48,6 +49,12 @@ import type { SyncOpts } from '../commands/sync.ts';
 import { isWriteTargetContained } from './path-confine.ts';
 import { createProgress, startHeartbeat } from './progress.ts';
 import { getCliOptions, cliOptsToProgressOptions } from './cli-options.ts';
+import { replaceableFile } from './facts/file-body-guard.ts';
+import { assertInlineBody } from './page-body/page-shape.ts';
+import { OperationError } from './ops/contract.ts';
+import { isWriteThroughDisabled } from './write-through.ts';
+import { isSourceDbOnlySlug } from './persistence/source-storage.ts';
+import { neutralizeOutsideText } from './outside-content.ts';
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -730,13 +737,7 @@ export function renderRepoCard(repo: string, data: RawRepo, syncedAt: string | n
     `private: ${data.private}`,
     ...(syncedAt === null ? [] : [`synced_at: ${yamlStr(syncedAt)}`]),
     '---',
-    '',
-    `# ${repo}`,
-    '',
-    data.description ?? '',
-    '',
-    `Default branch: ${data.default_branch}`,
-    '',
+    neutralizeOutsideText(['', `# ${repo}`, '', data.description ?? '', '', `Default branch: ${data.default_branch}`, ''].join('\n')),
   ].join('\n');
 }
 
@@ -848,7 +849,7 @@ export function renderItemPage(data: GitHubItemData, detailFetched = true, synce
     }
   }
 
-  return frontmatter.join('\n') + '\n' + body.join('\n') + '\n';
+  return frontmatter.join('\n') + '\n' + neutralizeOutsideText(body.join('\n')) + '\n';
 }
 
 /**
@@ -965,20 +966,35 @@ async function materializePage(deps: GitHubSyncDeps, filePath: string, content: 
   const rel = relative(deps.cfg.dir, filePath).replace(/\\/g, '/');
   content = connectorRender(content, { path: rel });
   if (deps.managed) return deps.managed.importMarkdown(rel, content);
-  const created = !existsSync(filePath);
+  const slug = slugifyPath(rel);
+  const existing = await deps.engine.getPage(slug, { sourceId: deps.sourceId });
+  if (existing) assertInlineBody(existing, 'GitHub connector materialization');
+  const databaseOnly = await isWriteThroughDisabled(deps.engine) || isSourceDbOnlySlug(deps.cfg.dir, slug, 'refuse');
+  if (databaseOnly) return { ...await importPage(deps, filePath, activePack, rel, content), created: !existing };
+  const guard = await replaceableFile(deps.engine, deps.sourceId, slug, filePath);
+  const drift = () => new OperationError('file_database_drift',
+    `${slug}: the checkout file has an edit not retained in the database, or changed during import. The file was not replaced. If the file is newer, run gbrain sync --source ${deps.sourceId}; if the database is newer, re-save its page with write-through on; if both changed, ask the user which version to keep before retrying.`,
+    'Import the newer file with gbrain sync, or ask the user which version to keep; the item is held until then.');
+  if (!guard.ok) throw drift();
+  const created = guard.expectedFileBytes === null;
   mkdirSync(dirname(filePath), { recursive: true });
   const tmpPath = `${filePath}.tmp`;
   writeFileSync(tmpPath, content, 'utf-8');
   try {
     const result = await importPage(deps, tmpPath, activePack, rel);
+    const current = existsSync(filePath) ? readFileSync(filePath, 'utf8') : null;
+    if (current !== guard.expectedFileBytes) throw drift();
     renameSync(tmpPath, filePath);
     return { ...result, created };
   } finally { rmSync(tmpPath, { force: true }); }
 }
 
 async function storedPage(deps: GitHubSyncDeps, filePath: string, apiUpdatedAt: string) {
-  if (!deps.managed) return { fresh: isPageFresh(filePath, apiUpdatedAt), hasDetail: pageHasDetail(filePath), exists: existsSync(filePath) };
-  const page = await deps.managed.page(relative(deps.cfg.dir, filePath).replace(/\\/g, '/').replace(/\.md$/, ''));
+  const slug = relative(deps.cfg.dir, filePath).replace(/\\/g, '/').replace(/\.md$/, '');
+  if (!deps.managed && !await isWriteThroughDisabled(deps.engine) && !isSourceDbOnlySlug(deps.cfg.dir, slugifyPath(slug), 'refuse')) {
+    return { fresh: isPageFresh(filePath, apiUpdatedAt), hasDetail: pageHasDetail(filePath), exists: existsSync(filePath) };
+  }
+  const page = deps.managed ? await deps.managed.page(slug) : await deps.engine.getPage(slugifyPath(slug), { sourceId: deps.sourceId });
   return { exists: !!page, fresh: typeof page?.frontmatter.updated_at === 'string' && page.frontmatter.updated_at >= apiUpdatedAt,
     hasDetail: !!page && page.frontmatter.detail_fetched !== false };
 }
@@ -988,14 +1004,17 @@ async function importPage(
   filePath: string,
   activePack: { page_types: ReadonlyArray<{ name: string; path_prefixes: ReadonlyArray<string> }> } | undefined,
   relPathOverride?: string,
+  content?: string,
 ): Promise<{ slug: string; chunks: number; status: 'imported' | 'skipped' }> {
-  const { importFile } = await import('./import-file.ts');
+  const { importFile, importFromContent } = await import('./import-file.ts');
   const rel = relPathOverride ?? relative(deps.cfg.dir, filePath).replace(/\\/g, '/');
-  const result = await importFile(deps.engine, filePath, rel, {
+  const opts = {
     noEmbed: true, // embeddings handled by the size gate below, like sync
     sourceId: deps.sourceId,
     activePack,
-  });
+  };
+  const result = content === undefined ? await importFile(deps.engine, filePath, rel, opts)
+    : await importFromContent(deps.engine, slugifyPath(rel), content, { ...opts, sourcePath: rel, preserveGateMarkers: true, holdNoncanonicalPrivate: true });
   if (result.status === 'error' || result.error) {
     throw new Error(result.error ?? `Import failed for ${rel}`);
   }
@@ -1073,7 +1092,7 @@ export async function runGitHubSync(
   fetchImpl?: FetchImpl,
 ): Promise<import('../commands/sync.ts').SyncResult> {
   return withConnectorSync(engine, sourceId, 'github', cfg, opts,
-    (managed, options) => runGitHubSyncInner(engine, sourceId, cfg, options, managed, fetchImpl), pendingConnectorResult);
+    async (managed, options) => options.dryRun ? connectorDryRunResult('github', sourceId) : runGitHubSyncInner(engine, sourceId, cfg, options, managed, fetchImpl), pendingConnectorResult);
 }
 
 async function runGitHubSyncInner(engine: BrainEngine, sourceId: string, cfg: GitHubSourceConfig, opts: SyncOpts,
@@ -1221,7 +1240,15 @@ async function runGitHubSyncInner(engine: BrainEngine, sourceId: string, cfg: Gi
           // so they are re-fetched every sweep. Cost is bounded by the number
           // of open PRs, which is small in practice.
           const isOpenPr = item.kind === 'pr' && item.state === 'open';
-          const { fresh, hasDetail } = await storedPage(deps, filePath, item.updated_at);
+          // #9062: a stored page this read cannot load (one stored in segments over the single-string ceiling) fails this item, not the run.
+          let stored: Awaited<ReturnType<typeof storedPage>>;
+          try {
+            stored = await storedPage(deps, filePath, item.updated_at);
+          } catch (err) {
+            await itemFailed(repo, item, err, ' stored page read');
+            continue;
+          }
+          const { fresh, hasDetail } = stored;
           if (!opts.full && !isOpenPr && fresh && hasDetail) {
             // Cursor accounting: a fresh skip is a success too. Without this,
             // a repo whose newest item is always fresh stays re-listed on
@@ -1447,8 +1474,10 @@ async function runExtractAndEmbed(
       const sub = await submitEmbedBackfill(deps.engine, deps.sourceId, { reason: 'github_sync_defer' });
       if (sub.status === 'submitted') {
         process.stderr.write(`[github] large sync (${totalChanges} pages); embeds deferred to embed-backfill job ${sub.jobId} — or ${drainHint}\n`);
-      } else if (sub.status === 'cooldown' || sub.status === 'spend_capped' || sub.status === 'no_worker_surface') {
+      } else if (sub.status === 'cooldown' || sub.status === 'spend_capped' || sub.status === 'no_worker_surface' || sub.status === 'stalled') {
         process.stderr.write(`[github] large sync (${totalChanges} pages); embed-backfill not queued (${sub.status}) — ${drainHint}\n`);
+      } else if (sub.status === 'embedding_disabled') {
+        process.stderr.write(`[github] large sync (${totalChanges} pages); embed-backfill not queued: embedding is disabled on this brain (keyless by choice)\n`);
       } else { sub satisfies never; }
     } catch (err) {
       process.stderr.write(`[github] embed-backfill submission failed: ${err instanceof Error ? err.message : String(err)} — ${drainHint}\n`);

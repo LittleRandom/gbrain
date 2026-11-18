@@ -9,8 +9,10 @@ import type { SearchOpts } from '../types.ts';
 import { clampSearchLimit } from '../engine.ts';
 import { searchLimitCap } from './eval-pool-depth.ts';
 import { getFtsLanguage } from '../fts-language.ts';
-import { requiresSafeChunks } from './safe-chunks.ts';
+import { chunkGenerationFilter, requiresSafeChunks } from './safe-chunks.ts';
 import { normalizeAlias } from './alias-normalize.ts';
+import { titleNameVariants } from './title-match.ts';
+import { frontmatterWhereSql } from './frontmatter-where.ts';
 import { resolveBoostMap, resolveHardExcludes } from './source-boost.ts';
 import {
   boundWebsearchQuery,
@@ -27,7 +29,32 @@ export interface SearchTitlesDialect {
   relaxedPrefersIndex: boolean;
   /** Project `stale` from timeline_entries (PGLite); otherwise `false`. */
   staleProbe: boolean;
+  /** chunkManifestReads; unset reads the manifest. */
+  chunkManifest?: boolean;
+  /** Match and rank title lexemes only, for local callers too: the OR re-run whose whole-vector matches do not fit the cap (#7135) and the cut strict attempt (#7082). */
+  relaxed?: boolean;
+  /**
+   * A local caller's OR re-run (GST-2899): rank the whole-vector matches only when all of them fit
+   * `titleWholeVectorCandidates()`; a set that does not fit returns one row of nulls marked `candidates_cut`, and only then
+   * does the caller run the title-only statement. The candidate count has no ORDER BY, since nothing is cut from it: ordered by page id it walked
+   * pages_pkey for a word on a few percent of pages (about 0.8 s at 1,000,000 pages against 40 ms from idx_pages_search).
+   */
+  completeOnly?: boolean;
 }
+
+/**
+ * #7082: a local caller's strict attempt matches the whole vector (title plus
+ * timelines, timeline_entries rows included), and a very common word matched
+ * most pages, so ranking read every matching vector until the statement timeout.
+ * It now ranks at most this many matching pages, the ones with the lowest page
+ * ids, so a cut keeps the same pages on every call for the same data; a term
+ * that matches fewer is ranked exactly as before, and a cut attempt is
+ * completed by the title-only statement (engine-sql/titles.ts).
+ */
+let wholeVectorCandidates = 5000;
+export function titleWholeVectorCandidates(): number { return wholeVectorCandidates; }
+/** Test seam: lower the cap so a small fixture can be cut. */
+export function __setTitleWholeVectorCandidatesForTests(n: number): void { wholeVectorCandidates = n; }
 
 export interface SearchTitlesStatement {
   sql: string;
@@ -35,14 +62,6 @@ export interface SearchTitlesStatement {
   params: unknown[];
   safeChunks: boolean;
 }
-
-/**
- * Label every lexeme of a tsquery's text form with weight A
- * (`'acm' & !'secret'` → `'acm':A & !'secret':A`; prefix `'acm':*` →
- * `'acm':*A`). Lexemes are single-quoted with `''` escapes in that form.
- */
-const WEIGHT_A_QUERY = (ftsLang: string): string =>
-  `regexp_replace(websearch_to_tsquery('${ftsLang}', $1)::text, '(''(?:[^'']|'''')*'')(?::(\\*))?', '\\1:\\2A', 'g')::tsquery`;
 
 export function buildSearchTitlesStatement(query: string, opts: SearchOpts | undefined, dialect: SearchTitlesDialect): SearchTitlesStatement {
   const limit = clampSearchLimit(opts?.limit, 20, searchLimitCap());
@@ -57,11 +76,18 @@ export function buildSearchTitlesStatement(query: string, opts: SearchOpts | und
   // FTS config name (e.g. 'english', 'pt_br'). Validated by getFtsLanguage()
   // — safe to interpolate into raw SQL.
   const ftsLang = getFtsLanguage();
-  const tsq = `websearch_to_tsquery('${ftsLang}', $1)`;
-  const matchSql = safeChunks ? `p.search_vector @@ ${WEIGHT_A_QUERY(ftsLang)}` : `p.search_vector @@ ${tsq}`;
-  const rankSql = safeChunks ? `ts_rank_cd(ts_filter(p.search_vector, '{a}'), ${tsq})` : `ts_rank_cd(p.search_vector, ${tsq})`;
-
   const params: unknown[] = [boundWebsearchQuery(query), normalizeAlias(query), limit, offset];
+  // #7471: each given-name variant ("matthew example" for "Matt Example") is
+  // ORed into the query as its own websearch query, so a title that spells the
+  // given name another way still matches every word. The OR fallback rebinds
+  // only $1; a variant matches nothing there (the strict query found no page).
+  const tsqueries = ['$1', ...titleNameVariants(query).map(v => `$${params.push(v)}`)]
+    .map(p => `websearch_to_tsquery('${ftsLang}', gbrain_fts_input(${p}))`);
+  const tsq = tsqueries.length === 1 ? tsqueries[0] : `(${tsqueries.join(' || ')})`;
+  const titleOnly = safeChunks || dialect.relaxed === true;
+  const matchSql = titleOnly ? `ts_filter(p.search_vector, '{a}') @@ ${tsq}` : `p.search_vector @@ ${tsq}`;
+  const rankSql = titleOnly ? `ts_rank_cd(ts_filter(p.search_vector, '{a}'), ${tsq})` : `ts_rank_cd(p.search_vector, ${tsq})`;
+
   let filters = '';
   if (opts?.type) {
     params.push(opts.type);
@@ -71,6 +97,7 @@ export function buildSearchTitlesStatement(query: string, opts: SearchOpts | und
     params.push(opts.types);
     filters += ` AND p.type = ANY($${params.length}::text[])`;
   }
+  filters += frontmatterWhereSql('p', opts?.where, json => `$${params.push(json)}`);
   if (opts?.exclude_slugs?.length) {
     params.push(opts.exclude_slugs);
     filters += ` AND p.slug != ALL($${params.length}::text[])`;
@@ -104,18 +131,28 @@ export function buildSearchTitlesStatement(query: string, opts: SearchOpts | und
     ? `CASE WHEN tp.updated_at < (SELECT MAX(te.created_at) FROM timeline_entries te
          WHERE te.page_id = tp.page_id) THEN true ELSE false END`
     : 'false';
+  const pageFilters = `${filters}
+        ${hardExcludeClause}
+        ${visibilityClause}`;
+  const capped = !titleOnly;
   const sql = `
-    WITH top_pages AS (
-      SELECT p.slug, p.id AS page_id, p.title, p.type, p.source_id,
-        p.effective_date, p.effective_date_source, p.updated_at,
-        (lower(btrim(p.title, ' "''' || chr(160))) = $2) AS exact_title,
-        ${rankSql} * ${sourceFactorCase} AS score
-      FROM pages p
+    WITH ${capped ? `candidates AS MATERIALIZED (
+      SELECT p.id FROM pages p
       JOIN sources s ON s.id = p.source_id
       WHERE ${matchSql}
-        ${filters}
-        ${hardExcludeClause}
-        ${visibilityClause}
+        ${pageFilters}
+      ${dialect.completeOnly ? '' : 'ORDER BY p.id'}
+      LIMIT ${wholeVectorCandidates + 1}
+    ),
+    ` : ''}top_pages AS (
+      SELECT p.slug, p.id AS page_id, p.title, p.type, p.source_id,
+        p.effective_date, p.effective_date_source, p.updated_at, p.body_storage, p.body_generation,
+        (lower(btrim(p.title, ' "''' || chr(160))) = $2) AS exact_title,
+        ${rankSql} * ${sourceFactorCase} AS score
+      FROM ${capped ? `(SELECT id FROM candidates ORDER BY id LIMIT ${wholeVectorCandidates}) c JOIN pages p ON p.id = c.id` : 'pages p'}
+      JOIN sources s ON s.id = p.source_id
+      WHERE ${capped ? (dialect.completeOnly ? `(SELECT count(*) FROM candidates) <= ${wholeVectorCandidates}` : 'true') : `${matchSql}
+        ${pageFilters}`}
       ORDER BY exact_title DESC, score DESC, p.id ASC
       LIMIT $3 OFFSET $4
     )
@@ -126,17 +163,20 @@ export function buildSearchTitlesStatement(query: string, opts: SearchOpts | und
       COALESCE(rep.chunk_text, '') AS chunk_text,
       COALESCE(rep.chunk_source, 'compiled_truth') AS chunk_source,
       tp.score,
-      ${staleSql} AS stale
-    FROM top_pages tp
+      ${staleSql} AS stale,
+      ${capped ? `(SELECT count(*) FROM candidates) > ${wholeVectorCandidates}` : 'false'} AS candidates_cut
+    FROM ${dialect.completeOnly ? `(SELECT (SELECT count(*) FROM candidates) > ${wholeVectorCandidates} AS cut) k
+    LEFT JOIN top_pages tp ON true` : 'top_pages tp'}
     LEFT JOIN LATERAL (
       SELECT cc.id, cc.chunk_index, cc.chunk_text, cc.chunk_source
       FROM content_chunks cc
-      WHERE cc.page_id = tp.page_id
+      WHERE cc.page_id = tp.page_id AND ${chunkGenerationFilter('tp', 'cc', dialect.chunkManifest ?? true)}
         AND cc.modality = 'text'
         ${detailLow ? `AND cc.chunk_source = 'compiled_truth'` : ''}
       ORDER BY (cc.chunk_source = 'compiled_truth') DESC, cc.chunk_index ASC
       LIMIT 1
     ) rep ON true
+    ${dialect.completeOnly ? 'WHERE tp.page_id IS NOT NULL OR k.cut' : ''}
     ORDER BY tp.exact_title DESC, tp.score DESC, tp.page_id ASC
   `;
   return { sql, params, safeChunks };

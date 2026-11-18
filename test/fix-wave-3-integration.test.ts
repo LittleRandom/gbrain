@@ -56,7 +56,7 @@ import { handleToolCall } from '../src/mcp/server.ts';
 import { ALL_SOURCES } from '../src/core/source-id.ts';
 import { withEnv } from './helpers/with-env.ts';
 import { capture } from './helpers/wave-scenarios.ts';
-import { createConnectorFixture, options, json, googleConfig, githubConfig, issueFixture, githubFetch, contact, withGoogleAccount } from './helpers/connector-fixture.ts';
+import { createConnectorFixture, options, json, googleConfig, githubConfig, issueFixture, githubFetch, contact, withGoogleAccount, withPausedOwnerBudget } from './helpers/connector-fixture.ts';
 import { parseGitHubSourceConfig, runGitHubSync } from '../src/core/github-source.ts';
 import { renderFactsTable } from '../src/core/facts-fence.ts';
 
@@ -111,7 +111,7 @@ test('check 1 (S1): a cycle stamp mid-sweep while connector pages are pending; t
     await engine.executeRaw('UPDATE persistence_brain SET enabled=true WHERE singleton=1');
     const stamp = async () => { const now = new Date().toISOString(); await engine.updateSourceConfig(f.id, { last_source_cycle_at: now, last_full_cycle_at: now }); };
     const fetcher = people(() => [contact('first', 'First Example'), contact('second', 'Second Example')], { onList: stamp });
-    try { await google(engine, f, fetcher); } catch { /* the sweep stops on its wait budget with writes pending */ }
+    try { await withPausedOwnerBudget(() => google(engine, f, fetcher)); } catch { /* the sweep stops on its wait budget with writes pending */ }
     const pending = await engine.executeRaw<WriteRequest>("SELECT * FROM persistence_requests WHERE source_id=$1 AND intent->>'kind' LIKE '%import' AND state='queued'", [f.id]);
     expect(pending.length).toBe(2);
     await stamp();
@@ -404,14 +404,19 @@ test('check 8 (S1, Postgres): an unbound write, binding between admission and pu
     const registration = await registerLocalWriter(engine, 'cli');
     await withVerifiedLocalRegistration(engine, registration, async () => {
       const preview = await runReconcilePreview(engine, { source_id: f.id, slug: 'notes/kept' });
+      // GST-2579: sync never imported the checkout's file, so taking the database copy over it is refused and writes nothing.
+      await expect(runReconcilePreview(engine, { source_id: f.id, slug: 'notes/kept', from: preview.preview,
+        decisions: ((preview.conflict_paths ?? []) as string[]).map(path => ({ path, action: 'take_database' })) }))
+        .rejects.toMatchObject({ code: 'source_changed', detail: 'unimported_file_edit' });
+      expect(readFileSync(join(f.dir, 'notes/kept.md'), 'utf8')).toContain('Written into the checkout.');
       const resolved = await runReconcilePreview(engine, { source_id: f.id, slug: 'notes/kept', from: preview.preview,
-        decisions: ((preview.conflict_paths ?? []) as string[]).map(path => ({ path, action: 'take_database' })) });
+        decisions: ((preview.conflict_paths ?? []) as string[]).map(path => ({ path, action: 'take_file' })) });
       expect((await runReconcileApply(engine, { source_id: f.id, slug: 'notes/kept', preview: resolved.preview, request_id: randomUUID() })).state).toBe('committed');
     });
     expect((await engine.executeRaw<{ reason: string | null; path: string | null }>('SELECT database_only_reason AS reason,source_path AS path FROM pages WHERE source_id=$1 AND slug=$2',
       [f.id, 'notes/kept']))[0]).toEqual({ reason: null, path: 'notes/kept.md' });
     expect((await checkUnboundSource(engine)).status).toBe('ok');
-    expect(readFileSync(join(f.dir, 'notes/kept.md'), 'utf8')).toContain('Written while unbound.');
+    expect(readFileSync(join(f.dir, 'notes/kept.md'), 'utf8')).toContain('Written into the checkout.');
     await engine.setConfig('persistence.unbound_write', 'refuse');
     await disposePersistenceConsumer(engine);
   }
@@ -432,7 +437,7 @@ test('check 9: every registered repair kind reaches the remediation plan with it
     await engine.executeRaw("UPDATE pages SET contextual_retrieval_mode=NULL,chunker_version=1,text_projection_revision=gen_random_uuid() WHERE source_id=$1 AND slug='people/second-example'", [f.id]);
     await engine.executeRaw("INSERT INTO op_checkpoints(op,fingerprint,completed_keys,updated_at) VALUES('managed-connector',$1,'[]'::jsonb,now()-interval '9 days')", [`orphan-${randomUUID()}`]);
     const kinds = AUTO_REPAIR_REGISTRY.map(spec => spec.kind);
-    expect(kinds).toEqual(['timeline', 'visibility', 'safe-chunks', 'contextual-mode', 'connector-checkpoints', 'request-indexes', 'connector-fences', 'take-supersession', 'orphan-bindings', 'embedding-effects', 'attribution-backfill', 'planner-stats', 'fences']);
+    expect(kinds).toEqual(['timeline', 'visibility', 'safe-chunks', 'contextual-mode', 'connector-checkpoints', 'request-indexes', 'connector-fences', 'take-supersession', 'orphan-bindings', 'embedding-effects', 'attribution-backfill', 'planner-stats', 'fences', 'slug-conflicts', 'access']);
     const planned = Object.fromEntries((await planRepairSteps(engine, { noEmbed: true })).map(step => [step.kind, step]));
     expect(planned['contextual-mode']).toMatchObject({ paid: false, embeds: 'inline', command: 'gbrain repair contextual-mode --no-embed --apply' });
     expect(planned['connector-checkpoints']).toMatchObject({ paid: false, embeds: 'none' });

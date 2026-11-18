@@ -13,15 +13,16 @@ import { assertTopologyCommitted } from '../core/persistence/managed-sources.ts'
 import { parseSourceLifecycleArgs, type ParsedSourceLifecycle } from './sources-lifecycle-args.ts';
 import { reportPersistenceCliError } from './persistence-delegate.ts';
 import { adminHostConfig } from './persistence-admin.ts';
+import type { AddSourceOpts } from '../core/sources-ops.ts';
 
 export const SOURCE_LIFECYCLE_HELP = `Managed source administration:
-  gbrain sources add <id> [--path <directory> | --url <https-url> | --kind github|google]
+  gbrain sources add <id> [--path <directory> | --url <https-url> | --kind github|google|meetings|slack|imessage]
   gbrain sources archive <id>
   gbrain sources restore <id> [--no-federate]
   gbrain sources remove <id> --confirm-destructive
   gbrain sources purge <archived-id> --confirm-destructive
   gbrain sources set-path <id> <verified-directory>
-  gbrain sources set-path <id> --clear   (connector sources: clear a stale local_path)
+  gbrain sources set-path <id> --clear   (connector sources, or any relative local_path: clear it)
   gbrain sources reclone <id>
 
 All commands accept --request-id <uuid>, --expected-incarnation <uuid>, --dry-run,
@@ -36,12 +37,37 @@ function checkManagedOptions(parsed: ParsedSourceLifecycle): void {
     'Create the source without --pat-file. Configure supported postpublication Git effects separately.');
 }
 
+/** A slack source is checked against Slack (token, scopes, every channel) before it is registered. */
+async function preflightSlack(parsed: ParsedSourceLifecycle): Promise<void> {
+  const options = parsed.operation === 'source_add' && parsed.params.dry_run !== true ? parsed.params.options as AddSourceOpts | undefined : undefined;
+  if (options?.slack) await (await import('../core/slack/source-add.ts')).preflightSlackAdd(options.id, options.slack);
+}
+
 export async function executeSourceLifecycle(engine: BrainEngine, parsed: ParsedSourceLifecycle): Promise<Record<string, unknown>> {
   checkManagedOptions(parsed);
+  await preflightSlack(parsed);
   return runPersistenceAdministration(engine, parsed.operation, parsed.params);
 }
 
-async function render(result: Record<string, unknown>): Promise<void> {
+/** GST-2732: what a committed add means for default search and a plain folder, on stderr and as `notices`. */
+async function addOutcome(result: Record<string, unknown>, parsed?: ParsedSourceLifecycle, engine?: BrainEngine): Promise<Record<string, unknown>> {
+  const options = parsed?.operation === 'source_add' ? parsed.params.options as AddSourceOpts | undefined : undefined;
+  if (!options || result.dry_run === true || result.state !== 'committed') return result;
+  let federated = (result.config as Record<string, unknown> | undefined)?.federated;
+  if (federated === undefined && engine) {
+    const rows = await engine.executeRaw<{ f: unknown }>(`SELECT config->'federated' AS f FROM sources WHERE id = $1`, [options.id]).catch(() => []);
+    federated = rows[0]?.f ?? (rows.length ? false : undefined);
+  }
+  if (federated === undefined) return result;
+  const connector = !!(options.github || options.google || options.meetings || options.slack);
+  const notices = await (await import('./sources-add-next.ts')).reportAddOutcome({ id: options.id, chosen: connector ? true : options.federated,
+    federated: federated === true,
+    path: options.localPath && typeof result.local_path === 'string' ? result.local_path : null, json: false, say: line => console.error(line.trim()) });
+  return notices ? { ...result, notices } : result;
+}
+
+async function render(result: Record<string, unknown>, parsed?: ParsedSourceLifecycle, engine?: BrainEngine): Promise<void> {
+  result = await addOutcome(result, parsed, engine);
   await writeStdoutFinal(JSON.stringify(result, null, 2) + '\n');
   if (result.dry_run !== true) {
     try { assertTopologyCommitted(result); }
@@ -52,7 +78,8 @@ async function render(result: Record<string, unknown>): Promise<void> {
 /** Also called by connected command users so no legacy raw DELETE/UPDATE slips through. */
 export async function runConnectedSourceLifecycle(engine: BrainEngine, args: string[]): Promise<boolean> {
   if (!await managedPersistenceEnabled(engine)) return false;
-  await render(await executeSourceLifecycle(engine, parseSourceLifecycleArgs(args)));
+  const parsed = parseSourceLifecycleArgs(args);
+  await render(await executeSourceLifecycle(engine, parsed), parsed, engine);
   return true;
 }
 
@@ -73,10 +100,11 @@ export async function runSourceLifecycleCli(args: string[], getEngine: () => Pro
     }
     if (parsed) {
       // --pat-file must refuse before the resident owner can create anything.
+      await preflightSlack(parsed);
       const delegated = await maybeDelegateLocalAdministration(parsed.operation,
         { ...parsed.params, ...(parsed.legacyOnly ? { legacy_hardening: true } : {}) }, config,
         { timeoutMs: getCliOptions().timeoutMs ?? undefined });
-      if (delegated.handled) { await render(delegated.result as Record<string, unknown>); return; }
+      if (delegated.handled) { await render(delegated.result as Record<string, unknown>, parsed); return; }
     } else {
       // An invalid mutation must not attempt another datastore open while its owner is live.
       const { inspectLockHolder } = await import('../core/pglite-lock.ts');
@@ -85,7 +113,7 @@ export async function runSourceLifecycleCli(args: string[], getEngine: () => Pro
     const engine = await getEngine();
     if (await managedPersistenceEnabled(engine)) {
       if (!parsed) throw parseError;
-      await render(await executeSourceLifecycle(engine, parsed));
+      await render(await executeSourceLifecycle(engine, parsed), parsed, engine);
     } else {
       const { runSources } = await import('./sources.ts');
       await runSources(engine, args);

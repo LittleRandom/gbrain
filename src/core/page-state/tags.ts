@@ -20,3 +20,13 @@ export async function mutatePageTag(engine: BrainEngine, key: PageKey, tag: stri
     }
   });
 }
+
+/**
+ * #5984: addTag for many tags of one page the caller wrote in this transaction
+ * (its id from that write, its page guard held): one statement with the same
+ * claim rules (an explicit add claims the tag; a frontmatter claim only adopts
+ * an unclaimed legacy row).
+ */
+export async function addPageTags(engine: Pick<BrainEngine, 'addPageTagsById'>, pageId: number, tags: readonly string[], tagSource?: 'frontmatter'): Promise<void> {
+  await engine.addPageTagsById(pageId, tags, tagSource ? { tagSource } : undefined);
+}

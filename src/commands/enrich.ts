@@ -37,7 +37,7 @@ import { maintenancePreflight, publishMaintenancePage, type MaintenanceAuthority
 import { preserveCanonicalFences } from '../core/cycle/concept-publication.ts';
 import type { WriteReceipt } from '../core/persistence/types.ts';
 import type { OperationContext } from '../core/operations.ts';
-import { configureGatewayIfUninitialized, isAvailable, chat, getChatModel, withBudgetTracker } from '../core/ai/gateway.ts';
+import { configureGatewayIfUninitialized, isAvailable, chat, getChatModel, withBudgetTracker, isThinkingModel, THINKING_MODEL_MAX_OUTPUT_TOKENS } from '../core/ai/gateway.ts';
 import { BudgetTracker, BudgetExhausted, loadPricingOverrides, type BudgetReason, type NoPricingGuidance } from '../core/budget/budget-tracker.ts';
 import { noPricingSteps } from '../core/budget/no-pricing.ts';
 import { CapFlagError, mergeCapFlag, parseCapFlag, type CapFlag } from '../core/budget/cap-flag.ts';
@@ -72,6 +72,7 @@ import {
   parseSynthesis,
   type EnrichEvidence,
 } from '../core/enrich/thin.ts';
+import { restoreNeutralized } from '../core/think/sanitize.ts';
 
 // ---------------------------------------------------------------------------
 // Tunables (exported for tests).
@@ -230,14 +231,14 @@ function completedKey(sourceId: string, slug: string): string {
 // Default synthesis via the gateway.
 // ---------------------------------------------------------------------------
 
-const defaultSynthesize: SynthesizeFn = async ({ system, user, model, abortSignal }) => {
+/** No prompt cache: the system prompt is below the smallest cacheable prefix, so a cache would only mark this page's evidence (#9541). */
+export const defaultSynthesize: SynthesizeFn = async ({ system, user, model, abortSignal }) => {
   const res = await chat({
     model,
     system,
     messages: [{ role: 'user', content: user }],
-    maxTokens: 2048,
+    maxTokens: isThinkingModel(model) ? THINKING_MODEL_MAX_OUTPUT_TOKENS : 2048,
     abortSignal,
-    cacheSystem: true,
   });
   return res.text;
 };
@@ -443,7 +444,9 @@ async function enrichOneLocked(ctx: EnrichOneCtx, candidate: EnrichCandidate): P
   // Write via the put_page op handler (trusted local: remote=false) so
   // auto-link + disk write-through fire, exactly like `gbrain capture`. The
   // retrieved context was sanitized in buildEnrichPrompt; the synthesized body
-  // is the model's grounded output.
+  // is the model's grounded output, with any neutralized span it copied from
+  // the prompt restored from the raw stub and evidence (#7125).
+  const body = restoreNeutralized(parsed.body, [page.compiled_truth ?? '', ...evidence.map(e => e.text)].join('\n')).text;
   const tags = snapshot.tags;
   const newFrontmatter: Record<string, unknown> = {
     ...page.frontmatter,
@@ -454,7 +457,7 @@ async function enrichOneLocked(ctx: EnrichOneCtx, candidate: EnrichCandidate): P
   };
   // The model owns the prose only: the page's facts/takes fences are carried
   // over verbatim so publication never expires fence facts or deletes takes.
-  const content = serializeMarkdown(newFrontmatter, preserveCanonicalFences(page, parsed.body), page.timeline ?? '', {
+  const content = serializeMarkdown(newFrontmatter, preserveCanonicalFences(page, body), page.timeline ?? '', {
     type: page.type,
     title: page.title,
     tags,
@@ -509,6 +512,7 @@ export async function runEnrichCore(
     pages_failed: 0,
   };
 
+  if (await (await import('../core/storage-manifest/door.ts')).isStorageManifestSource(engine, opts.sourceId)) return result;
   const sourceId = opts.sourceId;
   const types = opts.types && opts.types.length > 0 ? opts.types : DEFAULT_TYPES;
   const order: EnrichOrder = ENRICH_ORDERS.includes(opts.order as EnrichOrder)

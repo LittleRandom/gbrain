@@ -18,6 +18,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   MIGRATION_VERSIONS,
+  RECONCILE_MIGRATION_VERSIONS,
   MAX_CONSECUTIVE_PARTIALS,
   compareVersions,
   statusForVersion,
@@ -35,6 +36,9 @@ function entry(version: string, status: CompletedMigrationEntry['status']): Comp
 describe('MIGRATION_VERSIONS registry sync (EV4)', () => {
   test('matches the real migration registry exactly, in order', () => {
     expect([...MIGRATION_VERSIONS]).toEqual(migrations.map(m => m.version));
+  });
+  test('RECONCILE_MIGRATION_VERSIONS lists exactly the migrations that declare reconcile', () => {
+    expect([...RECONCILE_MIGRATION_VERSIONS]).toEqual(migrations.filter(m => m.reconcile).map(m => m.version));
   });
 });
 
@@ -126,7 +130,7 @@ describe('get_health op layer (dispatchToolCall, real PGLiteEngine)', () => {
 
   const STDIO = { remote: true, transport: 'stdio' as const, sourceId: 'default' };
 
-  test('migrations block carries the five ledger keys', async () => {
+  test('migrations block carries the six ledger keys (declined since #6466)', async () => {
     const { dispatchToolCall } = await import('../src/mcp/dispatch.ts');
     // GBRAIN_HOME is a PARENT dir — configDir() appends '.gbrain' itself.
     const home = mkdtempSync(join(tmpdir(), 'gbrain-ledger-op-'));
@@ -136,9 +140,10 @@ describe('get_health op layer (dispatchToolCall, real PGLiteEngine)', () => {
       expect(res.isError ?? false).toBe(false);
       const body = JSON.parse(res.content[0].text) as {
         page_count: number;
-        migrations: { pending: string[]; pending_fresh_install: string[]; partial: string[]; wedged: string[]; skipped_future: number };
+        migrations: { pending: string[]; pending_fresh_install: string[]; partial: string[]; wedged: string[]; declined: string[]; skipped_future: number };
       };
-      expect(Object.keys(body.migrations).sort()).toEqual(['partial', 'pending', 'pending_fresh_install', 'skipped_future', 'wedged'].sort());
+      expect(Object.keys(body.migrations).sort()).toEqual(['declined', 'partial', 'pending', 'pending_fresh_install', 'skipped_future', 'wedged'].sort());
+      expect(body.migrations.declined).toEqual([]);
       expect(Array.isArray(body.migrations.pending_fresh_install)).toBe(true);
       expect(Array.isArray(body.migrations.pending)).toBe(true);
       expect(Array.isArray(body.migrations.partial)).toBe(true);

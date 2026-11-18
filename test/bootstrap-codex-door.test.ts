@@ -8,8 +8,8 @@
  *  1. The RENDERED AGENTS.md carries Gate 3 ("Entity lookup (brain first)") in
  *     full — search-the-brain-before-answering with the actual brain tools —
  *     so a Codex agent with no hooks still pulls context every turn.
- *  2. `registerCodexMcp` argv pins `serve --surface starter` (bootstrap's page,
- *     timeline and verb tools, not a narrowed `verbs`) and binds GBRAIN_SOURCE so a
+ *  2. `registerCodexMcp` argv pins `serve --surface starter` (REGISTRATION_SURFACE:
+ *     bootstrap's page, timeline and verb tools, not a narrowed `verbs`) and binds GBRAIN_SOURCE so a
  *     GUI-spawned serve (which inherits no shell env) writes to the workspace
  *     source [G1, CX-P1.4].
  */

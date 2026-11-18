@@ -16,14 +16,24 @@
 import type { BrainEngine, LinkBatchInput } from './engine.ts';
 import type { Page } from './types.ts';
 import { executeRawJsonb } from './sql-query.ts';
-import { deriveTemporalEvidence, rowKey, type TemporalEvidence } from './link-temporal-evidence.ts';
+import { datedLines, deriveTemporalEvidence, narrativeRefs, rowKey, temporalEvidenceFrom, type TemporalEvidence, type TemporalInputs } from './link-temporal-evidence.ts';
 import { refreshRelationships, type RelationshipKey } from './link-relationships.ts';
 import { temporalLinkTypes } from './link-validity.ts';
-import { inlineTransitions } from './link-effective.ts';
+import { inlineTransitions, inlineTransitionsFrom, rangedRelationLines, type RangedRelationLine } from './link-effective.ts';
+import { pipelined } from './page-state/transactions.ts';
 
 type Tx = Pick<BrainEngine, 'executeRaw'>;
 
 const DERIVED_PRODUCERS = ['timeline', 'explicit', 'frontmatter', 'dream', 'inline'];
+
+/** What the evidence reads from the page body, collected outside the transaction (a segmented page's body is not read here). */
+export interface TemporalBody extends TemporalInputs { ranged: RangedRelationLine[] }
+
+/** The TemporalBody of a body held as strings. */
+export function temporalBodyOf(page: { compiled_truth: string; timeline?: string | null }): TemporalBody {
+  const content = `${page.compiled_truth}\n${page.timeline ?? ''}`;
+  return { lines: datedLines(content), narrative: narrativeRefs(page.compiled_truth), ranged: rangedRelationLines(content) };
+}
 
 export interface TemporalApplyResult {
   transitions: number;
@@ -49,17 +59,18 @@ export async function applyTemporalEvidence(
   page: Pick<Page, 'id' | 'slug' | 'source_id' | 'compiled_truth' | 'timeline' | 'frontmatter'>,
   rows: readonly LinkBatchInput[],
   keysBefore: readonly RelationshipKey[],
-  opts: { inlineRanges?: boolean } = {},
+  opts: { inlineRanges?: boolean; body?: TemporalBody } = {},
 ): Promise<TemporalApplyResult> {
   const pageId = Number(page.id);
   const sourceId = page.source_id ?? 'default';
-  const evidence = deriveTemporalEvidence({
-    slug: page.slug, compiled_truth: page.compiled_truth ?? '', timeline: page.timeline ?? '',
-    frontmatter: (page.frontmatter ?? {}) as Record<string, unknown>,
-  }, rows.map(r => ({ from_slug: r.from_slug, to_slug: r.to_slug, link_type: r.link_type, link_source: r.link_source ?? 'markdown', origin_field: r.origin_field ?? null })));
-  const inline = opts.inlineRanges
-    ? inlineTransitions(page.slug, `${page.compiled_truth ?? ''}\n${page.timeline ?? ''}`, rows.filter(r => (r.link_source ?? 'markdown') !== 'frontmatter'))
-    : { transitions: [], unmatched: [] };
+  const owned = rows.map(r => ({ from_slug: r.from_slug, to_slug: r.to_slug, link_type: r.link_type, link_source: r.link_source ?? 'markdown', origin_field: r.origin_field ?? null }));
+  const frontmatter = (page.frontmatter ?? {}) as Record<string, unknown>;
+  const evidence = opts.body ? temporalEvidenceFrom({ slug: page.slug, frontmatter }, opts.body, owned)
+    : deriveTemporalEvidence({ slug: page.slug, compiled_truth: page.compiled_truth ?? '', timeline: page.timeline ?? '', frontmatter }, owned);
+  const bodyRows = rows.filter(r => (r.link_source ?? 'markdown') !== 'frontmatter');
+  const inline = !opts.inlineRanges ? { transitions: [], unmatched: [] }
+    : opts.body ? inlineTransitionsFrom(page.slug, opts.body.ranged, bodyRows)
+    : inlineTransitions(page.slug, `${page.compiled_truth ?? ''}\n${page.timeline ?? ''}`, bodyRows);
   const transitions = [...evidence.transitions, ...inline.transitions];
 
   const tenseRows = rows.filter(r => evidence.tense.has(rowKey(r))).map(r => ({
@@ -67,8 +78,8 @@ export async function applyTemporalEvidence(
     from_source_id: r.from_source_id ?? sourceId, to_source_id: r.to_source_id ?? sourceId,
     tense: evidence.tense.get(rowKey(r)) === 'past' ? 'past' : null,
   }));
-  if (tenseRows.length) {
-    await executeRawJsonb(tx,
+  // The tense update, the transition replacement, the target check and the after-read are sent together, in this order.
+  const tense = tenseRows.length ? () => executeRawJsonb(tx,
       `UPDATE links l SET assertion_tense = v.tense
          FROM jsonb_to_recordset(($2::jsonb)->'rows') AS v(from_slug text, to_slug text, link_type text, link_source text,
            from_source_id text, to_source_id text, tense text)
@@ -77,13 +88,8 @@ export async function applyTemporalEvidence(
         WHERE l.from_page_id = f.id AND l.to_page_id = t.id AND l.link_type = v.link_type AND l.link_source = v.link_source
           AND (l.origin_page_id = $1 OR (l.origin_page_id IS NULL AND l.from_page_id = $1))
           AND l.assertion_tense IS DISTINCT FROM v.tense`,
-      [pageId], [{ rows: tenseRows }]);
-  }
-
-  await tx.executeRaw(`DELETE FROM link_transitions WHERE origin_page_id = $1 AND producer = ANY($2::text[])`, [pageId, DERIVED_PRODUCERS]);
-  let inserted: RelationshipKey[] = [];
-  if (transitions.length) {
-    inserted = await executeRawJsonb<RelationshipKey>(tx,
+      [pageId], [{ rows: tenseRows }]) : async () => undefined;
+  const insert = transitions.length ? () => executeRawJsonb<RelationshipKey>(tx,
       `INSERT INTO link_transitions (source_id, from_page_id, to_page_id, link_type, kind, occurred_on, date_precision, producer, origin_page_id, line_hash)
        SELECT $2, f.id, t.id, v.link_type, v.kind, v.occurred_on::date, v.date_precision, v.producer, $1, v.line_hash
          FROM jsonb_to_recordset(($3::jsonb)->'rows') AS v(from_slug text, to_slug text, link_type text, kind text,
@@ -92,20 +98,25 @@ export async function applyTemporalEvidence(
          JOIN pages t ON t.slug = v.to_slug AND t.source_id = $2 AND t.deleted_at IS NULL
        ON CONFLICT DO NOTHING
        RETURNING from_page_id, to_page_id, link_type`,
-      [pageId, sourceId], [{ rows: transitions }]);
-  }
+      [pageId, sourceId], [{ rows: transitions }]) : async () => [] as RelationshipKey[];
   const unmatched = [...evidence.unmatched, ...inline.unmatched];
   const explicitTargets = [...new Set(evidence.transitions.filter(t => t.producer === 'explicit' || t.producer === 'dream').map(t => t.to_slug))];
+  const [, , inserted, liveTargets, keysAfter] = await pipelined(tx, [
+    tense,
+    () => tx.executeRaw(`DELETE FROM link_transitions WHERE origin_page_id = $1 AND producer = ANY($2::text[])`, [pageId, DERIVED_PRODUCERS]),
+    insert,
+    () => explicitTargets.length ? tx.executeRaw<{ slug: string }>(
+      `SELECT slug FROM pages WHERE source_id = $1 AND slug = ANY($2::text[]) AND deleted_at IS NULL`, [sourceId, explicitTargets]) : Promise.resolve([]),
+    () => relationshipKeysForOrigin(tx, pageId),
+  ]) as [unknown, unknown, RelationshipKey[], Array<{ slug: string }>, RelationshipKey[]];
   if (explicitTargets.length) {
-    const live = new Set((await tx.executeRaw<{ slug: string }>(
-      `SELECT slug FROM pages WHERE source_id = $1 AND slug = ANY($2::text[]) AND deleted_at IS NULL`, [sourceId, explicitTargets])).map(r => r.slug));
+    const live = new Set(liveTargets.map(r => r.slug));
     for (const t of evidence.transitions) {
       if ((t.producer === 'explicit' || t.producer === 'dream') && !live.has(t.to_slug)) {
         unmatched.push({ line: `${t.kind === 'start' ? 'Started' : 'Ended'} ${t.link_type} [[${t.to_slug}]]`, reason: 'no_target' });
       }
     }
   }
-  const keysAfter = await relationshipKeysForOrigin(tx, pageId);
   const refreshed = await refreshRelationships(tx, [...keysBefore, ...keysAfter]);
   return { transitions: inserted.length, refreshed, unmatched };
 }
@@ -141,13 +152,16 @@ export async function writeManualTransitions(
   return inserted.length;
 }
 
-/** remove_link companion: drop manual dated statements for the removed relationship(s). */
-export async function removeManualTransitions(tx: Tx, rel: { from: string; to: string; linkType?: string; sourceId: string }): Promise<void> {
+/**
+ * remove_link companion: drop manual dated statements for the removed relationship(s). `databaseOnly` keeps the
+ * statements a links fence projected (origin_page_id set), which belong to the fence's rows, not to a database-only edge.
+ */
+export async function removeManualTransitions(tx: Tx, rel: { from: string; to: string; linkType?: string; sourceId: string; databaseOnly?: boolean }): Promise<void> {
   const keys = await tx.executeRaw<RelationshipKey>(
     `DELETE FROM link_transitions lt USING pages f, pages t
       WHERE f.id = lt.from_page_id AND t.id = lt.to_page_id AND f.slug = $1 AND t.slug = $2
         AND f.source_id = $3 AND t.source_id = $3 AND lt.producer = 'manual'
-        AND ($4::text IS NULL OR lt.link_type = $4)
-      RETURNING lt.from_page_id, lt.to_page_id, lt.link_type`, [rel.from, rel.to, rel.sourceId, rel.linkType ?? null]);
+        AND ($4::text IS NULL OR lt.link_type = $4) AND (NOT $5::boolean OR lt.origin_page_id IS NULL)
+      RETURNING lt.from_page_id, lt.to_page_id, lt.link_type`, [rel.from, rel.to, rel.sourceId, rel.linkType ?? null, rel.databaseOnly === true]);
   if (keys.length) await refreshRelationships(tx, keys);
 }

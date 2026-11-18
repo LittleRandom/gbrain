@@ -4,8 +4,8 @@
  *
  * Protects: who wrote each page_versions row, live page revision, fact, take
  * and timeline row (created_by and last_mutated_by), on a managed brain, for
- * journaled requests (OAuth client, legacy token, local CLI) and for
- * coordinated maintenance with no request. Fails if the coordinator stops
+ * journaled requests (OAuth client, legacy token, local CLI), for receipted
+ * maintenance requests and for coordinated maintenance with no request. Fails if the coordinator stops
  * passing its request to withCoordinatedWrite, if a trigger is missing or
  * misclassifies a column, or if the managed guard refuses an attribution-only
  * update. Runs on PGLite, and on Postgres (direct and transaction-mode
@@ -26,7 +26,9 @@ import { localHostId, registerLocalWriter, readLocalWriter } from '../src/core/p
 import { getWriteRequest } from '../src/core/persistence/journal.ts';
 import { submitRememberMutation, submitForgetMutation } from '../src/core/persistence/memory-mutations.ts';
 import { disposePersistenceConsumer } from '../src/core/persistence/service.ts';
-import { replaceDerivedFactsForPage } from '../src/core/persistence/derived-facts.ts';
+import { maintenancePreflight } from '../src/core/persistence/prepared-maintenance.ts';
+import { buildConversationPage, conversationGeneration, submitConversationPages } from '../src/core/facts/conversation-publication.ts';
+import { currentConversationVersionToken } from '../src/commands/extract-conversation-facts.ts';
 import type { Principal } from '../src/core/persistence/model.ts';
 import { renderFactsTable } from '../src/core/facts-fence.ts';
 import { renderTakesFence } from '../src/core/takes-fence.ts';
@@ -196,6 +198,8 @@ describe('write attribution on a managed brain', () => {
     await withFixedEmbeddings(async () => {
       for (const engine of engines) {
         const brain = await managedBrain(engine, { embedding: true });
+        // Calibrate the fixed test embedder: an uncalibrated model never supersedes by cosine (supersession-threshold.ts).
+        await brain.engine.setConfig('facts.supersession_thresholds', JSON.stringify({ 'openai:text-embedding-3-small@1536': 0.95 }));
         await run(brain.local, 'put_page', { slug: 'people/alice-example', content: page('Alice', 'Profile') });
         await run(brain.local, 'put_page', { slug: 'people/charlie-example', content: page('Charlie', 'Profile') });
         const byOauth = await submitRememberMutation(brain.oauth, { fact: 'Prefers written updates', provenance: 'test', entity: 'people/alice-example', request_id: randomUUID() }, 30_000);
@@ -238,8 +242,10 @@ describe('write attribution on a managed brain', () => {
       expect(row.expired_at).not.toBeNull();
       expect(created(row)).toEqual(actor(await requestRow(brain, brain.oauth, remembered), brain.principals.oauth));
       expect(last(row)).toEqual(forgetRequest);
-      const effects = await engine.executeRaw<{ request_id: string | null }>("SELECT request_id::text FROM persistence_effects WHERE kind='withdrawal-mirror' AND source_id=$1", [brain.sourceId]);
-      expect(effects.map(effect => effect.request_id)).toEqual([forgetRequest.request]);
+      // GBRA-190 G4: the withdrawal is the forget request's own page publication (the struck fence row), never a later mirror.
+      const revision = await pageRevisionActor(brain, 'people/alice-example');
+      expect({ request: revision.request, kind: revision.kind, id: revision.id }).toEqual(forgetRequest);
+      expect(await engine.executeRaw("SELECT 1 FROM persistence_effects WHERE kind='withdrawal-mirror' AND source_id=$1", [brain.sourceId])).toEqual([]);
     }
   }, 120_000);
 
@@ -278,17 +284,22 @@ describe('write attribution on a managed brain', () => {
     }
   }, 120_000);
 
-  test('coordinated derived fact maintenance has no request and names the local writer', async () => {
+  test('conversation fact maintenance publishes under its own request and names the local writer', async () => {
     for (const engine of engines) {
       const brain = await managedBrain(engine);
       const slug = 'notes/derived-example';
       await run(brain.local, 'put_page', { slug, content: page('Derived', 'Conversation notes') });
-      await replaceDerivedFactsForPage(engine, brain.sourceId, slug, { sourcePrefix: 'cli:extract-conversation-facts', isCurrent: async () => true,
-        build: async () => [{ fact: 'Derived example claim', kind: 'fact', visibility: 'world', notability: 'medium',
-          source: 'cli:extract-conversation-facts:test', entity_slug: slug, row_num: 1, source_markdown_slug: slug }] as never });
+      const authority = (await maintenancePreflight(engine, brain.sourceId))!;
+      const current = (await engine.getPage(slug, { sourceId: brain.sourceId }))!;
+      const versionToken = await currentConversationVersionToken(engine, current);
+      const generation = await conversationGeneration(engine, authority, { slug, page: current, versionToken, since: null, segmentLimit: 0 });
+      const entry = await buildConversationPage(engine, brain.local.config, { slug, generation, attempt: 0, versionToken, since: null, segmentLimit: 0 },
+        [{ fact: 'Derived example claim', kind: 'fact', notability: 'medium', source: 'cli:extract-conversation-facts', entity_slug: slug, row_num: 0, source_markdown_slug: slug }],
+        { newestEnd: null, visibility: 'world' });
+      const receipt = await submitConversationPages(engine, authority, [entry]);
       const rows = await engine.executeRaw<RowActors>(`SELECT ${ROW_COLUMNS} FROM facts WHERE source_id=$1 AND fact='Derived example claim'`, [brain.sourceId]);
       expect(rows).toHaveLength(1);
-      expect(created(rows[0])).toEqual(actor(null, brain.principals.local));
+      expect(created(rows[0])).toEqual(actor(await requestRow(brain, brain.local, receipt), brain.principals.local));
     }
   }, 120_000);
 
@@ -356,10 +367,15 @@ describe('write attribution on a managed brain', () => {
         expect(await engine.executeRaw('SELECT id FROM facts WHERE source_id=$1', [sourceId])).toHaveLength(1);
         expect(await engine.executeRaw('SELECT id FROM takes WHERE page_id=$1', [alice.id])).toHaveLength(1);
         expect(await engine.executeRaw('SELECT id FROM timeline_entries WHERE page_id=$1', [alice.id])).toHaveLength(1);
+        // Facts and takes publish as receipted maintenance requests of the local writer (wave 9
+        // follow-ups, item 1); the timeline writer still runs as coordinated maintenance (TODO).
         const maintenance = actor(null, brain.principals.local);
-        for (const [table, where, key] of [['facts', 'source_id=$1', sourceId], ['takes', 'page_id=$1', alice.id], ['timeline_entries', 'page_id=$1', alice.id]] as const) {
+        const receipted = { request: true, kind: brain.principals.local.kind, id: brain.principals.local.id };
+        for (const [table, where, key, expected] of [['facts', 'source_id=$1', sourceId, receipted], ['takes', 'page_id=$1', alice.id, receipted],
+          ['timeline_entries', 'page_id=$1', alice.id, maintenance]] as const) {
           const rows = await engine.executeRaw<RowActors>(`SELECT ${ROW_COLUMNS} FROM ${table} WHERE ${where}`, [key]);
-          expect({ table, created: rows.map(created) }).toEqual({ table, created: [maintenance] });
+          const actors = rows.map(created).map(a => expected === receipted ? { ...a, request: a.request !== null } : a);
+          expect({ table, created: actors }).toEqual({ table, created: [expected] });
         }
 
         const remembered = await submitRememberMutation(ctx, { fact: 'Leads the design review', provenance: 'test', entity: 'people/charlie-example', request_id: randomUUID() }, 30_000);

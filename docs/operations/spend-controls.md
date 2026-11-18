@@ -146,8 +146,10 @@ line naming the cap, its source and how to remove it, e.g.
 | Backfill per-job budget | `embed.backfill_max_usd` | `10` | caps the job's tracker | `off` (`0`/garbage → default, fail-closed) | uncapped (still ledgered) |
 | Backfill cooldown | `embed.backfill_cooldown_min` | `10` | skips re-submission inside window | — (latency knob, not spend) | **not** bypassed |
 | `reindex-code` cost gate | — (preview before re-embed) | — | TTY prompt / non-TTY refuse + exit 3 (`confirmation_required`) | `--max-cost off` | runs uncapped (still ledgered) |
+| `reindex --markdown` consent gate | — | — | TTY prompt / non-TTY exit 3; a queued job needs the approval stored at submit | `--dry-run`, `--no-embed` | derived cap |
 | `migrate embeddings` consent gate | — (plan + estimate before provider migration) | — | TTY y/N prompt / non-TTY refuse + exit 3 (`confirmation_required`) | `--yes` | estimate marked informational, but **still prompts** (guards a destructive schema rebuild, not just spend) |
-| `enrich` / `onboard --auto` | `--max-usd` (per-call) | — | non-TTY without `--yes`/`--max-usd`: refuse + exit 3 (`confirmation_required`); `--yes` runs under the derived cap | `--max-usd off` | runs uncapped (still ledgered) |
+| `enrich` | `--max-usd` (per-call) | — | non-TTY without `--yes`/`--max-usd`: refuse + exit 3 (`confirmation_required`); `--yes` runs under the derived cap | `--max-usd off` | runs uncapped (still ledgered) |
+| `onboard --auto` | `--max-usd` (per-call) | — | refuses without `--max-usd` (exit 2); manual-only steps (pack upgrade, takes bootstrap) never run, their commands are printed | `--max-usd off` | runs uncapped (still ledgered) |
 | Image-OCR per-run ceiling | `embedding_image_ocr_max_images` / `embedding_image_ocr_max_usd` | `200` images / `$1.00` (estimated) | skips OCR over-cap (import continues; skips counted in `ocr_skipped_budget`, surfaced by doctor `ocr_health`) | `0` disables that cap | **not** bypassed (per-run cap, not a tracker gate) |
 | Dream `extract_atoms` phase budget | `cycle.extract_atoms.budget_usd` | `0.30` | caps the phase's budget tracker (one tracker per drain attempt, across all its batches) | — | **not** consulted (phase budget enforces regardless) |
 | Atom auto-drain daily cap | `autopilot.auto_drain.max_usd_per_day` | `2.00` | daily cap on drain **attempts** (`floor(max / 0.30)` = 6), not a dollar ledger | `gbrain config set autopilot.auto_drain.enabled false` | **not** consulted |
@@ -156,7 +158,8 @@ line naming the cap, its source and how to remove it, e.g.
 | [Fence model repair (Tier 3)](#fence-model-repair-tier-3) | `fences.repair.max_usd_per_page` / `fences.repair.max_usd_per_day` | `0.30` / `1.00` | refuses the call: a page whose estimate is over the per-page cap or over today's remainder in the durable USD ledger (`llm_repair`/`fences`, per UTC day across every process) waits as `budget_exhausted`, and `gbrain repair fences --apply` stops there with exit 1. `--max-usd <n>` lowers a run's cap, never raises it | `gbrain config set fences.repair.llm false` (`0` on a cap = no model spend) | **not** consulted |
 | Dream `synthesize` per-run budget | `dream.synthesize.budget_usd` | `5` | defers the transcript and the rest of the run before submission (estimate: prompt size + child output cap, x `max_turns` in agentic mode) | `unlimited` (`0` = submit nothing) | **not** consulted |
 | Dream `synthesize` daily submission cap | `dream.synthesize.max_submissions_per_source_per_day` | `0` (off) | skips whole files; a failed count query submits nothing that run | `0` | **not** consulted |
-| Dream `BudgetMeter` phases (auto_think, drift, propose/grade takes, calibration) | `dream.auto_think.budget`, `dream.drift.budget`, `cycle.<phase>.budget_usd` | per phase | refuses the next submit past the cap | `unlimited` (`0` = spend nothing) | **not** consulted |
+| Dream `BudgetMeter` phases (drift, propose/grade takes, calibration) | `dream.drift.budget`, `cycle.<phase>.budget_usd` | per phase | refuses the next submit past the cap | `unlimited` (`0` = spend nothing) | **not** consulted |
+| Pinned-question refreshes (`standing_questions` phase, `questions_pin`, `questions_refresh`) | `cycle.standing_questions.budget_usd`, `cycle.standing_questions.max_per_cycle`; an MCP refresh is also capped by `consent.preapprove.paid.max_usd_per_run` | per run | refuses the refresh before any model call (`blocked_reason: budget_exhausted`) | `$1.00`, 5 pins per cycle (`0` = spend nothing) | an MCP-created pin stays inactive until the owner activates it or this preapproval exists |
 
 Dream `BudgetMeter` phases meter a model missing from the pricing table at a
 Sonnet-tier fallback rate instead of letting it run uncapped; local model
@@ -178,7 +181,16 @@ The maintenance run's `fence_repair` phase and `gbrain repair fences --apply`
 send a malformed facts or takes fence that only a rewrite can realign to the
 repair model. Only the fence header and the rows it must realign leave the
 machine, never valid rows or the rest of the page. Every other fence repair
-is free.
+is free. The same caps and the same daily ledger govern the rest of the
+content-repair lane (#6377): the tail classifier (an unclosed fence whose
+trailing lines hold a pipe; the fence region and those lines leave the
+machine) and the slug-conflict judgment (`content_repair` phase,
+`gbrain repair slug-conflicts`; both pages' frontmatter, headings, first 60
+lines and the lines mentioning the other slug leave the machine). The model
+chooses among coded answers and writes no text. `models.content_repair`
+overrides the slug-conflict model; unset, it follows `models.fence_repair`,
+then the content-repair eval's measured list (`anthropic:claude-opus-5-5`,
+`openai:gpt-6.1-sol`, `anthropic:claude-sonnet-5-5`, first with a key).
 
 - **Model.** `models.fence_repair` when set (any model, priced or not, always
   runs). Unset, the first model the fence-repair eval measured as accurate
@@ -305,9 +317,12 @@ gbrain config set autopilot.auto_drain.enabled false          # stop all automat
 What leaves the machine while it is on: the page text of each extracted email
 thread or calendar event (message bodies, subjects, participants as rendered on
 the page, up to `cycle.extract_atoms.max_input_chars`) is sent to the
-configured `extract_atoms` chat model (`models.dream.extract_atoms`, a
-utility-tier model by default), under the caps above. Atoms already extracted
-stay; opting out only stops new extraction.
+configured `extract_atoms` chat model (`models.dream.extract_atoms`, else
+`models.tier.utility`, else the built-in utility-tier default), under the caps above. Atoms already extracted
+stay; opting out only stops new extraction. A page longer than that cap is read
+once up to the cap: its head atoms are kept, the phase reports it under
+`input_truncated` with a stderr line, and the page is not marked complete; it
+is skipped (not re-spent) until you raise the cap or the page changes.
 
 ### Life Chronicle: automatic event extraction
 
@@ -324,7 +339,10 @@ tracker cannot price, the default cap is not enforced: extraction warns and
 runs, bounded only by the call count. When you set `chronicle.job_budget_usd`
 yourself, an unpriced model refuses with `no_pricing` until you register its
 price with `gbrain pricing set`. `gbrain chronicle-backfill` (history, on
-request) is exempt from the daily limit and bounded by its `--limit`.
+request) is exempt from the daily limit and bounded by its `--limit`;
+`--max-usd` adds a hard spend bound that counts retries (an unpriced model then
+refuses with `no_pricing`; see the
+[chronicle guide](../guides/life-chronicle.md#bound-the-spend-with---max-usd)).
 
 ```bash
 gbrain config set auto_chronicle false              # opt out
@@ -376,8 +394,18 @@ gbrain config set dream.breaker.max_dead_submissions 5   # raise the limit; 0 di
 - The check happens before synthesis submission. Transcript triage for that run may
   already have happened, so the promise is "no synthesis submission", not "no
   model call at all".
-- Not covered: a transcript that keeps growing gets a new content-hashed key each
-  cycle, and patterns runs outside maintenance carry no key.
+- Patterns digests its reflection set into its key, so the key changes whenever a
+  reflection does. Patterns deaths therefore count per source, under
+  `dream:patterns:source:<source id>`, whatever reflections each run read. A
+  patterns child cancelled at its timeout after paid work counts as a death; one
+  cancelled before any work does not. A completed run resets the count, so only
+  deaths in a row trip it; reset a tripped source with
+  `gbrain dream reset-key 'dream:patterns:source:<source id>'`.
+- A transcript that keeps growing gets a new content-hashed key each cycle, so
+  synthesize deaths also count per transcript under
+  `dream:synth-v2:@file:<source id>:<file>` once they span two content keys; the same
+  limit applies. `gbrain dream reset-key --list` prints it, and reset it the same way.
+- Not covered: patterns runs outside maintenance carry no key.
 - If the count query fails, the breaker is skipped for that run with a warning, the
   same posture as the synthesize daily cap.
 

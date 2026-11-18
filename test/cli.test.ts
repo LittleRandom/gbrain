@@ -3,10 +3,11 @@ import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { surfaceFileSource } from './helpers/source-surface.ts';
+import { fileURLToPath } from 'node:url';
 
 // test-reads-source-ok[structural]: two kept pins need the dispatcher's text: the handleCliOnly case-label census (switch labels cannot be enumerated at runtime) and the local-op normalize call site (bigints only reach it from Postgres, never PGLite).
-const cliSource = surfaceFileSource('cli', 'src/cli.ts');
-const repoRoot = new URL('..', import.meta.url).pathname;
+const cliSource = surfaceFileSource('cli', 'src/cli/main.ts');
+const repoRoot = fileURLToPath(new URL('..', import.meta.url));
 
 function isolatedEnv(home: string): Record<string, string> {
   const env: Record<string, string> = {};
@@ -55,7 +56,7 @@ describe('CLI structure', () => {
   // Structural, self-updating: a new handler module without a CLI_ONLY entry
   // fails here at PR time.
   test('every handleCliOnly top-level case label is reachable via CLI_ONLY', async () => {
-    const { CLI_ONLY } = await import('../src/cli.ts');
+    const { CLI_ONLY } = await import('../src/cli/main.ts');
     const members = new Set<string>(CLI_ONLY);
 
     const caseLabels = readdirSync(join(repoRoot, 'src', 'cli', 'commands'))
@@ -94,7 +95,7 @@ describe('BigInt-safe output normalization (#2450)', () => {
   });
 
   test('normalizeLocalResult serializes bigint → string without throwing', async () => {
-    const { normalizeLocalResult } = await import('../src/cli.ts');
+    const { normalizeLocalResult } = await import('../src/cli/main.ts');
     const out = normalizeLocalResult({
       id: 42n,
       nested: { count: 7n },
@@ -110,14 +111,14 @@ describe('BigInt-safe output normalization (#2450)', () => {
   });
 
   test('bigint past Number.MAX_SAFE_INTEGER keeps full precision as a string', async () => {
-    const { normalizeLocalResult } = await import('../src/cli.ts');
+    const { normalizeLocalResult } = await import('../src/cli/main.ts');
     const big = 9007199254740993n; // MAX_SAFE_INTEGER + 2
     const out = normalizeLocalResult({ id: big }) as Record<string, unknown>;
     expect(out.id).toBe('9007199254740993');
   });
 
   test("formatResult's default renderer is bigint-safe", async () => {
-    const { formatResult } = await import('../src/cli.ts');
+    const { formatResult } = await import('../src/cli/main.ts');
     expect(() => formatResult('__no_such_op__', { id: 5n })).not.toThrow();
     expect(formatResult('__no_such_op__', { id: 5n })).toContain('"5"');
   });
@@ -137,7 +138,7 @@ describe('BigInt-safe output normalization (#2450)', () => {
 // untouched (the JSON path carries the raw characters).
 describe("list_pages TSV escaping (#5433)", () => {
   async function render(pages: unknown[]): Promise<string> {
-    const { formatResult } = await import('../src/cli.ts');
+    const { formatResult } = await import('../src/cli/main.ts');
     return formatResult('list_pages', pages, {});
   }
 
@@ -215,7 +216,7 @@ describe('ask alias', () => {
 
   test('ask does NOT appear in --tools-json output', async () => {
     const proc = Bun.spawn(['bun', 'run', 'src/cli.ts', '--tools-json'], {
-      cwd: new URL('..', import.meta.url).pathname,
+      cwd: fileURLToPath(new URL('..', import.meta.url)),
       stdout: 'pipe',
       stderr: 'pipe',
     });
@@ -230,7 +231,7 @@ describe('ask alias', () => {
 describe('CLI dispatch integration', () => {
   test('--version outputs version', async () => {
     const proc = Bun.spawn(['bun', 'run', 'src/cli.ts', '--version'], {
-      cwd: new URL('..', import.meta.url).pathname,
+      cwd: fileURLToPath(new URL('..', import.meta.url)),
       stdout: 'pipe',
       stderr: 'pipe',
     });
@@ -241,7 +242,7 @@ describe('CLI dispatch integration', () => {
 
   test('unknown command prints error and exits 2 (usage)', async () => {
     const proc = Bun.spawn(['bun', 'run', 'src/cli.ts', 'notacommand'], {
-      cwd: new URL('..', import.meta.url).pathname,
+      cwd: fileURLToPath(new URL('..', import.meta.url)),
       stdout: 'pipe',
       stderr: 'pipe',
     });
