@@ -19,7 +19,7 @@ import type { Action } from '../agent-output.ts';
 import { hostFix, invalidParam, paramUse, readFix } from './op-fix.ts';
 import { CJK_SLUG_CHARS } from '../cjk.ts';
 import { isOpPageSlug, OP_PAGE_SLUG_RE } from '../page-slug-grammar.ts';
-import { validateSlug } from '../utils.ts';
+import { normalizeSlug, validateSlug } from '../utils.ts';
 import { ALL_SOURCES, NO_SOURCES, isValidSourceId } from '../source-id.ts';
 import { encodeDeepResearchId } from '../deep-research-id.ts';
 import { isSearchMode } from '../search/mode.ts';
@@ -414,8 +414,8 @@ export function slugUnderBoundPrefixes(prefixes: readonly string[], slug: string
   // trip the resolved-slug re-check — an error returned after the write had
   // already landed. Registration rejects non-lowercase prefixes going
   // forward; lowercasing both sides keeps pre-existing rows meaning what
-  // their operator intended.
-  const canonical = slug.toLowerCase();
+  // their operator intended. NFC too (normalizeSlug), the form validateSlug stores.
+  const canonical = normalizeSlug(slug);
   return prefixes.some((bp) => {
     const base = normalizeSlugPrefix(bp);
     if (base === '') return false;
@@ -437,7 +437,7 @@ export function slugUnderBoundPrefixes(prefixes: readonly string[], slug: string
  * what an existing client may write.
  */
 export function normalizeSlugPrefix(prefix: string): string {
-  return (prefix.endsWith('/*') ? prefix.slice(0, -1) : prefix).toLowerCase();
+  return normalizeSlug(prefix.endsWith('/*') ? prefix.slice(0, -1) : prefix);
 }
 
 /**
@@ -542,7 +542,13 @@ export function opAllowedForBoundClient(
  * `gbrain auth rescope-token <name> --sources none`) refuses every operation:
  * it never falls back to the `default` floor for reads or writes.
  */
-export function noSourceGrantError(operation?: string, auth?: Pick<AuthInfo, 'clientId' | 'principal'>): OperationError {
+export function noSourceGrantError(operation?: string, auth?: Pick<AuthInfo, 'clientId' | 'principal' | 'archivedSources'>): OperationError {
+  if (auth?.archivedSources?.length) {
+    return opError('unknown_source',
+      `${operation ? `${operation}: ` : ''}the source this token writes to, or every source it reads, is archived or removed (${auth.archivedSources.join(', ')}), so it reads nothing until one is restored.`,
+      `Ask the brain host's operator to restore it if it was archived (gbrain sources restore ${auth.archivedSources[0]}), or to grant this token a live source.`,
+      { fix: sourcesListFix('Lists the live sources.') });
+  }
   const fix = sourceGrantFix(auth);
   const err = opError('permission_denied',
     `${operation ? `${operation}: ` : ''}this token is granted no sources (its source grant is an explicit empty list).`,
@@ -845,6 +851,7 @@ export function resolveRequestedScope(
     return ctx.remote === false ? {} : sourceScopeOpts(ctx);
   }
   if (sourceIdParam !== undefined) {
+    if (ctx.auth?.archivedSources?.includes(sourceIdParam)) throw archivedSourceError(ctx, sourceIdParam);
     const scope = sourceScopeOpts(ctx);
     const granted = scope.sourceIds !== undefined
       ? scope.sourceIds.includes(sourceIdParam)
@@ -1042,8 +1049,13 @@ export async function assertExplicitSourceLive(
     [sourceIdParam],
   );
   if (live.length > 0) return;
+  throw archivedSourceError(ctx, sourceIdParam);
+}
+
+/** The #4620 refusal for an explicit source_id that names no live source; also a granted source archived since (GST-3163). */
+function archivedSourceError(ctx: OperationContext, sourceIdParam: string): OperationError {
   const clientId = safeClientId(ctx.auth);
-  throw opError(
+  return opError(
     'unknown_source',
     `source '${sourceIdParam}' does not exist (removed or archived)`,
     'Omit source_id to read within your grant, or pick an id from sources_list. ' +

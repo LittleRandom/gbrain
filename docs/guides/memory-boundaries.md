@@ -82,6 +82,20 @@ returns the rendered bullet, and editing or deleting that bullet in the page's
 Timeline section through `edit_page` (with `expected_revision`) refreshes or
 removes its row, because the page is the system of record for timeline rows.
 
+<a id="remote-writes-private-facts"></a>
+## Remote writes and private fact rows
+
+A remote `put_page` never deletes a page's private Facts rows or rewords their claims, the brain owner's included:
+a stored private row its content leaves out comes back, a row it rewords is kept beside the new text, and a row written
+with the same number and claim takes the other cells it writes. So a writer that cannot see those rows cannot lose them,
+whichever view it read, unless either Facts fence fails to parse cleanly: then nothing is merged, rows the content leaves
+out can be lost, and the server logs a warning. The owner withdraws or replaces a claim by naming its row: `recall`
+with `entity: <slug>` and `source_id` looks up the facts filed under that entity with their ids,
+`forget_fact` withdraws one along with every row of that entity stating the same claim, and a `put_page` that
+adds a new `private` row with a different statement adds its replacement. `forget_fact` refuses a fact on or
+about a private page and a row more trusted than remote writes; for those, use the local CLI (`gbrain forget <id>`),
+which also writes a page as given.
+
 <a id="large-pages"></a>
 ## Large pages
 
@@ -184,8 +198,10 @@ The agent runs `gbrain get <slug> --grep pricing --context 1` (MCP:
 matter), down to the next heading of the same or a higher level, with the
 headings above it. If no heading matches, the error lists the page's headings
 (up to 20). `--grep` returns each paragraph with a line containing the text
-(plain text, not a pattern) plus `--context` paragraphs either side (default
-1, at most 5), with line numbers and `total_matches`. It returns at most 50
+(plain text, not a pattern; `--grep 'uptime|SLA'` also matches either word,
+while a spaced pipe such as `'| seats |'` stays literal) plus `--context`
+paragraphs either side (default 1, at most 5), with line numbers and
+`total_matches`. It returns at most 50
 matching paragraphs and 100,000 characters, and says `truncated` when it
 stops early. The line numbers are the ones a `--body window` read takes:
 `gbrain get <slug> --body window --lines 100-140` reads lines 100 to 140
@@ -607,6 +623,8 @@ An edited file imports normally. Its response carries the same store-by-store
 the purged page's facts. A write refused because it carries purged content,
 or accepted as a no-op after its purged rows were dropped, keeps no copy of
 that content in its stored write request.
+
+The automatic purge of expired deleted pages does the same for the write journal on a brain without a write owner, in the transaction that deletes the page: the page's timeline entry text, edit diffs and stored write intents are removed from its journal entries, including entries written while the brain had a write owner. A write still pending keeps its intent and then fails on the missing page. Other pages' journal entries that quote the purged text are not swept. An explicit `gbrain delete --purge` now also removes the diff kept in the page's compacted edit receipts.
 
 An owner purge held to keep a derived page private (`derived_origin_parked`)
 stays owed until its page is removed or restored: whichever purge later removes

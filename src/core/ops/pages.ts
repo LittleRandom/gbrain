@@ -1,3 +1,4 @@
+import { alsoPrefixes } from './slug-params.ts';
 import { funnelPassThrough } from '../funnel.ts';
 import { suffixedSlugDryRun } from '../persistence/suffixed-slug.ts';
 import { AGENT_CONTENT_PARAMS, PAGE_MUTATION_PARAMS, CAPTURE_EVENT_PARAMS, CAPTURE_CLI_PROVENANCE_PARAMS, REASON_PARAM, WRITE_WAIT_PARAM } from '../persistence/params.ts';
@@ -32,7 +33,7 @@ import { sanitizeRemoteBody } from '../remote-body.ts';
 import { getContentFlag } from '../quarantine.ts';
 import { fileHeldField, readHeldPages } from '../persistence/held-reads.ts';
 import { bumpLastRetrievedAt } from '../last-retrieved.ts';
-import { ownerWidened, resolveExcludePrivatePages, isPrivatePage, findPrivateOnlySlugs, isPrivatePageForCaller } from '../search/private-visibility.ts';
+import { ownerFenceView, resolveExcludePrivatePages, isPrivatePage, findPrivateOnlySlugs, isPrivatePageForCaller } from '../search/private-visibility.ts';
 import { heldRowsForCaller } from '../eligibility/fence-overlay.ts';
 import { unquoteAnyTranscriptText } from '../search/transcript-quote.ts';
 import { withIgnoredPrivacyLabelNotice } from '../search/ignored-privacy-labels.ts';
@@ -45,6 +46,7 @@ import { WHERE_PARAM, whereOpParam } from './where-param.ts';
 import { parseSourceIdsParam, requestSourceScope, SOURCE_IDS_PARAM } from './search-source-scope.ts';
 import { isDatetimeInputError } from '../utils.ts';
 import { rethrowNamingRevisionSource } from './put-page-revision-source.ts';
+import { guardUnsourcedPutEarly, noteSuppressedSourceFlip } from '../persistence/unsourced-put-fork.ts';
 import {
   assertExplicitSourceLive,
   enforceSubagentSlugFence,
@@ -93,12 +95,11 @@ async function dropPrivateSlugs(
  * caller. Same stripping rule as compiled_truth: takes fence dropped
  * entirely, facts fence keeps only `world`-visibility rows, less those held from a world-only caller (GST-2891).
  * GST-3058 (R94): a caller bound to the brain owner speaking for itself keeps the facts fence as stored, and the takes
- * fence too when it reads every holder (readHolders), the way the local CLI reads the page.
+ * fence too when it reads every holder (ownerFenceView), the way the local CLI reads the page.
  */
-async function stripPrivacyFencesForRemoteReader(ctx: OperationContext, page: Page): Promise<Page> {
+export async function stripPrivacyFencesForRemoteReader(ctx: OperationContext, page: Page): Promise<Page> {
   const omitRows = await heldRowsForCaller(ctx.engine, ctx.remote, { sourceId: page.source_id, slug: page.slug, compiled_truth: page.compiled_truth, timeline: page.timeline });
-  const owner = ownerWidened() ? { keepTakes: readHolders(ctx) === undefined } : undefined;
-  const opts = { includeWithdrawn: true, keepMaterializedMarkers: true, omitRows, owner }; // #5567: markers round-trip remote edits
+  const opts = { includeWithdrawn: true, keepMaterializedMarkers: true, omitRows, owner: ownerFenceView(readHolders(ctx)) }; // #5567: markers round-trip remote edits
   return { ...page, compiled_truth: sanitizeRemoteBody(page.compiled_truth, opts), timeline: sanitizeRemoteBody(page.timeline ?? '', opts) };
 }
 
@@ -186,8 +187,8 @@ const get_page: Operation = {
       // should say WHERE the slug actually lives. Trusted local callers only
       // (`ctx.remote === false`) — for a remote caller the probe would be a
       // cross-source existence oracle outside its grant. Only when the lookup
-      // was actually scoped (an unscoped read already spanned every source).
-      if (ctx.remote === false && (sourceOpts.sourceId !== undefined || sourceOpts.sourceIds !== undefined)) {
+      // was actually scoped (an unscoped read already spanned every source). GST-3747: never under --as, which answers as the member.
+      if (ctx.remote === false && !ctx.applyRemoteReadPolicy && (sourceOpts.sourceId !== undefined || sourceOpts.sourceIds !== undefined)) {
         try {
           // gbrain-allow-unscoped-getpage: read-only diagnostic existence probe —
           // deliberately spans all sources to name where the slug lives.
@@ -378,6 +379,7 @@ const put_page: Operation = {
   handler: async (ctx, p) => {
     const { pageMutationSource, submitPageMutation } = await pageMutations();
     const sourceId = pageMutationSource(ctx, p, 'put_page');
+    await guardUnsourcedPutEarly(ctx, sourceId, p); // a real put is checked in admission (after the write authority and a request_id replay)
     if (ctx.dryRun) {
       if (typeof p.slug === 'string') {
         validatePageSlug(p.slug);
@@ -389,7 +391,7 @@ const put_page: Operation = {
     }
     if (ctx.remote !== false && typeof p.slug === 'string') await assertLargePageAdmission(ctx.engine, p.slug, sourceId, p);
     (await import('../persistence/page-visibility.ts')).assertSubmittedReaders(ctx.remote, p.slug, p.content);
-    return submitPageMutation(ctx, { operation: 'put_page', params: p }).then(funnelPassThrough('save')).catch(error => rethrowNamingRevisionSource(ctx, sourceId, p, error)).then(result => withIgnoredPrivacyLabelNotice(ctx, sourceId, p, result)).then(result => withImplicitPlacement(ctx, sourceId, p, result));
+    return submitPageMutation(ctx, { operation: 'put_page', params: p, unsourcedForkGuard: true }).then(async result => (await noteSuppressedSourceFlip(ctx, sourceId, p), result)).then(funnelPassThrough('save')).catch(error => rethrowNamingRevisionSource(ctx, sourceId, p, error)).then(result => withIgnoredPrivacyLabelNotice(ctx, sourceId, p, result)).then(result => withImplicitPlacement(ctx, sourceId, p, result));
   },
   cliHints: { name: 'put', positional: ['slug'], stdin: 'content' },
 };
@@ -462,6 +464,7 @@ const delete_page: Operation = {
       }
       return { dry_run: true, action: p.purge === true ? 'purge_page' : 'delete_page', slug: p.slug };
     }
+    if (typeof p.slug === 'string') await (await import('../household/placement.ts')).householdDeleteAdmission(ctx.engine, sourceId, p.slug, ctx.remote);
     return (await import('../repair/origin-carry.ts')).deletePageCarryingPrivate(ctx, p, sourceId);
   },
   cliHints: { name: 'delete', positional: ['slug'] },
@@ -641,7 +644,7 @@ const list_pages: Operation = {
       excludePrivate,
       listColumnsOnly: true,
       where: whereOpParam(ctx, 'list_pages', p.where),
-      ...(typeof p.slug_prefix === 'string' && p.slug_prefix ? { slugPrefix: p.slug_prefix } : {}),
+      ...(typeof p.slug_prefix === 'string' && p.slug_prefix ? { slugPrefix: p.slug_prefix, ...alsoPrefixes('slugPrefixAlso', p.slug_prefix) } : {}),
       ...scope,
     }).catch((e: unknown) => {
       // #6103: an updated_after the database cannot parse is the caller's input, not a server fault.

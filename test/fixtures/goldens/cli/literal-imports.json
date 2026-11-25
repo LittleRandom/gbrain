@@ -13,6 +13,9 @@
       "anomalies": [
         "./commands/anomalies.ts"
       ],
+      "apple-contacts": [
+        "./commands/apple-contacts.ts"
+      ],
       "autopilot": [
         "./commands/autopilot.ts"
       ],
@@ -30,6 +33,9 @@
       ],
       "calibration": [
         "./commands/calibration.ts"
+      ],
+      "claims": [
+        "./commands/claims.ts"
       ],
       "code-callees": [
         "./commands/code-callees.ts"
@@ -106,6 +112,12 @@
       "guests": [
         "./commands/guests.ts"
       ],
+      "household": [
+        "./commands/household.ts"
+      ],
+      "identity": [
+        "./commands/identity.ts"
+      ],
       "import": [
         "./commands/import.ts",
         "./core/agent-output.ts",
@@ -114,6 +126,9 @@
       ],
       "jobs": [
         "./commands/jobs.ts"
+      ],
+      "ledger": [
+        "./commands/ledger.ts"
       ],
       "loops": [
         "./commands/loops.ts"
@@ -144,14 +159,23 @@
       "onboard": [
         "./commands/onboard.ts"
       ],
+      "onboarding": [
+        "./commands/onboarding.ts"
+      ],
       "orphans": [
         "./commands/orphans.ts"
       ],
       "pages": [
         "./commands/pages.ts"
       ],
+      "policy": [
+        "./commands/policy.ts"
+      ],
       "pricing": [
         "./commands/pricing.ts"
+      ],
+      "profile": [
+        "./commands/profile.ts"
       ],
       "quarantine": [
         "./commands/trust.ts",
@@ -239,9 +263,6 @@
         "./core/eligibility/scan.ts",
         "./core/trust/label-lowerings.ts",
         "./core/trust/backfill.ts"
-      ],
-      "waiting": [
-        "./commands/loops.ts"
       ],
       "wakeshift": [
         "./commands/wakeshift.ts"

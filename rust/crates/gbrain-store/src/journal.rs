@@ -35,9 +35,14 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use std::cell::Cell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
+/// The single JSON counter record of format-1 brains, folded into the records below by the
+/// format-2 upgrade (`fold_format_1_counters`).
 const COUNTERS: &str = "journal_counters";
+/// Unfinished-request counters, one record each (8-byte little-endian), so that admissions never
+/// all touch one key: `journal_outstanding` for the brain and `journal_outstanding/<principal>`.
+const OUTSTANDING: &str = "journal_outstanding";
 const NEXT_SEQUENCE: &str = "next_sequence";
 
 pub const PRINCIPAL_KINDS: &[&str] = &[
@@ -57,7 +62,7 @@ const STATES: &[&str] = &[
     "failed",
     "cancelled",
 ];
-const TERMINAL: &[&str] = &["committed", "conflict", "failed", "cancelled"];
+pub(crate) const TERMINAL: &[&str] = &["committed", "conflict", "failed", "cancelled"];
 
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
@@ -137,38 +142,127 @@ struct Counters {
     principals: BTreeMap<String, u64>,
 }
 
+fn outstanding_key(principal: Option<&str>) -> Vec<u8> {
+    match principal {
+        None => keys::meta(OUTSTANDING),
+        Some(p) => keys::meta(&format!("{OUTSTANDING}/{p}")),
+    }
+}
+
+/// Format 1 kept the unfinished-request counters as one JSON `journal_counters` record; the
+/// format-2 upgrade (`Store::open_kv`) adds it to the per-counter records and deletes it.
+pub(crate) fn fold_format_1_counters(tx: &mut dyn KvWrite) -> Result<()> {
+    let Some(legacy) = get_json::<Counters>(&*tx, &keys::meta(COUNTERS))? else {
+        return Ok(());
+    };
+    if legacy.brain != 0 {
+        tx.add_i64(&outstanding_key(None), legacy.brain as i64)?;
+    }
+    for (principal, n) in &legacy.principals {
+        if *n != 0 {
+            tx.add_i64(&outstanding_key(Some(principal)), *n as i64)?;
+        }
+    }
+    tx.delete(&keys::meta(COUNTERS))
+}
+
+/// The unfinished-request counters, one record each. A principal whose count is 0 is left out.
+fn read_counters(read: &dyn KvRead) -> Result<Counters> {
+    let mut counters = Counters {
+        brain: crate::kv::read_i64(read, &outstanding_key(None))?.max(0) as u64,
+        principals: BTreeMap::new(),
+    };
+    let prefix = keys::meta(&format!("{OUTSTANDING}/"));
+    let mut failure = None;
+    scan_prefix(read, &prefix, false, &mut |k, v| {
+        let Ok(name) = std::str::from_utf8(&k[prefix.len()..]) else {
+            failure = Some(StoreError::new(
+                STORE_CORRUPT,
+                "bad outstanding counter key",
+            ));
+            return false;
+        };
+        let Ok(bytes) = <[u8; 8]>::try_from(v) else {
+            failure = Some(StoreError::new(STORE_CORRUPT, "bad outstanding counter"));
+            return false;
+        };
+        let n = i64::from_le_bytes(bytes).max(0) as u64;
+        counters.principals.insert(name.to_string(), n);
+        true
+    })?;
+    if let Some(e) = failure {
+        return Err(e);
+    }
+    counters.principals.retain(|_, n| *n > 0);
+    Ok(counters)
+}
+
 /// What is stored for a request.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct RequestRecord {
-    id: String,
-    principal_kind: String,
-    principal_id: String,
-    request_id: String,
+    pub(crate) id: String,
+    pub(crate) principal_kind: String,
+    pub(crate) principal_id: String,
+    pub(crate) request_id: String,
     #[serde(default)]
-    client_request_id: Option<String>,
-    operation: String,
-    source_id: String,
-    source_incarnation: String,
+    pub(crate) client_request_id: Option<String>,
+    pub(crate) operation: String,
+    pub(crate) source_id: String,
+    pub(crate) source_incarnation: String,
     #[serde(default)]
-    page_id: Option<u64>,
-    slug: String,
-    digest: String,
-    intent: Value,
-    authority: Value,
-    sequence: u64,
-    state: String,
+    pub(crate) page_id: Option<u64>,
+    pub(crate) slug: String,
+    pub(crate) digest: String,
+    #[serde(deserialize_with = "crate::jsonb::de_value")]
+    pub(crate) intent: Value,
+    #[serde(deserialize_with = "crate::jsonb::de_value")]
+    pub(crate) authority: Value,
+    pub(crate) sequence: u64,
+    pub(crate) state: String,
+    #[serde(default, deserialize_with = "crate::jsonb::de_opt_value")]
+    pub(crate) outcome: Option<Value>,
     #[serde(default)]
-    outcome: Option<Value>,
+    pub(crate) error_code: Option<String>,
     #[serde(default)]
-    error_code: Option<String>,
+    pub(crate) error_message: Option<String>,
     #[serde(default)]
-    error_message: Option<String>,
+    pub(crate) blocked_reason: Option<String>,
+    pub(crate) created_at_us: i64,
+    pub(crate) updated_at_us: i64,
     #[serde(default)]
-    blocked_reason: Option<String>,
-    created_at_us: i64,
-    updated_at_us: i64,
-    #[serde(default)]
-    completed_at_us: Option<i64>,
+    pub(crate) completed_at_us: Option<i64>,
+    /// The `persistence_requests` columns the native journal does not keep, stored by the
+    /// TypeScript journal members (`persistence.rs`). Empty for a natively admitted request.
+    #[serde(default, flatten)]
+    pub(crate) extra: Map<String, Value>,
+}
+
+/// The staging ids that outstanding (not terminal) requests name in `intent.body_ref.staging_id`:
+/// the journal arm of PGLite's `liveStagingIds` (`engine-sql/page-body.ts`), a root of the
+/// segment sweep. It scans every request, never trusting the journal's own outstanding counter:
+/// `insert_write_request` (`persistence.rs`) writes a queued request into this same family and
+/// charges only the persistence counters, so that counter can read zero while a request still
+/// names a staging.
+pub(crate) fn request_held_staging_ids(read: &dyn KvRead) -> Result<HashSet<String>> {
+    let mut out = HashSet::new();
+    let mut failure = None;
+    scan_prefix(read, &[keys::REQUEST], false, &mut |_, v| {
+        match serde_json::from_slice::<RequestRecord>(v) {
+            Ok(request) if !request.terminal() => {
+                if let Some(id) = request
+                    .intent
+                    .pointer("/body_ref/staging_id")
+                    .and_then(Value::as_str)
+                {
+                    out.insert(id.to_string());
+                }
+            }
+            Ok(_) => {}
+            Err(e) => failure = Some(crate::StoreError::from(e)),
+        }
+        failure.is_none()
+    })?;
+    failure.map_or(Ok(out), Err)
 }
 
 impl RequestRecord {
@@ -177,8 +271,8 @@ impl RequestRecord {
     }
 
     /// `WriteRequest` of `src/core/persistence/model.ts` (the fields this engine keeps).
-    fn to_row(&self) -> Value {
-        json!({
+    pub(crate) fn to_row(&self) -> Value {
+        let mut row = json!({
             "id": self.id,
             "principal_kind": self.principal_kind,
             "principal_id": self.principal_id,
@@ -190,19 +284,23 @@ impl RequestRecord {
             "page_id": self.page_id,
             "slug": self.slug,
             "digest": self.digest,
-            "intent": self.intent,
-            "authority": self.authority,
+            "intent": crate::jsonb::order(self.intent.clone()),
+            "authority": crate::jsonb::order(self.authority.clone()),
             "sequence": self.sequence,
             "state": self.state,
-            "outcome": self.outcome,
+            "outcome": self.outcome.clone().map(crate::jsonb::order),
             "error_code": self.error_code,
             "error_message": self.error_message,
             "blocked_reason": self.blocked_reason,
-            "compacted": false,
             "created_at": iso(self.created_at_us),
             "updated_at": iso(self.updated_at_us),
             "completed_at": self.completed_at_us.map(iso),
-        })
+        });
+        let Value::Object(fields) = &mut row else {
+            unreachable!("json! builds an object")
+        };
+        crate::persistence::fill_request_columns(fields, &self.extra);
+        row
     }
 
     /// `receiptFor`: the outcome's fields, `outcome`, `request_id`, `client_request_id`, `state`
@@ -215,11 +313,12 @@ impl RequestRecord {
             &self.state
         };
         let mut out = Map::new();
-        if let Some(Value::Object(fields)) = &self.outcome {
+        let outcome = self.outcome.clone().map(crate::jsonb::order);
+        if let Some(Value::Object(fields)) = &outcome {
             out.extend(fields.clone());
         }
-        if let Some(outcome) = &self.outcome {
-            out.insert("outcome".into(), outcome.clone());
+        if let Some(outcome) = outcome {
+            out.insert("outcome".into(), outcome);
         }
         out.insert("request_id".into(), json!(self.request_id));
         if let Some(client) = self.client_request_id.as_ref().filter(|c| !c.is_empty()) {
@@ -292,18 +391,22 @@ fn digest_of(operation: &str, source_id: &str, slug: &str, intent: &Value) -> St
     out
 }
 
-fn next_sequence(tx: &mut dyn KvWrite) -> Result<u64> {
-    let key = keys::meta(NEXT_SEQUENCE);
-    let current = match tx.get(&key)? {
-        Some(bytes) => keys::be8(&bytes)
-            .ok_or_else(|| StoreError::new(STORE_CORRUPT, "bad sequence counter"))?,
-        None => 1,
-    };
-    tx.put(&key, &(current + 1).to_be_bytes())?;
-    Ok(current)
+pub(crate) fn next_sequence(tx: &mut dyn KvWrite) -> Result<u64> {
+    tx.allocate(&keys::meta(NEXT_SEQUENCE), 1)
 }
 
-fn read_request(
+/// The last sequence handed out, 0 before the first. Requests are never deleted on this engine,
+/// so this is `max(sequence)` over every request row.
+pub(crate) fn max_sequence(read: &dyn KvRead) -> Result<u64> {
+    match read.get(&keys::meta(NEXT_SEQUENCE))? {
+        Some(bytes) => keys::be8(&bytes)
+            .map(|next| next.saturating_sub(1))
+            .ok_or_else(|| StoreError::new(STORE_CORRUPT, "bad sequence counter")),
+        None => Ok(0),
+    }
+}
+
+pub(crate) fn read_request(
     read: &dyn KvRead,
     principal: &Principal,
     request_id: &str,
@@ -324,7 +427,7 @@ fn read_request(
     get_json(read, &keys::request(&id))
 }
 
-fn write_request(tx: &mut dyn KvWrite, record: &RequestRecord) -> Result<()> {
+pub(crate) fn write_request(tx: &mut dyn KvWrite, record: &RequestRecord) -> Result<()> {
     put_json(tx, &keys::request(&record.id), record)
 }
 
@@ -374,30 +477,34 @@ fn admit_in(
         }
         return Ok((existing, false));
     }
-    let mut counters: Counters = get_json(&*tx, &keys::meta(COUNTERS))?.unwrap_or_default();
+    // Postgres counts unfinished requests under a row lock; here each counter is its own record
+    // and the check is re-run at commit (`counter_below`), so admissions do not conflict with
+    // each other unless one of them would cross a limit.
     let pkey = principal_key(&admission.principal.kind, &admission.principal.id);
-    let mine = counters.principals.get(&pkey).copied().unwrap_or(0);
-    if mine >= limits.principal_outstanding {
+    let cap = limits.principal_outstanding as i64;
+    if let Some(n) = tx.counter_below(&outstanding_key(Some(&pkey)), cap)? {
         return Err(StoreError::new(
             ADMISSION_REFUSED,
             format!(
-                "this principal already has {mine} unfinished writes (limit {})",
+                "this principal already has {} unfinished writes (limit {})",
+                n.max(0),
                 limits.principal_outstanding
             ),
         ));
     }
-    if counters.brain >= limits.brain_outstanding {
+    let cap = limits.brain_outstanding as i64;
+    if let Some(n) = tx.counter_below(&outstanding_key(None), cap)? {
         return Err(StoreError::new(
             ADMISSION_REFUSED,
             format!(
                 "this brain already has {} unfinished writes (limit {})",
-                counters.brain, limits.brain_outstanding
+                n.max(0),
+                limits.brain_outstanding
             ),
         ));
     }
-    counters.brain += 1;
-    counters.principals.insert(pkey, mine + 1);
-    put_json(tx, &keys::meta(COUNTERS), &counters)?;
+    tx.add_i64(&outstanding_key(None), 1)?;
+    tx.add_i64(&outstanding_key(Some(&pkey)), 1)?;
     let now = env.now_micros();
     let record = RequestRecord {
         id: env.new_uuid(),
@@ -426,6 +533,7 @@ fn admit_in(
         created_at_us: now,
         updated_at_us: now,
         completed_at_us: None,
+        extra: Map::new(),
     };
     write_request(tx, &record)?;
     tx.put(
@@ -457,6 +565,7 @@ fn finish_in(
             ),
         ));
     }
+    crate::persistence::guard_deferred_transition(&record.state, &finish.state)?;
     let now = env.now_micros();
     record.state = finish.state.clone();
     record.outcome = finish.outcome.clone();
@@ -466,18 +575,9 @@ fn finish_in(
     record.updated_at_us = now;
     record.completed_at_us = Some(now);
     write_request(tx, &record)?;
-    let mut counters: Counters = get_json(&*tx, &keys::meta(COUNTERS))?.unwrap_or_default();
-    counters.brain = counters.brain.saturating_sub(1);
     let pkey = principal_key(&record.principal_kind, &record.principal_id);
-    match counters.principals.get(&pkey).copied().unwrap_or(0) {
-        0 | 1 => {
-            counters.principals.remove(&pkey);
-        }
-        n => {
-            counters.principals.insert(pkey, n - 1);
-        }
-    }
-    put_json(tx, &keys::meta(COUNTERS), &counters)?;
+    tx.add_i64(&outstanding_key(None), -1)?;
+    tx.add_i64(&outstanding_key(Some(&pkey)), -1)?;
     Ok(record)
 }
 
@@ -570,8 +670,7 @@ impl Store {
 
     /// `{ brain, principals: { "principal:<kind>:<id>": n } }`: unfinished requests.
     pub fn journal_outstanding(&self) -> Result<Value> {
-        let counters: Counters =
-            get_json(&*self.read()?, &keys::meta(COUNTERS))?.unwrap_or_default();
+        let counters = read_counters(&*self.read()?)?;
         Ok(json!({"brain": counters.brain, "principals": counters.principals}))
     }
 
@@ -606,6 +705,7 @@ impl Store {
         let admission = mutation.admission(operation, &source_id);
         let applying = Cell::new(false);
         let attempt = self.write(|tx| {
+            applying.set(false);
             let (record, fresh) = admit_in(tx, &*self.env, &admission, limits)?;
             if !fresh {
                 return Ok(record);
@@ -701,10 +801,16 @@ struct WriterRecord {
     id: String,
     lane: String,
     credential_hash: String,
+    #[serde(deserialize_with = "crate::jsonb::de_value")]
     grant_ceiling: Value,
     created_at_us: i64,
     #[serde(default)]
     revoked_at_us: Option<i64>,
+}
+
+/// The stored id and lane of the local writer `id` (case-folded key), revoked or not.
+pub(crate) fn read_writer_record(read: &dyn KvRead, id: &str) -> Result<Option<(String, String)>> {
+    Ok(get_json::<WriterRecord>(read, &keys::writer(&id.to_lowercase()))?.map(|w| (w.id, w.lane)))
 }
 
 impl WriterRecord {
@@ -713,7 +819,7 @@ impl WriterRecord {
             "id": self.id,
             "lane": self.lane,
             "credential_hash": self.credential_hash,
-            "grant_ceiling": self.grant_ceiling,
+            "grant_ceiling": crate::jsonb::ordered(&self.grant_ceiling),
             "created_at": iso(self.created_at_us),
             "revoked_at": self.revoked_at_us.map(iso),
         })
@@ -781,6 +887,51 @@ impl Store {
             };
             put_json(tx, &keys::writer(&id), &record)?;
             Ok(record.to_row())
+        })
+    }
+
+    /// `insertLocalWriterRow`: the `INSERT .. ON CONFLICT DO NOTHING` of PGLite's
+    /// `persistence_local_writers`. True when this call stored the row; false, with nothing
+    /// written, when a row already holds the id or the credential hash (the table's two unique
+    /// keys), whatever that row's lane, revocation or grant. The lane and id checks are the
+    /// table's own constraints, so a bad lane or a non-UUID id is an error, not a false.
+    pub fn insert_local_writer_row(&self, registration: &WriterRegistration) -> Result<bool> {
+        if !is_uuid(&registration.id) {
+            return Err(StoreError::invalid("a local writer id is a UUID"));
+        }
+        if registration.lane != "cli" && registration.lane != "stdio" {
+            return Err(StoreError::invalid("a local writer lane is cli or stdio"));
+        }
+        let id = registration.id.to_lowercase();
+        self.write(|tx| {
+            if get_json::<WriterRecord>(&*tx, &keys::writer(&id))?.is_some() {
+                return Ok(false);
+            }
+            let mut taken = false;
+            scan_prefix(&*tx, &[keys::WRITER], false, &mut |_, v| {
+                if let Ok(other) = serde_json::from_slice::<WriterRecord>(v)
+                    && other.credential_hash == registration.credential_hash
+                {
+                    taken = true;
+                }
+                !taken
+            })?;
+            if taken {
+                return Ok(false);
+            }
+            let record = WriterRecord {
+                id: id.clone(),
+                lane: registration.lane.clone(),
+                credential_hash: registration.credential_hash.clone(),
+                grant_ceiling: registration
+                    .grant_ceiling
+                    .clone()
+                    .unwrap_or_else(|| json!({})),
+                created_at_us: self.env.now_micros(),
+                revoked_at_us: None,
+            };
+            put_json(tx, &keys::writer(&id), &record)?;
+            Ok(true)
         })
     }
 

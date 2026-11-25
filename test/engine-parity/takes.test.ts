@@ -541,6 +541,104 @@ describe('engine parity: takes', () => {
       return { beforeAll, written, storedView, stale, nearest, nearestOne, allow, sideScoped, noOne, afterEdit, rejectsDuplicateIds: dupErr !== null };
     },
   );
+
+  parityTest(
+    'matchTakeRows lists the stored takes a fence row would collide with, null-safe, ascending, limited, for one page only',
+    { methods: ['putPage', 'addTakesBatch', 'matchTakeRows'] },
+    async (engine) => {
+      const alice = await page(engine, 'people/match-alice');
+      const bob = await page(engine, 'people/match-bob');
+      await engine.addTakesBatch([
+        take(alice.id, 1, 'Same claim'), take(alice.id, 2, 'Original claim'), take(alice.id, 3, 'Holder moves'),
+        take(alice.id, 4, 'Kind moves', { kind: 'bet' }), take(alice.id, 6, 'Unlisted by the fence'),
+        take(bob.id, 2, 'Bob has row two too'),
+      ]);
+      const fence = (row_num: number, claim: string, extra: { kind?: string; holder?: string | null } = {}) =>
+        ({ row_num, claim, kind: 'take', holder: 'garry', ...extra }) as never;
+      const rows = [
+        fence(4, 'Kind moves', { kind: 'take' }), fence(2, 'Edited claim'), fence(5, 'No stored row five'), fence(3, 'Holder moves', { holder: null }),
+        fence(1, 'Same claim'), fence(6, 'Unlisted by the fence', { holder: 'someone-else' }),
+      ];
+      const all = await engine.matchTakeRows(alice.id, rows, 50);
+      const limited = await engine.matchTakeRows(alice.id, rows, 2);
+      const none = await engine.matchTakeRows(alice.id, [fence(1, 'Same claim'), fence(7, 'New row')], 50);
+      const empty = await engine.matchTakeRows(alice.id, [], 50);
+      const zero = await engine.matchTakeRows(alice.id, rows, 0);
+      const otherPage = await engine.matchTakeRows(bob.id, rows, 50);
+      const noPage = await engine.matchTakeRows(987654, rows, 50);
+      // A stored take that two fence rows of its number both differ from is listed once for each, as the join lists it.
+      const twice = await engine.matchTakeRows(alice.id, [fence(2, 'First edit'), fence(2, 'Second edit'), fence(2, 'Original claim')], 50);
+      const answers = { all, limited, none, empty, zero, otherPage, noPage, twice };
+      expect(answers).toEqual({ all: [2, 3, 4, 6], limited: [2, 3], none: [], empty: [], zero: [], otherPage: [2], noPage: [], twice: [2, 2] });
+      return answers;
+    },
+  );
+
+  parityTest(
+    'deleteTakeRows deletes the page takes at the listed row numbers with their evidence, and an empty list deletes nothing',
+    { methods: ['putPage', 'addTakesBatch', 'addSynthesisEvidence', 'listTakes', 'deleteTakeRows'] },
+    async (engine) => {
+      const alice = await page(engine, 'people/drop-alice');
+      const bob = await page(engine, 'people/drop-bob');
+      const synthesis = await page(engine, 'notes/drop-synthesis');
+      await engine.addTakesBatch([
+        take(alice.id, 1, 'Keep one'), take(alice.id, 2, 'Drop two'), take(alice.id, 3, 'Drop three', { active: false }), take(alice.id, 4, 'Keep four'),
+        take(bob.id, 2, 'Bob row two stays'),
+      ]);
+      expect(await engine.addSynthesisEvidence([
+        { synthesis_page_id: synthesis.id, take_page_id: alice.id, take_row_num: 2, citation_index: 1 },
+        { synthesis_page_id: synthesis.id, take_page_id: alice.id, take_row_num: 4, citation_index: 2 },
+      ])).toBe(2);
+      const rows = async (pageId: number) => (await allTakes(engine, pageId)).map((t) => `${t.row_num}:${t.claim}`).sort();
+      await engine.deleteTakeRows(alice.id, []);
+      const afterEmpty = await rows(alice.id);
+      await engine.deleteTakeRows(alice.id, [2, 3, 99, 2]);
+      const afterDelete = { alice: await rows(alice.id), bob: await rows(bob.id) };
+      await engine.deleteTakeRows(987654, [1, 2]);
+      // The evidence went with its take: the same evidence row inserts again once the take is back; the kept take's row is still there.
+      await engine.addTakesBatch([take(alice.id, 2, 'Back again')]);
+      const evidenceAgain = await engine.addSynthesisEvidence([
+        { synthesis_page_id: synthesis.id, take_page_id: alice.id, take_row_num: 2, citation_index: 1 },
+        { synthesis_page_id: synthesis.id, take_page_id: alice.id, take_row_num: 4, citation_index: 2 },
+      ]);
+      const answers = { afterEmpty, afterDelete, evidenceAgain };
+      expect(answers).toEqual({
+        afterEmpty: ['1:Keep one', '2:Drop two', '3:Drop three', '4:Keep four'],
+        afterDelete: { alice: ['1:Keep one', '4:Keep four'], bob: ['2:Bob row two stays'] },
+        evidenceAgain: 1,
+      });
+      return answers;
+    },
+  );
+
+  parityTest(
+    'a claim edited through the batch upsert drops out of a vector search that ran before the edit',
+    { methods: ['putPage', 'addTakesBatch', 'listTakes', 'updateTakeEmbeddings', 'searchTakesVector'] },
+    async (engine) => {
+      const a = await page(engine, 'people/alice-example');
+      await engine.addTakesBatch([
+        take(a.id, 1, 'axis zero take', { holder: 'garry', weight: 0.5 }),
+        take(a.id, 2, 'axis one take', { holder: 'alice', weight: 0.5 }),
+      ]);
+      const ids = await takeIds(engine, a.id);
+      expect(await engine.updateTakeEmbeddings([
+        { take_id: ids.get('axis zero take')!, embedding: basisEmbedding(0), claim: 'axis zero take', model: 'embed-m1' },
+        { take_id: ids.get('axis one take')!, embedding: basisEmbedding(1), claim: 'axis one take', model: 'embed-m1' },
+      ])).toBe(2);
+      const query = new Float32Array(1536);
+      query[0] = 1;
+      query[1] = 0.1;
+      const claims = async () => (await engine.searchTakesVector(query)).map((h) => h.claim);
+      // The first search warms whatever the engine keeps between reads.
+      const before = await claims();
+      // The claim changes; Postgres nulls the take's embedding in the same upsert, so the take has no vector to rank.
+      await engine.addTakesBatch([take(a.id, 1, 'axis zero take, reworded', { holder: 'garry', weight: 0.5 })]);
+      const after = await claims();
+      expect(before).toEqual(['axis zero take', 'axis one take']);
+      expect(after).toEqual(['axis one take']);
+      return { before, after };
+    },
+  );
 });
 
 describe('engine parity: contradiction probe runs and judge cache', () => {

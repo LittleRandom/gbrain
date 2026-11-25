@@ -49,6 +49,20 @@ const DIM = 1536;
 const INTERFACE_METHODS: readonly string[] = [
   // Cycle-lock leases
   'acquireCycleLock', 'refreshCycleLock', 'releaseCycleLock', 'readCycleLocks', 'deleteCycleLock', 'deleteCycleLockIfStale',
+  // Alias fan-out reads (engine-sql/alias-fanout-reads.ts; master text pinned by test/n3-sql-move-parity.test.ts)
+  'resolveCaseSensitiveAliases', 'readPageTitle', 'readPageAliasRows', 'readEntityAliasRows',
+  // CLI export and segmented-body reads (engine-sql/export-reads.ts; master text pinned by test/n3-sql-move-parity.test.ts)
+  'listExportPageKeys', 'readExportWithdrawalLedgerBytes', 'listExportWithdrawals', 'readExportPageRows', 'normalizeFenceLines', 'readSegmentedPageHead',
+  'readBodyManifestRows', 'readBodyManifestMeta', 'readBodyManifestOutline', 'listForcedCutSeqs', 'readSegmentedVersionBodyBytes', 'listAccessPolicySourceIds',
+  // Belief coverage and keyword-index inventory (engine-sql/belief.ts, search-vector.ts)
+  'listCoveredSources', 'countSearchVectorRows',
+  // Minion queue health reads (engine-sql/jobs-health.ts; master text pinned by test/n3-sql-move-parity.test.ts)
+  'readQueueHealthSignals', 'listWaitingByQueue', 'readQueueDivergence', 'listQueueWedgeCounts', 'listPrivateQueueHealth',
+  'readWedgeSignals', 'readOldestWaitingAge', 'listStuckActiveJobsByName',
+  // Trust-tier reads (engine-sql/trust-tier-reads.ts; master text pinned by test/n3-sql-move-parity.test.ts)
+  'listVersionTrustTiers', 'listVersionReasonWriters', 'listPageTypesByIds',
+  // Withdrawal discovery (engine-sql/withdrawal-discovery.ts)
+  'readWithdrawalDiscovery',
   // Lifecycle
   'connect', 'disconnect', 'reconnect', 'initSchema', 'transaction', 'transactionDirect', 'registerBeforeDisconnect', 'withReservedConnection',
   // Pages CRUD
@@ -58,9 +72,21 @@ const INTERFACE_METHODS: readonly string[] = [
   // Hybrid search reads (engine-sql/search-reads.ts) and the onboarding signal count (engine-sql/health.ts)
   'cosinesByChunkIds', 'hasSupersedeEdges', 'supersedingPageSlugs', 'aliasCanonicalRefs', 'pageCollapseFacts', 'slugsEndingIn',
   'generatedPagesIn', 'livePageIdsAt', 'pagesLinkingTo', 'countOnboardSignal',
+  'readFieldUsageSamples',
+  // schema detect --fields page samples (engine-sql/field-usage.ts; covered by test/engine-parity/field-usage.test.ts)
+  'hasWithdrawnFenceClaim',
+  // Withdrawal fence check (engine-sql/withdrawal-fence.ts; SQL text pinned by test/withdrawal-fence-sql-pin.test.ts)
+  'listSegmentedPages', 'invalidateWithdrawnPages',
+  // Withdrawal page statements (engine-sql/withdrawal-pages.ts; SQL text pinned by test/withdrawal-pages-sql-pin.test.ts)
   // Import writes (engine-sql/chunks.ts, tags.ts, pages.ts)
   'deleteChunksExcept', 'setChunkerVersion', 'writeTextProjectionSeal', 'moveChunkIndexes', 'getChunkReuseRows', 'pruneFrontmatterTags',
   'addPageTagsById', 'replaceDerivedAliases', 'getPageSealState', 'refreshPageOrigin',
+  'readPageBodySizes',
+  'readStoredBodyBytes',
+  // The large-page write guard's stored body size read (engine-sql/large-page.ts).
+  // Wanted-link, timeline-write, take-fence and code-traversal-cache members (engine-sql/wanted-links.ts, timeline.ts, takes.ts, code-traversal-cache.ts)
+  'lockRegisteredSourceIds', 'replaceWantedLinkRows', 'removeTimelineRows', 'updateTimelineDetails', 'matchTakeRows', 'deleteTakeRows',
+  'getCodeTraversalCache', 'putCodeTraversalCache', 'clearCodeTraversalCache',
   // Search
   'searchKeyword', 'countKeywordPages', 'searchKeywordPages', 'searchTitles', 'searchVector', 'getEmbeddingsByChunkIds',
   // Chunks
@@ -84,7 +110,7 @@ const INTERFACE_METHODS: readonly string[] = [
   // Ontology
   'mergeOntologyFact', 'getOntology', 'discoverOntologyDimensions', 'findOntologyConflicts',
   // Raw data + files
-  'putRawData', 'getRawData', 'upsertFile', 'getFile', 'listFilesForPage',
+  'putRawData', 'getRawData', 'upsertFile', 'getFile', 'listFilesForPage', 'listFiles',
   // Takes
   'addTakesBatch', 'listTakes', 'searchTakes', 'searchTakesVector', 'getTakeEmbeddings',
   'countStaleTakes', 'listStaleTakes', 'updateTake', 'supersedeTake', 'resolveTake',
@@ -129,6 +155,31 @@ const INTERFACE_METHODS: readonly string[] = [
   'readSegmentDerivations', 'upsertSegmentDerivations', 'retireSegmentDerivations',
   // GST-3032 owner-only delete triggers (src/core/engine-sql/owner-only-marks.ts; covered by test/owner-only-removal-lineage.test.ts)
   'ownerOnlyMarkTriggers',
+  // Decide proposal tables (src/core/engine-sql/decide-proposals.ts; covered by test/engine-parity/decide-proposals.test.ts)
+  'applyDecideReviewQueue', 'applyDecideSweepDeferred', 'getDecideProposal', 'getDecideReviewProposal',
+  'insertDecideProposal', 'insertDecideReviewProposal', 'listDecideProposalIds', 'listDecideProposals',
+  'listDecideProposedPairs', 'listDecideReviewProposalIds', 'listDecideReviewProposals', 'listDueDecideReviewQueue',
+  'listDueDecideSweepDeferred', 'readProposalReviewRates', 'transitionDecideProposal', 'transitionDecideReviewProposal',
+  // Decide state, spend, receipts and calibrations (src/core/engine-sql/decide-store.ts; covered by test/engine-parity/decide-store.test.ts)
+  'dailyDecideSpend', 'decideConflictNoEntityCounts', 'decideSlotUsage', 'deleteDecideState', 'ensureDecideState',
+  'getDecideCalibration', 'insertDecideCalibration', 'insertDecideReceipts', 'insertDecideSpend',
+  'listDecideCalibrations', 'listDecideMixedModelDecisions', 'listDecideReceiptStats', 'listDecideReplayReceipts',
+  'listDecideResolvedModels', 'listDecideSpendBySlot', 'pruneDecideReceipts', 'readDecideState',
+  'setDecideCalibrationRetired', 'storeDecideQualification', 'upsertDecideState',
+  // Open loops (src/core/engine-sql/open-loops.ts; covered by test/engine-parity/open-loops.test.ts)
+  'closeOpenLoop', 'countOpenLoopsByCounterpartyEmail', 'listOpenLoops', 'readEntityOpenLoops', 'upsertOpenLoop',
+  // Timeline reads (src/core/engine-sql/timeline-reads.ts; covered by test/engine-parity/timeline-reads.test.ts)
+  'countSegmentedTimelinePages', 'countTimelineCommentMarkupRows', 'deleteTimelineRows', 'listStoredTimelineRowsOrdered',
+  'listTimelineOrphanPages', 'readMaxTimelineEntryId', 'sampleEffectiveDateSources', 'sampleEffectiveDates',
+  'storedTimelineRowsByPageIds',
+  // Small write-side reads (src/core/engine-sql/write-misc.ts; pinned by test/write-misc-sql-pin.test.ts)
+  'attachSourcePath', 'expireMemoryProposals', 'getWorktreeBinding', 'hasExtractedEvents', 'hasLabelledOnlyMember',
+  'listAccessTokens', 'listActiveAccessMembers', 'listAwaitingMemoryProposals', 'listMemoryProposalRows',
+  'listOwnerProposalRows', 'listSharedSkillPackRoots', 'listSynopsisSourceIds', 'notifierCoverageRecorded',
+  'purgeMemoryProposals', 'readAdmissionSource', 'readHealthMemoClock', 'readMemoryProposal', 'readOpCheckpointKeys',
+  'readPendingProposalSummary', 'readSourceState', 'sharedSkillPackTablePresent',
+  // Held members the member layer adds before any caller moves (engine-sql/trust-tier-reads.ts, engine-sql/op-checkpoint.ts)
+  'listPendingCoreEditNotices', 'purgeStaleAppliedCaptures',
 ];
 
 /**
@@ -140,6 +191,9 @@ const INTERFACE_METHODS: readonly string[] = [
  */
 const ENGINE_INTERNAL_HELPERS: readonly string[] = [
   'db',
+  // The member layer's private executors: the raw read the CLI reads run through, and the unscoped CLI-reads executor.
+  'rawRead',
+  'cliReads',
   'connectForRestore',
   'applyForwardReferenceBootstrap',
   'getBulkRetryOpts',
@@ -152,11 +206,15 @@ const ENGINE_INTERNAL_HELPERS: readonly string[] = [
   'cycleLockSql',
   // Hybrid search reads: the unscoped engine-sql executor the search-read methods run through.
   'searchRead',
+  // Alias fan-out reads: the unscoped engine-sql executor the alias read methods run through.
+  'aliasFanoutRead',
   // Engine graduation: PGLite close/open that keeps the kernel lock across the custody window.
   'closeRetainingLock',
   'connectWithHeldLock',
   // #9227: whether this engine holds the datastore lock; the PGLite abandoned-claim release rests on it.
   'holdsDatastoreLock',
+  // The unscoped engine-sql executors the timeline reads and the write-side reads run through.
+  'timelineRead', 'writeMiscReads',
 ];
 
 /**

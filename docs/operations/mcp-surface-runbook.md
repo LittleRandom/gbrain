@@ -32,10 +32,14 @@ one `surface_env_invalid` info notice naming the surface actually served.
 `serve --http` ignores `GBRAIN_SURFACE` (its ceiling widens only through an
 explicit `--surface` restart; `GBRAIN_MCP_FORCE_SURFACE` narrows it).
 
-**Registrations.** Every stdio registration gbrain writes pins `starter`
-(`REGISTRATION_SURFACE` in `src/core/mcp-registration.ts`): readiness's
-`harness_wiring` fix, `gbrain init`'s quickstart line, `gbrain bootstrap
-hooks` for Claude Code, Codex and opencode, and the plugins.
+**Registrations.** Every stdio registration gbrain writes takes its surface
+from `registrationProfile(harness)` in `src/core/mcp-registration.ts`: Codex
+pins `full`; Claude Code, opencode and other hosts pin `starter` listing the
+memory verbs (`--advertise verbs`). That covers readiness's `harness_wiring`
+fix, `gbrain init`'s quickstart line and `gbrain bootstrap hooks` for Claude
+Code, Codex and opencode; the Claude Code and Codex plugins pin `full`.
+`gbrain config set mcp.default_surface_<claude_code|codex|hermes> full|starter`
+turns one harness's default (`config unset` restores the shipped one).
 `gbrain init --surface` and `gbrain bootstrap hooks --surface` pick another.
 `bootstrap hooks` never narrows an existing install: a matching registration
 is kept untouched, and a replaced one keeps its form (a pinned `--surface x`
@@ -61,7 +65,7 @@ connection may widen, and otherwise asks the user, because only the operator wid
 a pinned client. `STARTER_CALLABLE_PARAMS` in `src/mcp/surface.ts` lists the few
 hidden parameters a starter caller may still pass, each with its reason (page
 windows, the shared-skill follower, the thin client's source binding, the
-connection check, a delegating client's `submit_agent` `queue`, `model` and
+connection check, `remember` `valid_from` (already accepted inside `items`), a delegating client's `submit_agent` `queue`, `model` and
 `allowed_slug_prefixes`, `list_pages` paging with `offset`). An agent job (`submit_agent`)
 records the surface of the connection that submitted it, and its tool calls are refused
 the same way; a job queued before the surface was recorded keeps the full surface until
@@ -74,7 +78,9 @@ plain-text suggestions may still name one.
 **Session widening.** On the owner's stdio pipe, `request_tools {surface}`
 widens this session's tool set (never past `--access read-only` or
 `GBRAIN_MCP_FORCE_SURFACE`), sends `tools/list_changed`, and returns the new
-tools' schemas so a client that ignores `list_changed` can call them by name.
+tools' schemas. Codex and OpenClaw never take a new tool in the turn that asked
+for it ([client behaviour](../protocol/AGENT_OPERATOR_v1.md#tool-catalog-changes-toolslist_changed)),
+so for those clients the note says so and names the lasting route instead.
 Nothing is written; a new session starts at the registered surface. Each widen
 writes a `surface_widened from=<x> to=<y> op=request_tools` line on stderr.
 `gbrain config set mcp.allow_session_widen false` turns widening off; the
@@ -283,10 +289,12 @@ them `takes_list`, `takes_search`, `takes_scorecard`, `takes_calibration`,
 `synthesize` reads world takes only for a non-owner with no list. Known
 limits: agent jobs and group chats (a declared room) read as before this PR
 until GST-3066, as do stdio, on-behalf-of audiences and attested actors; an
-agent job reads its client's stored takes holders list, else world takes. The
-owner's `put_page`, inline or streamed, still restores the private rows as
-stored for every remote writer, so editing or deleting one does not stick yet;
-use the local CLI for that until GST-3064 lands. With a room declared, a
+agent job reads its client's stored takes holders list, else world takes. A
+remote `put_page`, the owner's included, restores the stored private rows its
+content leaves out and keeps a reworded one beside the new text (a cleanly
+parsed fence only); the owner withdraws or replaces a claim with
+`forget_fact` and a new row with a different statement (GST-3064;
+[remote writes and private fact rows](../guides/memory-boundaries.md#remote-writes-private-facts)). With a room declared, a
 `get_page` whole-body read or `view: 'markdown'` whose returned body carries
 rows a world-only read strips (private rows, held rows, takes) is marked
 `room_access: {readable: false, reason: 'private_label'}`; the mark is per
@@ -385,7 +393,9 @@ Post-deploy checks, in order:
    `SELECT token_name, params->>'tool_count' FROM mcp_request_log WHERE operation='tools/list' ORDER BY created_at DESC LIMIT 10;`
 2. **Empty-query probe shows the degraded block** — call `search` with a
    nonsense query; the empty result must carry a second content block
-   ("0 results. … retrieval healthy …" or degraded stages) + `_meta.retrieval`.
+   ("0 results. … retrieval healthy …", on a brain keyless on purpose
+   "… keyword-only because embeddings are off on this brain on purpose …",
+   or degraded stages) + `_meta.retrieval`.
 3. **Workerless submit warns** — `submit_agent` while no worker runs must
    still succeed and carry `queue_state.warning` (worker_alive false).
 4. **put_page lint fields present** — put an uncited page; the response

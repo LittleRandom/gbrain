@@ -27,7 +27,9 @@ import { retiredPageSql } from '../../../core/entities/resolve.ts';
 import { doctorVerify } from '../check-fix.ts';
 import { DUPLICATE_KINDS, findDuplicateGroups } from '../../../core/entities/duplicates.ts';
 import { decidedSets, identityDrift, type IdentityDrift } from '../../../core/entities/identity-decisions.ts';
+import { AUTO_DECIDED_BY, autoLinksSince, collapsesSince } from '../../../core/entities/evidence/auto.ts';
 import { connectedEngine, type DoctorContext, type DoctorEntry } from '../context.ts';
+import type { IdentityDecisionsRead, PendingIdentityMember } from '../../../core/engine-sql/identity-decisions.ts';
 
 export const NAME = 'person_title_duplicates';
 /** Titled person pages examined per run; more are reported as not examined. */
@@ -120,6 +122,18 @@ async function runEntityDuplicates(ctx: DoctorContext): Promise<Check[]> {
     const shown = groups.slice(0, SHOWN).map(g => ({ id: g.id, kind: g.kind, class: g.class, members: g.members }));
     const drift = await identityDrift(engine, read);
     const driftText = driftLine(drift);
+    const reconcilable = drift.store_mismatch || drift.database_only > 0 || drift.unsynced_files > 0 || drift.rows_without_file > 0
+      || drift.pending.some(p => p.reason === 'unlinked');
+    if (driftText && !reconcilable) {
+      checks.push({
+        name: 'entity_duplicates', status: 'warn', message: `${driftText} ${groups.length} duplicate group(s) are undecided.`,
+        details: { counts, groups: shown, drift },
+        fix: { ask_user: true, actor: 'user', consent: [], requires_exclusive: false, verify: doctorVerify(DUP_NAME), argv: ['gbrain', 'entity-identity-list', '--json'],
+          why: 'gbrain dedupe reconcile cannot clear these: a missing page has to come back, a page in another identity group has to leave it, and a decision file that does not validate has to be edited.',
+          user_message: remedies(drift, read) },
+      });
+      return checks;
+    }
     if (driftText) {
       checks.push({
         name: 'entity_duplicates', status: 'warn', message: `${driftText} ${groups.length} duplicate group(s) are undecided.`,
@@ -157,15 +171,64 @@ async function runEntityDuplicates(ctx: DoctorContext): Promise<Check[]> {
   return checks;
 }
 
+/** What the owner does about drift reconcile cannot clear: missing pages, pages in another group, invalid decision files. */
+function remedies(d: IdentityDrift, read: IdentityDecisionsRead): string {
+  const groupOf = (p: PendingIdentityMember) => {
+    const d = read.decisions.find(x => x.decision_id === p.decision_id);
+    return d?.group_id ?? d?.entity_id ?? p.decision_id;
+  };
+  const rejects = (reason: PendingIdentityMember['reason']) => [...new Set(d.pending.filter(p => p.reason === reason).map(groupOf))].map(g => `\`gbrain dedupe reject ${g}\``).join(', ');
+  const lines: string[] = [];
+  if (d.pending.some(p => p.reason === 'page_missing')) lines.push(`A page of a confirmed group is missing: restore or import it and it links on the next sync, or undo the group with ${rejects('page_missing')}.`);
+  if (d.pending.some(p => p.reason === 'other_group')) lines.push(`A page of a confirmed group is in another identity group: remove it from that group with \`gbrain entity-identity-unlink\`, or undo the group with ${rejects('other_group')}.`);
+  if (d.invalid_files.length) lines.push(`Fix or delete ${d.invalid_files.join(', ')} in source ${d.home}'s repository and commit it; until then the last valid version of that decision, if one was read, stays applied, and an edit that does not validate is skipped.`);
+  return lines.join(' ');
+}
+
 /** What disagrees between the recorded duplicate decisions and their projection, in one sentence, or ''. */
 function driftLine(d: IdentityDrift): string {
   const parts: string[] = [];
   if (d.store_mismatch) parts.push('duplicate decisions are kept in git, but this host sees no repository for the brain');
   if (d.database_only) parts.push(`${d.database_only} duplicate decision(s) are in the database but not in git (source ${d.home})`);
   if (d.unsynced_files) parts.push(`${d.unsynced_files} committed decision file(s) are not read into the database yet`);
+  if (d.invalid_files.length) parts.push(`${d.invalid_files.length} committed decision file(s) do not validate: ${d.invalid_files.slice(0, 3).join(', ')}`);
   if (d.rows_without_file) parts.push(`${d.rows_without_file} decision row(s) have no committed file`);
   if (d.pending.length) parts.push(`${d.pending.length} page(s) of confirmed groups are not linked (${d.pending.slice(0, 3).map(p => `${p.source_id}:${p.slug} ${p.reason}`).join(', ')})`);
   return parts.length ? `Duplicate decisions drift: ${parts.join('; ')}.` : '';
 }
 
 export const entityDuplicatesEntry: DoctorEntry = { name: 'entity_duplicates', emits: ['entity_duplicates'], run: runEntityDuplicates };
+
+const AUTO_NAME = 'dedupe_auto_links';
+
+/**
+ * dedupe_auto_links (GST-3609 PR C): what gbrain dedupe auto --apply did in the last 24 hours, by class: the person links
+ * it recorded (C2) and the same-source pages it collapsed (C7), each class with its reject, undo and off commands.
+ */
+async function runDedupeAutoLinks(ctx: DoctorContext): Promise<Check[]> {
+  const engine = connectedEngine(ctx);
+  const checks: Check[] = [];
+  ctx.progress.heartbeat(AUTO_NAME);
+  try {
+    const since = Date.now() - 86_400_000;
+    const byClass = new Map<string, string[]>();
+    for (const d of autoLinksSince(await engine.listIdentityDecisions(), since)) {
+      const cls = d.decided_by.slice(AUTO_DECIDED_BY.length);
+      byClass.set(cls, [...byClass.get(cls) ?? [], d.decision_id]);
+    }
+    for (const c of await collapsesSince(engine, since)) byClass.set(c.class, [...byClass.get(c.class) ?? [], c.collapse]);
+    const classes = [...byClass].map(([cls, ids]) => ({ class: cls, links: ids.length,
+      reject: cls === 'C7' ? 'gbrain dedupe reject <collapse id>' : 'gbrain dedupe reject <identity id>',
+      undo: `gbrain dedupe undo ${ids.slice(0, SHOWN).join(' ')}`, off: `gbrain dedupe auto --off ${cls}` }));
+    const total = classes.reduce((n, c) => n + c.links, 0);
+    const text = classes.map(c => `${c.class} ${c.links} (a wrong one for good: ${c.reject}; undo: ${c.undo}${c.links > SHOWN ? ` and ${c.links - SHOWN} more` : ''}; all of them: ${c.off})`).join('; ');
+    checks.push({ name: 'dedupe_auto_links', status: 'ok',
+      message: total ? `${total} person page pair(s) linked or collapsed automatically in the last 24 hours: ${text}.` : 'No person pages linked or collapsed automatically in the last 24 hours.',
+      details: { links: total, classes } });
+  } catch (err) {
+    checks.push({ name: 'dedupe_auto_links', status: 'warn', message: `Automatic person links and collapses could not be read: ${err instanceof Error ? err.message : String(err)}. Health is unknown.` });
+  }
+  return checks;
+}
+
+export const dedupeAutoLinksEntry: DoctorEntry = { name: 'dedupe_auto_links', emits: ['dedupe_auto_links'], run: runDedupeAutoLinks };

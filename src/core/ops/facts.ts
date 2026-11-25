@@ -57,6 +57,7 @@ import type { TrustTier } from '../trust/tier.ts';
 import { AUDIT_ROW_SOURCES } from '../facts/audit-sources.ts';
 import { parseSinceParam } from '../facts/since-parse.ts';
 import { callerSessionKey } from '../access/member-facts.ts';
+import { applySlotEnds } from '../search/slot-ends.ts';
 import { groupFactsByEntity, parseQuestionParam, questionRecallNotices, rankFactsByQuestion, recallHintNotice, namesakesOrMerge, unlinkedNamesakes, type EntityCandidate, type QuestionRecall } from '../facts/question-recall.ts';
 
 // ============================================================
@@ -370,6 +371,7 @@ const recall: Operation = {
     const visibility = worldOnly ? ['world'] as ('private' | 'world')[] : undefined;
     const excludePrivate = await resolveExcludePrivatePages(ctx.engine, ctx.remote); // #4352: fact and page arms alike
     const eligibility = await resolveReadEligibility(ctx, { minTrust: p.min_trust }); // #5575 floor + quarantine/rederive hiding
+    const factScope = { sourceIds: factSources, worldOnly, excludePrivate, minTrust: eligibility.floor, suppressFlagged: eligibility.suppressFlagged };
 
     type FactRows = Array<Awaited<ReturnType<typeof ctx.engine.listFactsByEntity>>[number] & { entity_slugs?: string[]; collapsed_count?: number; quoted?: 'transcript' }>;
     type FactRowItem = FactRows[number];
@@ -422,16 +424,14 @@ const recall: Operation = {
     // audit exclusion all filter at the ENGINE level, before each source's
     // LIMIT, so a hidden newest row never consumes a slot).
     const listOpts = {
-      activeOnly: !includeExpired,
-      limit: MAX_SEARCH_LIMIT,
+      activeOnly: !includeExpired, limit: MAX_SEARCH_LIMIT,
       visibility, excludePrivate,
       grep: grep ?? undefined,
       excludeAuditRows: true, eligibility,
     };
 
     if (question !== null && !readsNoSource) {
-      ranking = await rankFactsByQuestion(ctx, { question, params: p, factSources, limit, entity: entityParam, sessionId: sessionParam, since, grep, includeExpired,
-        scope: { sourceIds: factSources, worldOnly, excludePrivate, minTrust: eligibility.floor, suppressFlagged: eligibility.suppressFlagged } });
+      ranking = await rankFactsByQuestion(ctx, { question, params: p, factSources, limit, entity: entityParam, sessionId: sessionParam, since, grep, includeExpired, scope: factScope });
       ({ rows, ambiguousEntity } = ranking); mergedSources = ranking.mergedSources ?? null;
       for (const notice of questionRecallNotices(ranking, ctx.brainId)) ctx.emitNotice?.(notice);
     } else if (p.supersessions === true) {
@@ -494,6 +494,7 @@ const recall: Operation = {
     // engines, keyed on `source` not `fact` text) — this client-side
     // filter is belt-and-braces defense in depth, not the primary guard.
     rows = rows.filter((r) => !(AUDIT_ROW_SOURCES as readonly string[]).includes(r.source));
+    if (p.supersessions !== true && !ranking) rows = await applySlotEnds(ctx.engine, factScope, rows, { activeOnly: !includeExpired, entities: entityParam ? factSources.map(src => ({ source_id: src, slugs: [...new Set(rows.flatMap(r => (r.source_id === src && r.entity_slug ? [r.entity_slug] : [])))] })) : undefined }); // GST-3170: read-time slot ends
 
     // Engines apply grep in SQL (pre-limit). This client-side pass stays only
     // as the filter for the supersessions branch, which bypasses FactListOpts.
@@ -733,6 +734,7 @@ const context_pack: Operation = {
     entity_refs: { type: 'array', items: { type: 'object', properties: { source_id: { type: 'string' }, slug: { type: 'string' } } },
       description: 'Source-qualified entities: [{"source_id":"wiki","slug":"people/alice-example"}].', fullSurfaceOnly: true },
     prefer_source_id: { type: 'string', description: 'Source to try first (thin clients send .gbrain-source here); never narrows.', fullSurfaceOnly: true },
+    profile: { type: 'boolean', description: 'true: add your own profile (facets, constraints, relationships, preferences).', fullSurfaceOnly: true },
   },
   scope: 'read',
   verb: true,
@@ -847,10 +849,11 @@ const context_pack: Operation = {
     const threadsOf = (c: (typeof cards)[number]) =>
       (c.open_threads ?? []).filter((t) => !since || (t.date !== null && isAfter(t.date, since)));
     let droppedCount: number | undefined;
+    const profilePack = p.profile === true ? await (await import('../profile/read.ts')).contextPackProfile(ctx, walk.sources, budgetTokens === null ? null : budgetTokens - packHeaderCost() - coreTokens - (pullBrief?.text ? estimateTokens(pullBrief.text) : 0), eligibility) : null;
     if (budgetTokens !== null) {
       // #4761: reserve the envelope + headers, then price each card as its
       // rendered line plus its rendered (since-filtered) thread lines.
-      const itemBudget = budgetTokens - packHeaderCost() - coreTokens - (pullBrief?.text ? estimateTokens(pullBrief.text) : 0);
+      const itemBudget = budgetTokens - packHeaderCost() - coreTokens - (pullBrief?.text ? estimateTokens(pullBrief.text) : 0) - (profilePack?.used ?? 0);
       const cardCost = (c: (typeof cards)[number]) =>
         lineCost(renderCardLine(c, walk.home, ctx.remote !== false)) + threadsOf(c).reduce((n, t) => n + lineCost(renderThreadLine(t)), 0);
       const cardPack = itemBudget > 0 ? packToBudget(cards, cardCost, itemBudget) : dropAll(cards);
@@ -891,7 +894,7 @@ const context_pack: Operation = {
     const recordLines = cards.flatMap(renderRecordLines);
     const basePack = entities.length === 0 ? '' : budgetTokens !== null ? renderPack(cards, open_threads, facts, undefined, walk.home, entityFacts, ctx.remote !== false) : res.text;
     const packText = recordLines.length ? [basePack, ['', RECORDS_HEADER, ...recordLines].join('\n')].filter(Boolean).join('\n') : basePack;
-    const text = [coreText, pullBrief?.text ?? '', packText].filter(Boolean).join('\n\n');
+    const text = [coreText, pullBrief?.text ?? '', profilePack?.text ?? '', packText].filter(Boolean).join('\n\n');
     const budgetUsed = budgetTokens !== null ? estimateTokens(text) : undefined;
 
     return {
@@ -938,7 +941,7 @@ const context_pack: Operation = {
         ...(f.trust_tier ? { trust_tier: f.trust_tier, origin: f.origin } : {}),
         ...(f.quoted ? { quoted: f.quoted } : {}),
       })),
-      text,
+      text, ...(profilePack ? { profile: profilePack.block } : {}),
       ...(pullBrief ? { brief: pullBrief.view } : {}),
       ...(withheld ? { suppressed: suppressionSummary(withheld) } : {}),
       ...(core && core.enabled ? { core: { text: core.text, chars_used: core.chars_used, chars_limit: core.chars_limit, pages: core.pages,
@@ -950,6 +953,7 @@ const context_pack: Operation = {
       // C4: optional pinned answers (fresh sentences) and the withheld count (src/core/questions/service.ts).
       ...(await (await import('../questions/service.ts')).pinnedAnswersForPack(ctx, (res.cards ?? []).map((c) => ({ source_id: c.entity.source_id, slug: c.entity.slug })))
         .catch(() => null)),
+      ...(await (await import('../policy/check.ts')).policyStateForPack(ctx.engine, ctx.remote !== false).catch(() => null)),
     };
   },
 };

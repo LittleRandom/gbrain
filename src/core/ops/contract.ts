@@ -461,6 +461,12 @@ export interface AuthInfo {
   readShared?: boolean;
   readSharedUnresolved?: boolean;
   /**
+   * GST-3163: sources a token's grant names that are archived now. They are left out of `sourceId`/`allowedSources`,
+   * so no unqualified read reaches them; an explicit `source_id` naming one passes the grant check and then answers
+   * unknown_source from the liveness check (`assertExplicitSourceLive`), as it did before archiving narrowed the grant.
+   */
+  archivedSources?: string[];
+  /**
    * GBRA-575: the grant's `private_facts: granted_sources` axis, set at token
    * verification from the live row, with the same explicitly named sources.
    * MCP dispatch makes them the private-fact sources of each non-mutating call
@@ -602,6 +608,12 @@ export interface OperationContext {
    */
   revealTools?: (names: string[]) => void;
   /**
+   * Set by the stateless HTTP transport: sends tools/list_changed on this
+   * request's own response stream (the server has no standalone stream to
+   * push on). `request_tools` calls it after it persists a surface change.
+   */
+  notifyToolListChanged?: () => Promise<void>;
+  /**
    * Subagent runtime context (v0.16+). Set by the subagent tool dispatcher when
    * dispatching an op as a tool call from an LLM loop. Used to enforce per-op
    * agent policy (e.g. put_page namespace rule).
@@ -694,6 +706,8 @@ export interface OperationContext {
    * authority: dispatch enforces callability itself.
    */
   isCallable?: (opName: string, args?: Record<string, unknown>) => boolean;
+  /** MCP dispatch only: this connection's hidden-tool route inputs and its tool-list test, so `capabilities` reports callable and listed separately. */
+  toolAccess?: { connection: () => import('../../mcp/hidden-tool-hint.ts').ToolConnection; isListed?: (op: OperationMeta) => Promise<boolean>; servedToClient?: (name: string) => boolean };
   /**
    * Resolved global CLI options (--quiet / --progress-json / --progress-interval).
    * CLI callers populate this from `getCliOptions()`. MCP / library callers
@@ -797,6 +811,11 @@ export interface OperationContext {
    * command. Ignored unless `remote === false`; a grant always wins.
    */
   localSourceImplicit?: boolean;
+  /**
+   * pages-02 — true when the trusted local CLI's source came from the cwd checkout tier (local_path), which names a
+   * source as a flag does: an unsourced put there is not a silent fork. Set only with `localSourceImplicit`.
+   */
+  localSourceFromCheckout?: boolean;
   /**
    * #5081 — explicit-read admission for a stdio connection bound by an
    * explicit tier (`GBRAIN_SOURCE` or a `.gbrain-source` pin). Set ONLY by

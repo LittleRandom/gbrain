@@ -142,6 +142,26 @@
       "stdout": []
     },
     {
+      "argv": "policy",
+      "exitCode": 1,
+      "stderr": [
+        "Error [requires_local_engine]: `gbrain policy` requires a local engine. This install is a thin client of http://127.0.0.1:1/mcp.",
+        "Fix: gbrain policy",
+        "Docs: https://github.com/garrytan/gbrain/blob/master/docs/guides/error-codes.md#requires_local_engine"
+      ],
+      "stdout": []
+    },
+    {
+      "argv": "ledger",
+      "exitCode": 1,
+      "stderr": [
+        "Error [requires_local_engine]: `gbrain ledger` requires a local engine. This install is a thin client of http://127.0.0.1:1/mcp.",
+        "Fix: gbrain ledger",
+        "Docs: https://github.com/garrytan/gbrain/blob/master/docs/guides/error-codes.md#requires_local_engine"
+      ],
+      "stdout": []
+    },
+    {
       "argv": "migrate",
       "exitCode": 1,
       "stderr": [
@@ -526,6 +546,16 @@
       "stdout": []
     },
     {
+      "argv": "identity",
+      "exitCode": 1,
+      "stderr": [
+        "Error [requires_local_engine]: `gbrain identity` requires a local engine. This install is a thin client of http://127.0.0.1:1/mcp.",
+        "Fix: gbrain identity",
+        "Docs: https://github.com/garrytan/gbrain/blob/master/docs/guides/error-codes.md#requires_local_engine"
+      ],
+      "stdout": []
+    },
+    {
       "argv": "brainstorm",
       "exitCode": 1,
       "stderr": [
@@ -608,6 +638,16 @@
       "stdout": []
     },
     {
+      "argv": "onboarding",
+      "exitCode": 1,
+      "stderr": [
+        "Error [requires_local_engine]: `gbrain onboarding` requires a local engine. This install is a thin client of http://127.0.0.1:1/mcp.",
+        "Fix: gbrain onboarding",
+        "Docs: https://github.com/garrytan/gbrain/blob/master/docs/guides/error-codes.md#requires_local_engine"
+      ],
+      "stdout": []
+    },
+    {
       "argv": "founder",
       "exitCode": 1,
       "stderr": [
@@ -629,6 +669,16 @@
         "  gbrain founder scorecard companies/acme-example",
         "  gbrain founder scorecard companies/acme-example --since 2025-05-17 --json",
         ""
+      ],
+      "stdout": []
+    },
+    {
+      "argv": "profile",
+      "exitCode": 1,
+      "stderr": [
+        "Error [unavailable]: OAuth discovery failed: OAuth discovery network error: ECONNREFUSED: Unable to connect. Is the computer able to access the url?",
+        "Fix: gbrain remote doctor",
+        "Docs: https://github.com/garrytan/gbrain/blob/master/docs/guides/error-codes.md#unavailable"
       ],
       "stdout": []
     },
@@ -708,21 +758,31 @@
       "stdout": []
     },
     {
-      "argv": "waiting",
-      "exitCode": 1,
-      "stderr": [
-        "Error [requires_local_engine]: `gbrain waiting` requires a local engine. This install is a thin client of http://127.0.0.1:1/mcp.",
-        "Fix: gbrain waiting",
-        "Docs: https://github.com/garrytan/gbrain/blob/master/docs/guides/error-codes.md#requires_local_engine"
-      ],
-      "stdout": []
-    },
-    {
       "argv": "loops",
       "exitCode": 1,
       "stderr": [
         "Error [requires_local_engine]: `gbrain loops` requires a local engine. This install is a thin client of http://127.0.0.1:1/mcp.",
         "Fix: gbrain loops",
+        "Docs: https://github.com/garrytan/gbrain/blob/master/docs/guides/error-codes.md#requires_local_engine"
+      ],
+      "stdout": []
+    },
+    {
+      "argv": "claims",
+      "exitCode": 1,
+      "stderr": [
+        "Error [requires_local_engine]: `gbrain claims` requires a local engine. This install is a thin client of http://127.0.0.1:1/mcp.",
+        "Fix: gbrain claims",
+        "Docs: https://github.com/garrytan/gbrain/blob/master/docs/guides/error-codes.md#requires_local_engine"
+      ],
+      "stdout": []
+    },
+    {
+      "argv": "household",
+      "exitCode": 1,
+      "stderr": [
+        "Error [requires_local_engine]: `gbrain household` requires a local engine. This install is a thin client of http://127.0.0.1:1/mcp.",
+        "Fix: gbrain household",
         "Docs: https://github.com/garrytan/gbrain/blob/master/docs/guides/error-codes.md#requires_local_engine"
       ],
       "stdout": []
@@ -774,6 +834,16 @@
         "Error [requires_local_engine]: `gbrain connectors` is not routable (thin-client of http://127.0.0.1:1/mcp); run it on the brain host.",
         "Fix: gbrain connectors",
         "Why: connectors manage provider session credentials in ~/.gbrain/connectors and sync your chat history on the host. Credentials never cross the wire — run on the host machine.",
+        "Docs: https://github.com/garrytan/gbrain/blob/master/docs/guides/error-codes.md#requires_local_engine"
+      ],
+      "stdout": []
+    },
+    {
+      "argv": "apple-contacts",
+      "exitCode": 1,
+      "stderr": [
+        "Error [requires_local_engine]: `gbrain apple-contacts` requires a local engine. This install is a thin client of http://127.0.0.1:1/mcp.",
+        "Fix: gbrain apple-contacts",
         "Docs: https://github.com/garrytan/gbrain/blob/master/docs/guides/error-codes.md#requires_local_engine"
       ],
       "stdout": []

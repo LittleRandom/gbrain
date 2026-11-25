@@ -32,7 +32,7 @@ import { ruleCoversSql, validPrefix, validQualifiedRuleId } from '../access/fold
 import { holdingSlugSql } from '../facts-fence.ts';
 import { NAME_KEY_PAGE_DIRS } from '../entities/basename-dirs.ts';
 import { atomMovedOriginPrivateSql, atomOriginSlugsSql } from '../persistence/atom-origin.ts';
-import { ownerOnlyFactSql, ownerOnlyForm, ownerOnlyPageSql, ownerOnlySourcesPresent } from '../access/owner-only.ts';
+import { ownerOnlyFactSql, ownerOnlyForm, ownerOnlyPageSql, ownerOnlySourcesPresent, ownerOnlyTakeSql, ownerOnlyTimelineSql, type OwnerOnlyForm } from '../access/owner-only.ts';
 
 export const REMOTE_PRIVATE_PAGES_KEY = 'search.remote_private_pages';
 
@@ -455,6 +455,11 @@ function lineageReads(owner: boolean, single: boolean, lineage: boolean, readsRe
     audienceKindMembers: Object.freeze(ownerRead && audienceKind.every(id => ACCESS_ID_RE.test(id)) ? [...new Set(audienceKind)].sort() : []) };
 }
 
+/** The current read's own caller-access record, or null outside one (currentCallerAccess fills in a default instead). */
+export function callerAccessRecord(): CallerAccess | null {
+  return callerAccessStore.getStore() ?? null;
+}
+
 /** Runs `fn` outside any caller's record, for work a request spawns that must not inherit its view. */
 export function withoutCallerAccess<T>(fn: () => T): T {
   return callerAccessStore.exit(fn);
@@ -484,6 +489,24 @@ export function callerIsOwner(): boolean {
 export function ownerWidened(): boolean {
   const access = currentCallerAccess();
   return access.owner && access.ownerReads === true;
+}
+
+/**
+ * GST-3064: whether a full-body read by this caller (reading these take holders, readHolders(ctx)) shows the Facts fence
+ * as stored, private and held rows included: to the owner's widened read (ownerWidened) on an inline page, and on a
+ * segmented page only when it reads every holder (that page's markdown view is paged from the stored body only then).
+ */
+export function storedFactsShown(holders: readonly string[] | undefined, segmented: boolean): boolean {
+  return ownerWidened() && (!segmented || holders === undefined);
+}
+
+/**
+ * GST-3064: sanitizeRemoteBody's `owner` option for an inline body this caller reads (storedFactsShown), keeping takes
+ * only for a caller that reads every holder. get_page, fetch and get_page as_of read an inline body through it, so
+ * they show the owner the same rows.
+ */
+export function ownerFenceView(holders: readonly string[] | undefined): { keepTakes: boolean } | undefined {
+  return storedFactsShown(holders, false) ? { keepTakes: holders === undefined } : undefined;
 }
 
 /**
@@ -898,6 +921,50 @@ export function folderRestrictedSql(alias: string): string {
 }
 
 /**
+ * GST-3815: page row `p` reads to everyone who reads page row `t`, as SQL, for a derivation that copies text from `p`
+ * onto `t` (enrich filling a page from other pages' facts, links and chunks). `p` is `t` itself, or: no privacy rule
+ * hides it (privacyPartSql: visibility, aliases, pinned questions, lineage), no origin of it names readers, every reader
+ * `t` names is one of its readers, every folder rule over it also covers `t`, no pending folder prefix covers it, and
+ * it is owner-only only when `t` is. A `t` that names readers or sits under a folder rule admits labelled-only members,
+ * who read only pages labelled for them (labelledOnlySql), so `p` must then name readers too, or sit under a rule of
+ * `t`'s. Anything it cannot tell (readers not yet derived, unreadable access tables, owner-only lineage on a read with
+ * no schema version) fails closed.
+ */
+export function pageReadsToReadersOfSql(p: string, t: string): string {
+  const unlabelled = (a: string) => `(${a}.page_readers IS NULL AND NOT ${namesReadersSql(a)} AND ${a}.folder_rule_ids IS NULL)`;
+  const readersWithin = `(${p}.page_readers IS NOT NULL AND ${t}.page_readers IS NOT NULL AND ${t}.page_readers <@ ${p}.page_readers)`;
+  const rulesWithin = `(${p}.folder_rule_ids IS NOT NULL AND ${t}.folder_rule_ids IS NOT NULL AND ${p}.folder_rule_ids <@ ${t}.folder_rule_ids)`;
+  return `(${p}.id = ${t}.id OR (${privacyPartSql(p)} AND ${originAllowedSql(p)}
+    AND ((${p}.page_readers IS NULL AND NOT ${namesReadersSql(p)}) OR ${readersWithin})
+    AND (${p}.folder_rule_ids IS NULL OR ${rulesWithin})
+    AND (${unlabelled(t)} OR (${t}.page_readers IS NOT NULL AND ${readersWithin}) OR (${t}.page_readers IS NULL AND NOT ${namesReadersSql(t)} AND ${rulesWithin}))
+    AND NOT gbrain_access_pending_covers(${p}.source_id, ${p}.slug) AND NOT (SELECT gbrain_access_state_unreadable())
+    AND ${ownerOnlyWithinSql(ownerOnlyPageSql, p, t)}))`;
+}
+
+/** GST-3815: row `alias` is owner-only only when page row `t` is; with no schema version the lineage is unknown, so any owner-only data refuses it. */
+function ownerOnlyWithinSql(rowSql: (alias: string, form: OwnerOnlyForm) => string, alias: string, t: string): string {
+  const form = ownerOnlyForm(readSchemaVersion());
+  return form === 'closed' ? `NOT ${rowSql(alias, form)}` : `(NOT ${rowSql(alias, form)} OR ${ownerOnlyPageSql(t, form)})`;
+}
+
+/** GST-3815: page row `t` names readers or sits under a folder rule, so labelled-only members may read it, as SQL. */
+export function pageAdmitsLabelledOnlySql(t: string): string {
+  return `(${t}.page_readers IS NOT NULL OR ${namesReadersSql(t)} OR ${t}.folder_rule_ids IS NOT NULL)`;
+}
+
+/**
+ * GST-3815: fact row `f` is owner-only only when page row `t` is, and when `t` admits labelled-only members (it names
+ * readers or sits under a folder rule) the fact is held on a page they can be judged on, as SQL. A labelled-only member
+ * reads a fact only through a page labelled for it (labelledOnlyFactSql), so a fact with no holding page never fills such a
+ * `t`. The holding page itself is judged by pageReadsToReadersOfSql.
+ */
+export function factWithinPageReadersSql(f: string, t: string): string {
+  return `(${ownerOnlyWithinSql(ownerOnlyFactSql, f, t)} AND (NOT ${pageAdmitsLabelledOnlySql(t)} OR EXISTS (SELECT 1 FROM pages held_page
+    WHERE held_page.source_id = ${f}.source_id AND held_page.slug = ${f}.source_markdown_slug AND held_page.deleted_at IS NULL)))`;
+}
+
+/**
  * folderRestrictedSql for a page known by its slug (a parsed page, a row read without the column, a page about to be
  * written): judged against the applied folder rules, not the stamp. A failed read counts as restricted.
  */
@@ -959,11 +1026,24 @@ export function privateLinkOriginFilterForCaller(linkAlias: string): string {
 
 /** privateTimelineEventFilterFragment for a remote read. */
 export function privateTimelineEventFilterForCaller(timelineAlias: string): string {
-  return `(${timelineAlias}.event_page_id IS NULL OR EXISTS (
+  return `((${timelineAlias}.event_page_id IS NULL OR EXISTS (
     SELECT 1 FROM pages event_private
     WHERE event_private.id = ${timelineAlias}.event_page_id
       AND ${privatePagesFilterForCaller('event_private')}
-  ))`;
+  ))${ownerOnlyTimelineAllowedSql(timelineAlias)})`;
+}
+
+/**
+ * A timeline row whose own recorded inputs reach owner-only data (a meeting in an owner-only source fanned onto an
+ * attendee page in another source) passes only for an owner read; its page is tested apart. Empty for the owner.
+ */
+export function ownerOnlyTimelineAllowedSql(timelineAlias: string): string {
+  return currentCallerAccess().owner ? '' : ` AND NOT ${ownerOnlyTimelineSql(timelineAlias, ownerOnlyForm(readSchemaVersion()))}`;
+}
+
+/** A take whose own recorded inputs reach owner-only data passes only for an owner read; its page is tested apart. Empty for the owner. */
+export function ownerOnlyTakeAllowedSql(takeAlias: string): string {
+  return currentCallerAccess().owner ? '' : ` AND NOT ${ownerOnlyTakeSql(takeAlias, ownerOnlyForm(readSchemaVersion()))}`;
 }
 
 /**
@@ -1210,7 +1290,7 @@ export async function remotePrivacyRelaxed(engine: BrainEngine): Promise<boolean
   return expose;
 }
 
-/** GST-363: whom the brain serves, as a remote request reads it from config (no query). `since` is epoch seconds. */
+/** GST-363: whom the brain serves, as a remote request reads it from config (no query). `since` is epoch seconds, with the fraction access.serves_since records since v329 (GST-3199). */
 export interface ServesPolicy { several: boolean; from: 'config' | 'members'; since: number | null; enforce: boolean }
 
 /** `servesUnknown`: the config read failed, so whom the brain serves is not known (never read as one person, GST-363). */
@@ -1225,7 +1305,7 @@ export function servesPolicyFrom(config: Record<string, string | undefined>): Se
   return {
     several: (fromConfig ? explicit : config[SERVES_DERIVED_KEY]?.trim()) === 'several',
     from: fromConfig ? 'config' : 'members',
-    since: Number.isFinite(since) ? Math.floor(since / 1000) : null,
+    since: Number.isFinite(since) ? since / 1000 : null,
     enforce: !['false', '0', 'off', 'no'].includes(config[REQUESTER_SCOPE_ENFORCE_KEY]?.trim().toLowerCase() ?? ''),
   };
 }

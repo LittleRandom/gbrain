@@ -326,6 +326,18 @@ import { v322 } from './v322-owner-only-marks.ts';
 import { v323 } from './v323-token-read-shared.ts';
 import { v324 } from './v324-secret-store.ts';
 import { v325 } from './v325-entity-identity-reviews.ts';
+import { v326 } from './v326-pages-title-lower-hash-index.ts';
+import { v327 } from './v327-access-handovers.ts';
+import { v328 } from './v328-owner-only-reads-complete.ts';
+import { v329 } from './v329-serves-since-subsecond.ts';
+import { v330 } from './v330-entity-identity-reviews-evidence.ts';
+import { v331 } from './v331-access-read-log.ts';
+import { v332 } from './v332-engine-writer-observations.ts';
+import { v333 } from './v333-hold-page-id.ts';
+import { v334 } from './v334-learning-items.ts';
+import { v335 } from './v335-pages-spelling-key-index.ts';
+import { v336 } from './v336-files-follow-page-slug.ts';
+import { v337 } from './v337-write-gate-hold-rechecks.ts';
 
 // Array order is historical (see HISTORICAL_ARRAY_ORDER in the generator); the
 // runner sorts by version before applying.
@@ -650,4 +662,16 @@ export const MIGRATIONS: Migration[] = [
   v323,
   v324,
   v325,
+  v326,
+  v327,
+  v328,
+  v329,
+  v330,
+  v331,
+  v332,
+  v333,
+  v334,
+  v335,
+  v336,
+  v337,
 ];

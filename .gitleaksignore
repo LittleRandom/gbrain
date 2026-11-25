@@ -77,3 +77,29 @@ abef0b6d4b3c475ab8a6ab991744562f1f579a4f:test/transcripts-openclaw-gateway-argv.
 # Rust engine research maps (PR 9595): history-only false positives (one prose line, and this file's own first comment) read as generic-api-key; not secrets.
 0b3539ac8cbbcab5308016a53b3559276449854f:docs/research/rust-engine/gbrain-evals/brainbench-categories.md:generic-api-key:242
 ef56be48bd4bca977ed5eee7012070573039b142:.gitleaksignore:generic-api-key:77
+# Rust engine slice 1a: the synthetic fenced word constant in test/engine-parity/search-private-fence.test.ts (commit 3b04ef1)
+# read as generic-api-key; the tree renamed the constant. This history-only fingerprint is not a secret.
+3b04ef121cc1bdf6c5bcb761664f5b07356d9eb2:test/engine-parity/search-private-fence.test.ts:generic-api-key:30
+# GST-3278: placeholder test tokens and a Swift parameter label in commit 44e49da0 read as generic-api-key; the tree now builds the tokens at runtime. History-only fingerprints, not secrets.
+44e49da06d44da87504ebf908fdcfd49ed67b46c:apple/helper/Tests/HelperCoreTests/ContactsWriteTests.swift:generic-api-key:110
+44e49da06d44da87504ebf908fdcfd49ed67b46c:test/apple-contacts-write.test.ts:generic-api-key:85
+44e49da06d44da87504ebf908fdcfd49ed67b46c:test/apple-contacts-write.test.ts:generic-api-key:123
+44e49da06d44da87504ebf908fdcfd49ed67b46c:test/apple-contacts-write.test.ts:generic-api-key:156
+44e49da06d44da87504ebf908fdcfd49ed67b46c:test/apple-contacts-write.test.ts:generic-api-key:157
+# #10191 Rust store snapshot: header-only private-key test strings (no key body) in the doctor secret-marker tests, in two commits of the PR branch (0ed8030e79, 37831faacb). The final tree builds these strings at runtime. History-only fingerprints, not credentials.
+37831faacb855a33fbedc5c9e9b9f2e76cd84798:rust/crates/gbrain-store/src/cli_reads/doctor_derived_health.rs:private-key:473
+37831faacb855a33fbedc5c9e9b9f2e76cd84798:rust/crates/gbrain-store/src/cli_reads/doctor_derived_health.rs:private-key:477
+37831faacb855a33fbedc5c9e9b9f2e76cd84798:rust/crates/gbrain-store/src/cli_reads/doctor_derived_health.rs:private-key:480
+37831faacb855a33fbedc5c9e9b9f2e76cd84798:rust/crates/gbrain-store/src/cli_reads/doctor_derived_health.rs:private-key:484
+37831faacb855a33fbedc5c9e9b9f2e76cd84798:rust/crates/gbrain-store/tests/cli_reads_doctor_derived_health.rs:private-key:221
+0ed8030e796de5f4099838e78ea53c9822ff5bf3:rust/crates/gbrain-store/src/cli_reads/doctor_derived_health.rs:private-key:473
+0ed8030e796de5f4099838e78ea53c9822ff5bf3:rust/crates/gbrain-store/src/cli_reads/doctor_derived_health.rs:private-key:477
+0ed8030e796de5f4099838e78ea53c9822ff5bf3:rust/crates/gbrain-store/src/cli_reads/doctor_derived_health.rs:private-key:480
+0ed8030e796de5f4099838e78ea53c9822ff5bf3:rust/crates/gbrain-store/src/cli_reads/doctor_derived_health.rs:private-key:484
+0ed8030e796de5f4099838e78ea53c9822ff5bf3:rust/crates/gbrain-store/tests/cli_reads_doctor_derived_health.rs:private-key:221
+# Rust store policy PR: an illustrative base64-looking probe body in test/pregate-allowlist-cache-keys.test.ts (commit 4db2d5b384) read as generic-api-key;
+# the next commit replaced it with plain filler text. This history-only fingerprint is not a secret.
+4db2d5b384e0c3c5e3f32bb246fe7a55ab425a70:test/pregate-allowlist-cache-keys.test.ts:generic-api-key:279
+# GST-3849 PR 2: a synthetic minted Google access token literal in test/google-socket.test.ts (commit d9c7d3d) read as
+# generic-api-key; the tree now builds it with a join. This history-only fingerprint is not a secret.
+d9c7d3d9371298b996d7de93f28ce9ab0875d827:test/google-socket.test.ts:generic-api-key:251
